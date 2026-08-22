@@ -71,10 +71,12 @@ tamper test). A typed ResearchIR (Fact/Claim/Conflict/…) remains future work.
 Covered by unit + benchmark assertions (constraint retention under full
 compaction). Security-policy separation beyond the protected flag is future work.
 
-### Phase 4 — Checkpoint/delta journaling — NOT_STARTED
-Current persistence is whole-state save/load (sufficient for resume).
-Append-only checkpoint+deltas with periodic compaction is the next structural
-change; needed for audit trails and cache-stable prefixes at scale.
+### Phase 4 — Checkpoint/delta journaling — DONE
+`rcc/journal.py`: append-only JSONL (meta header + say/observe/atom deltas +
+full-state checkpoints). `restore()` = latest checkpoint (or meta) + replayed
+deltas; `upto_seq` rollback; `compact()` atomically folds history into a
+single checkpoint. Replay divergence detected via deterministic obs-ID
+assertion. Whole-state save/load kept as the simple path on top.
 
 ### Phase 5 — Adaptive compact scratch (DIRECT/DRAFT/SYMBOLIC/EXPERT/FULL) — IN_PROGRESS (step 1 DONE)
 **Step 1 — symbolic machine state (RIR/1): DONE.**
@@ -90,15 +92,31 @@ Format cost micro-benchmark (`bench/formats.py`, same content, 6 formats):
 RIR/1 cheapest on both counters (approx 365 tok vs prose 515; o200k 216 vs
 prose 253; JSON worst at +34% over prose under o200k — consistent with
 arXiv:2605.29676). All formats verified to carry critical values verbatim.
-**Step 2 — mode router (DIRECT/DRAFT/SYMBOLIC/…): NOT_STARTED.**
-**Step 3 — optional model-assisted distillation behind a gate: NOT_STARTED.**
+**Step 2 — mode router: DONE.**
+`rcc/router.py`: deterministic signal-based selection — FULL (conflicts /
+2+ failures / suspected injection) > EXPERT (8+ observations) > SYMBOLIC
+(3+ atoms) > DRAFT > DIRECT. Mode controls visibility only; atoms always
+remain in state, journal and timeline. Feature-flagged: `router_enabled`.
 
-### Phase 6 — Dictionary encoding for structured outputs — NOT_STARTED
-(SQL fixture exists in the benchmark; encoding not implemented.)
+**Step 3 — model-assisted distillation: interface DONE, live compressor pending.**
+`rcc/gate.py`: `Compressor` protocol + `NullCompressor` (deterministic
+default) + `SafeCompressor` (any failure → None → verbatim fallback). An
+actual model-backed compressor requires a live provider and stays behind the
+Phase-7 gate by construction.
 
-### Phase 7 — Query-aware break-even gate — PARTIALLY covered
-The min-mask-tokens floor is a degenerate gate (stub cost vs content cost).
-Expected-reuse/cache-invalidation-aware gating: NOT_STARTED.
+### Phase 6 — Dictionary encoding for structured outputs — DONE
+`rcc/dictenc.py`: lossless JSON-object dictionary codec — schema stated once,
+objects become positional rows; exact type round-trip (strings stay strings,
+ints stay ints); declines non-conforming or non-shrinking payloads;
+fail-open at render time (`Policy.encode_jsonl`, off by default).
+Measured (o200k): 20-row JSONL tool dump 400 → 310 tokens (−22%), byte-exact decode.
+
+### Phase 7 — Query-aware break-even gate — DONE (deterministic core)
+`rcc/gate.py`: per-turn amortised comparison `S·N + q·N·(s+c) < D·N·(1+pen)`;
+wired via `Policy.gate="window"|"breakeven"` with conservative defaults
+(q=0.05, horizon=20). Boundary tests: monotone in q, never masks hot data,
+zero-horizon keeps verbatim. Calibration of q/N against measured workloads:
+future measurement task.
 
 ### Phase 8 — Experimental machine dialects — MERGED INTO Phase 5
 (Structured symbolic scratch IS the first machine dialect; generic
@@ -144,7 +162,7 @@ the end. CompiledContext.metrics carries the same breakdown programmatically.
 
 ## 4. Validation
 
-- `uv run pytest` → **46 passed** (unit: tokens/store/session; exact-tokenizer;
+- `uv run pytest` → **93 passed** (unit: tokens/store/session; exact-tokenizer;
   literature-grounded properties; security: injection, cross-run,
   schema-version, tamper; integration: benchmark gates).
 - `uvx ruff check rcc bench tests` → clean.
@@ -188,11 +206,12 @@ provenance/exactness semantics.
 
 ## 8. Next highest-ROI action
 
-Phase 5 step 2: a small deterministic mode router choosing scratch verbosity
-(DIRECT: no atoms for trivial ops; DRAFT/SYMBOLIC/EXPERT/FULL per task class)
-plus an adversarial fine-facts eval suite over the full compile path.
-Evidence: step-1 guard already blocks numeric drift at atom level; the
-remaining risk is the router picking the wrong verbosity, which is cheap to
-test deterministically before any model-assisted distillation (step 3) is
-ever allowed behind the Phase-7 break-even gate.
+All deterministic layers are now implemented and tested (93 tests). The
+largest remaining unknown cannot be closed offline: **live-model evaluation**
+— do downstream LLMs actually answer correctly over `[OBS …]` stubs + RIR/1
+blocks, and how does mode routing affect answer quality? Evidence: every
+risk in §5 that remains open ("no model has been prompted with it") blocks
+the same thing. Recommended shape: small harness replaying the existing five
+scenarios through one provider with baseline vs compiled contexts, scoring
+exact-fact recall / citation presence / constraint adherence per run.
 
