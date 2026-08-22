@@ -1,6 +1,14 @@
 # Research Context Compiler — Implementation Plan
 
-Status legend: `NOT_STARTED` / `IN_PROGRESS` / `BLOCKED` / `DONE` / `REJECTED_BY_EVIDENCE`
+Status legend (legacy phases): `NOT_STARTED` / `IN_PROGRESS` / `BLOCKED` / `DONE` / `REJECTED_BY_EVIDENCE`
+
+> **2026-08-22 strategic reset:** the project's end-state is now latent
+> cognition on open-weight Qwen (`Qwen/Qwen3.8-27B`). This plan's DONE
+> markers describe the deterministic evidence substrate only; they do NOT
+> imply live-model validation, behavioral fidelity, or any speedup. Current
+> direction lives in VISION.md, ADR-001, LATENT_ROADMAP.md,
+> EVALUATION_PROTOCOL.md, BLOCKERS.md. RIR/1 is repositioned as
+> audit/debug/fallback representation, not the "language of thought".
 
 ## 0. Evidence review (2026-08-22 literature pass)
 
@@ -164,8 +172,12 @@ the end. CompiledContext.metrics carries the same breakdown programmatically.
 
 - `uv run pytest` → **93 passed** (unit: tokens/store/session; exact-tokenizer;
   literature-grounded properties; security: injection, cross-run,
-  schema-version, tamper; integration: benchmark gates).
-- `uvx ruff check rcc bench tests` → clean.
+  schema-version, tamper; integration: benchmark gates). Environment note:
+  this count requires tiktoken; without it, 85 pass and 2 modules skip
+  (`test_real_tokenizer`, exact-tokenizer parts of the bench integration).
+  Test counts are environment-dependent and must not be quoted as universal.
+- `uvx ruff check rcc bench tests` → 7 style findings in legacy files as of
+  2026-08-22 (E402/E741/E702); core behaviour unaffected.
 - Known limitation of the evaluation: "task success" is proxied by deterministic
   checks (fact recoverability, constraint retention, injection quarantine),
   not end-to-end LLM task quality. That requires a live-model harness.

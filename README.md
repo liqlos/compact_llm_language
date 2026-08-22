@@ -1,5 +1,15 @@
 # RCC — Research Context Compiler
 
+**Strategic direction (2026-08-22):** RCC is pivoting to latent cognition on
+open-weight Qwen (`Qwen/Qwen3.8-27B` release target; Qwen3.5 proxies).
+See `docs/research-context-compiler/VISION.md`, `ADR-001`,
+`LATENT_ROADMAP.md`, `EVALUATION_PROTOCOL.md`, `BLOCKERS.md`.
+
+The existing package is the **evidence substrate**: it is storage-lossless,
+deterministic and auditable — but no live model has ever been run against
+compiled context, so behavioral fidelity is NOT MEASURED and no speedup is
+claimed anywhere below.
+
 Compiles long research/coding transcripts into compact active context backed
 by an immutable, content-addressed evidence store. Optimizes cost per task,
 not raw character counts: bulky old observations become stable reference
@@ -18,10 +28,12 @@ expand(obs_id) ─► byte-exact original inside <UNTRUSTED_OBSERVATION> markers
 timeline()   ─► live per-turn audit: what is inline/masked/failopen + tokens
 ```
 
-## Guarantees
+## Guarantees (scoped precisely)
 
-- **Lossless**: masked ≠ lost. `expand()` returns the full original bytes,
-  SHA-256 verified on every read. No referential dangling by construction.
+- **Storage-lossless**: masked ≠ lost. `expand()` returns the full original
+  bytes, SHA-256 verified on every read. No referential dangling by
+  construction. (Access-losslessness and behavioral fidelity are separate,
+  weaker claims — see VISION.md; both unmeasured with a live model.)
 - **Prefix-stable**: stubs are written once and never rewritten; the RIR/1
   block only appends → prompt-prefix caching stays valid across turns.
 - **Fine-fact guard**: numeric tokens in machine-state atoms must appear
@@ -64,39 +76,49 @@ fail-open — so nothing happens invisibly "until the end".
 ## Tests & benchmark
 
 ```bash
-uv sync && uv run pytest          # 93 tests: unit, security, properties, integration
-uvx ruff check rcc bench tests    # lint
+uv sync && uv run pytest          # 93 tests WITH tiktoken installed (this env);
+                                  # without tiktoken: 85 pass + 2 modules skip.
+                                  # Counts are environment-dependent by design.
+uvx ruff check rcc bench tests    # lint (legacy files may carry minor warnings)
 uv run python -m bench.run_bench --exact --json .rcc_bench/results.json
 ```
+
+Token-savings numbers below are **synthetic token estimates**, not model
+latency or task success. They justify nothing about end-to-end speed.
 
 Measured (o200k_base, exact tokenizer): peak active context −61…−78% on
 representative scenarios; fact recall via expansion 100%; cumulative spend
 −42% over a full long-research run (grows with horizon). Details:
 `docs/research-context-compiler/IMPLEMENTATION_PLAN.md`.
 
-## Status & layout
+## Status & layout (maturity scale: HYPOTHESIS / SCAFFOLDED / UNIT_VERIFIED / MODEL_VERIFIED / REPLICATED / REJECTED_BY_EVIDENCE / BLOCKED)
 
 | Layer | State |
 |---|---|
-| 0 Measurement / baseline | DONE |
-| 1 Stable refs, dedup, safe masking | DONE |
-| 2 Immutable raw store | DONE |
-| 3 Protected exact channel | DONE |
-| 4 Checkpoint + delta journal | DONE |
-| 5.1 Symbolic machine state (RIR/1) | DONE |
-| 5.2 Mode router (DIRECT…FULL) | DONE |
-| 5.3 Compressor plug point + gate | interface DONE; live compressor pending provider |
-| 6 Dictionary encoding (JSONL) | DONE |
-| 7 Break-even gate | DONE (deterministic core; q/N calibration = future measurement) |
-| Live-model evaluation | NOT_STARTED — next |
+| 0 Measurement / baseline (token estimates) | UNIT_VERIFIED |
+| 1 Stable refs, dedup, safe masking | UNIT_VERIFIED |
+| 2 Immutable raw store | UNIT_VERIFIED |
+| 3 Protected exact channel | SCAFFOLDED (caller-controlled flag; not a trust boundary) |
+| 4 Checkpoint + delta journal | UNIT_VERIFIED |
+| 5.1 Symbolic machine state (RIR/1) | SCAFFOLDED (audit/fallback role; see VISION.md) |
+| 5.2 Mode router | SCAFFOLDED (experimental) |
+| 5.3 Compressor plug point + gate | interface only |
+| 6 Dictionary encoding | SCAFFOLDED (experimental) |
+| 7 Break-even gate | SCAFFOLDED (deterministic core; q/N never calibrated) |
+| Behavioral fidelity on live model | NOT MEASURED — blocks all downstream claims |
+| Latent reasoning (`latent_lab/`) | SCAFFOLDED (mock unit tests) → state probe next |
+| Qwen3.8-27B speedup ≥2× | NOT MEASURED |
 
 ```
 rcc/            core library (tokens, store, scratch, session, journal,
-                router, dictenc, gate)
-bench/          deterministic scenarios, harness, format micro-benchmark
+                router, dictenc, gate) — evidence/compatibility layer
+latent_lab/     latent-cognition experiments (protocols, mock backend,
+                state probe, bench scaffolding); optional heavy deps
+bench/          deterministic token-estimate scenarios (synthetic!)
 tests/          unit / security / property / integration suites
 docs/research-context-compiler/
-                implementation plan with evidence review and measurements
+                vision, ADRs, roadmap, evaluation protocol, blockers,
+                implementation plan with measurements
 ```
 
 ## Research grounding
