@@ -23,9 +23,12 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from .dictenc import encode_json_objects
+from .gate import Usage, break_even
+from .router import TaskSignals, route
 from .scratch import Atom, Scratch
 from .store import RawStore, StoredRef, StoreError
 from .tokens import TOKENIZER_ID, count_tokens
@@ -49,6 +52,11 @@ class Policy:
     keep_recent: int = 4          # most recent distinct observations stay inline
     min_mask_tokens: int = 150    # smaller observations always stay inline
     mask_duplicates: bool = True  # repeat occurrences become stubs immediately
+    router_enabled: bool = False  # Phase 5.2: deterministic scratch-mode router
+    gate: str = "window"          # Phase 7: "window" (default) | "breakeven"
+    expected_reads_per_turn: float = 0.05   # q for break-even gate
+    horizon_turns: int = 20       # N estimate for break-even gate
+    encode_jsonl: bool = False    # Phase 6: lossless JSON-object dictionary encoding
 
 
 @dataclass
@@ -80,6 +88,8 @@ class CompileMetrics:
     stub_observation_tokens: int = 0
     message_tokens: int = 0
     scratch_tokens: int = 0
+    scratch_mode: str | None = None
+    jsonl_encoded: int = 0
     observations_masked: int = 0
     duplicates_stubbed: int = 0
     failopen_inline: int = 0     # would have been masked but kept for safety
@@ -107,6 +117,23 @@ class ResearchSession:
         self._by_id: dict[str, ObservationItem] = {}
         self._by_sha: dict[str, ObservationItem] = {}
         self.scratch: Scratch | None = None  # attached lazily via attach_scratch()
+        self.journal = None                  # attached via attach_journal()
+        self.recent_failures = 0             # explicit signal for the router
+        self.injection_suspected = False     # explicit signal for the router
+
+    def note_failure(self) -> None:
+        self.recent_failures += 1
+
+    def flag_injection(self) -> None:
+        self.injection_suspected = True
+
+    def attach_journal(self, path: Path | str):
+        """Bind an append-only checkpoint+delta journal to this session."""
+        from .journal import Journal
+
+        if self.journal is None:
+            self.journal = Journal(path, self)
+        return self.journal
 
     def attach_scratch(self) -> Scratch:
         """Bind a symbolic machine-state (RIR/1) scratchpad to this session."""
@@ -121,6 +148,8 @@ class ResearchSession:
     def say(self, role: str, content: str, *, protected: bool = False) -> None:
         self._turns.append(Turn(MessageItem(role=role, content=content, protected=protected), self._seq))
         self._seq += 1
+        if self.journal is not None:
+            self.journal.log_say(role, content, protected)
 
     def observe(self, label: str, content: str) -> str:
         """Register a tool/document observation.
@@ -143,6 +172,8 @@ class ResearchSession:
         self._by_id[item.obs_id] = item
         self._turns.append(Turn(item, self._seq))
         self._seq += 1
+        if self.journal is not None:
+            self.journal.log_observe(label, content, item.obs_id)
         return item.obs_id
 
     # ---- compilation -----------------------------------------------
@@ -161,15 +192,30 @@ class ResearchSession:
             obs_id=it.obs_id, label=it.label, sha=it.ref.short_sha, tok=it.n_tokens
         )
 
-    def _mask_candidate(self, it: ObservationItem, dup_occurrence: bool, recent: list[str]) -> bool:
+    def _mask_candidate(self, it: ObservationItem, dup_occurrence: bool,
+                        recent: list[str], seq: int = 0) -> bool:
         """Policy decision only -- does not consider store availability."""
         if not self.policy.enabled or it.ref.size_bytes == 0:
             return False
         if it.n_tokens < self.policy.min_mask_tokens:
             return False  # stub would cost nearly as much as the content
         if dup_occurrence and self.policy.mask_duplicates:
-            return True
-        return it.obs_id not in recent
+            passes_window = True
+        elif it.obs_id in recent:
+            passes_window = False
+        else:
+            passes_window = True
+        if not passes_window:
+            return False
+        if self.policy.gate == "breakeven":
+            decision = break_even(Usage(
+                content_tokens=it.n_tokens,
+                stub_tokens=self.tokenizer(self._stub(it)),
+                remaining_turns=max(1, self.policy.horizon_turns - seq),
+                expected_reads_per_turn=self.policy.expected_reads_per_turn,
+            ))
+            return decision.mask
+        return True
 
     def _safe_to_mask(self, it: ObservationItem) -> bool:
         try:
@@ -180,6 +226,17 @@ class ResearchSession:
 
     def compile(self) -> CompiledContext:
         m = CompileMetrics()
+        mode = None
+        if self.policy.router_enabled:
+            mode = route(TaskSignals(
+                n_observations=len(self._by_id),
+                n_atoms=len(self.scratch) if self.scratch else 0,
+                n_conflicts=(sum(1 for a in self.scratch.atoms() if a.kind == "C")
+                             if self.scratch else 0),
+                recent_failures=self.recent_failures,
+                injection_suspected=self.injection_suspected,
+            ))
+        m.scratch_mode = mode
         recent = self._distinct_recent_ids()
         seen_once: set[str] = set()
         parts: list[str] = []
@@ -195,7 +252,7 @@ class ResearchSession:
             dup_occurrence = it.obs_id in seen_once
             seen_once.add(it.obs_id)
 
-            want_mask = self._mask_candidate(it, dup_occurrence, recent)
+            want_mask = self._mask_candidate(it, dup_occurrence, recent, seq=t.seq)
             if want_mask and not self._safe_to_mask(it):
                 # fail-open: keep verbatim rather than emit an unrecoverable stub
                 m.failopen_inline += 1
@@ -213,12 +270,20 @@ class ResearchSession:
                     )
                     m.failopen_inline += 1
                     continue
+                if self.policy.encode_jsonl:
+                    try:
+                        enc = encode_json_objects(body)
+                    except Exception:  # noqa: BLE001 -- fail-open: keep verbatim
+                        enc = None
+                    if enc is not None:
+                        body = enc[0]
+                        m.jsonl_encoded += 1
                 parts.append(
                     f"<OBSERVATION id={it.obs_id} label={it.label} sha={it.ref.short_sha}>\n"
                     + body
                     + "\n</OBSERVATION>"
                 )
-                m.inline_observation_tokens += it.n_tokens + 6
+                m.inline_observation_tokens += self.tokenizer(body) + 6
                 continue
 
             parts.append(self._stub(it))
@@ -230,7 +295,8 @@ class ResearchSession:
                 m.observations_masked += 1
 
         # Machine state (RIR/1) renders LAST: appends preserve the prefix.
-        if self.scratch is not None:
+        # DIRECT suppresses visibility only -- atoms remain in state/journal.
+        if self.scratch is not None and mode != "DIRECT":
             block = self.scratch.render()
             if block:
                 parts.append(block)
@@ -267,7 +333,7 @@ class ResearchSession:
             it = t.item
             dup = it.obs_id in seen_once
             seen_once.add(it.obs_id)
-            want_mask = self._mask_candidate(it, dup, recent)
+            want_mask = self._mask_candidate(it, dup, recent, seq=t.seq)
             if want_mask and not self._safe_to_mask(it):
                 action = "failopen_inline"
             elif want_mask:
@@ -306,22 +372,12 @@ class ResearchSession:
 
     # ---- persistence (resume support) -------------------------------
 
-    def save(self, path: Path | str) -> None:
-        payload = {
+    def _export_state(self) -> dict:
+        return {
             "schema_version": 1,
             "run_id": self.run_id,
             "tokenizer_id": getattr(self.tokenizer, "__name__", "custom"),
-            "scratch": [
-                {"aid": a.aid, "kind": a.kind, "text": a.text,
-                 "src": list(a.src), "conf": a.conf}
-                for a in (self.scratch.atoms() if self.scratch else [])
-            ],
-            "policy": {
-                "enabled": self.policy.enabled,
-                "keep_recent": self.policy.keep_recent,
-                "min_mask_tokens": self.policy.min_mask_tokens,
-                "mask_duplicates": self.policy.mask_duplicates,
-            },
+            "policy": asdict(self.policy),
             "seq": self._seq,
             "obs_counter": self._obs_counter,
             "observations": [
@@ -335,7 +391,15 @@ class ResearchSession:
                 else {"kind": "observation", "obs_id": t.item.obs_id, "seq": t.seq}
                 for t in self._turns
             ],
+            "scratch": [
+                {"aid": a.aid, "kind": a.kind, "text": a.text,
+                 "src": list(a.src), "conf": a.conf}
+                for a in (self.scratch.atoms() if self.scratch else [])
+            ],
         }
+
+    def save(self, path: Path | str) -> None:
+        payload = self._export_state()
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(".tmp")
@@ -343,17 +407,15 @@ class ResearchSession:
         os.replace(tmp, p)
 
     @classmethod
-    def load(
+    def _from_state(
         cls,
-        path: Path | str,
+        d: dict,
         store: RawStore,
         tokenizer: Callable[[str], int] | None = None,
     ) -> ResearchSession:
-        d = json.loads(Path(path).read_text(encoding="utf-8"))
         if d.get("schema_version") != 1:
             raise SessionError(f"unsupported schema_version {d.get('schema_version')!r}")
-        pol = d["policy"]
-        s = cls(run_id=d["run_id"], store=store, policy=Policy(**pol),
+        s = cls(run_id=d["run_id"], store=store, policy=Policy(**d["policy"]),
                 tokenizer=tokenizer or count_tokens)
         s._seq = d["seq"]
         s._obs_counter = d["obs_counter"]
@@ -381,3 +443,13 @@ class ResearchSession:
                 sc._counter[a["kind"]] = max(sc._counter.get(a["kind"], 0),
                                              int(a["aid"][2:] or 0))
         return s
+
+    @classmethod
+    def load(
+        cls,
+        path: Path | str,
+        store: RawStore,
+        tokenizer: Callable[[str], int] | None = None,
+    ) -> ResearchSession:
+        d = json.loads(Path(path).read_text(encoding="utf-8"))
+        return cls._from_state(d, store, tokenizer)
