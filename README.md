@@ -64,7 +64,7 @@ fail-open — so nothing happens invisibly "until the end".
 ## Tests & benchmark
 
 ```bash
-uv sync && uv run pytest          # 61 tests incl. security + property tests
+uv sync && uv run pytest          # 93 tests: unit, security, properties, integration
 uvx ruff check rcc bench tests    # lint
 uv run python -m bench.run_bench --exact --json .rcc_bench/results.json
 ```
@@ -73,6 +73,31 @@ Measured (o200k_base, exact tokenizer): peak active context −61…−78% on
 representative scenarios; fact recall via expansion 100%; cumulative spend
 −42% over a full long-research run (grows with horizon). Details:
 `docs/research-context-compiler/IMPLEMENTATION_PLAN.md`.
+
+## Status & layout
+
+| Layer | State |
+|---|---|
+| 0 Measurement / baseline | DONE |
+| 1 Stable refs, dedup, safe masking | DONE |
+| 2 Immutable raw store | DONE |
+| 3 Protected exact channel | DONE |
+| 4 Checkpoint + delta journal | DONE |
+| 5.1 Symbolic machine state (RIR/1) | DONE |
+| 5.2 Mode router (DIRECT…FULL) | DONE |
+| 5.3 Compressor plug point + gate | interface DONE; live compressor pending provider |
+| 6 Dictionary encoding (JSONL) | DONE |
+| 7 Break-even gate | DONE (deterministic core; q/N calibration = future measurement) |
+| Live-model evaluation | NOT_STARTED — next |
+
+```
+rcc/            core library (tokens, store, scratch, session, journal,
+                router, dictenc, gate)
+bench/          deterministic scenarios, harness, format micro-benchmark
+tests/          unit / security / property / integration suites
+docs/research-context-compiler/
+                implementation plan with evidence review and measurements
+```
 
 ## Research grounding
 
