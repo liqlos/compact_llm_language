@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 
 try:
     import torch
+    from torch.utils.checkpoint import checkpoint as cp_checkpoint
 except ImportError:  # pragma: no cover - import-safety without lab group
     torch = None
 
@@ -118,8 +119,10 @@ class LoRALinear(_Base):
         torch.nn.init.kaiming_uniform_(self.lora_A, a=5 ** 0.5)
 
     def forward(self, x):
-        return self.base(x) + self.scaling * (
-            (x @ self.lora_A.transpose(0, 1)) @ self.lora_B.transpose(0, 1))
+        # master LoRA weights stay fp32 even over a bf16 base layer
+        delta = ((x.to(self.lora_A.dtype) @ self.lora_A.transpose(0, 1))
+                 @ self.lora_B.transpose(0, 1)) * self.scaling
+        return self.base(x) + delta.to(x.dtype)
 
 
 def inject_lora(layers, *, r: int = 8, alpha: float = 16.0,
@@ -196,7 +199,8 @@ class LocalizedRecurrence:
 
         self.guard = VocabGuard(model, tokenizer)
 
-        self.clock = torch.nn.Embedding(max_k + 1, hidden)
+        dev = next(model.parameters()).device
+        self.clock = torch.nn.Embedding(max_k + 1, hidden, device=dev)
         torch.nn.init.zeros_(self.clock.weight)
 
         self.injected = inject_lora(
@@ -218,19 +222,45 @@ class LocalizedRecurrence:
         # canonical forward feeds rotary the mrope rows [1:] and layers row [0]
         return self.base.rotary_emb(emb, self._pos4(n, start)[1:])
 
+    @staticmethod
+    def _sever_cache_grads(cache):
+        """Break autograd links INTO cached state storage.
+
+        The hybrid cache mutates its tensors in place on every layer call;
+        treating the store as a numeric buffer lets gradients flow through
+        the hidden-state chain (z path) while remaining autograd-safe.
+        """
+        def sever(v):
+            if torch.is_tensor(v):
+                if v.grad_fn is not None or v.requires_grad:
+                    v.data = v.detach().data
+            elif isinstance(v, dict):
+                for x in v.values():
+                    sever(x)
+            elif isinstance(v, list):
+                for x in v:
+                    sever(x)
+            elif isinstance(v, tuple):
+                for x in v:
+                    sever(x)
+
+        for layer in cache.layers:
+            for attr in ("conv_states", "recurrent_states", "keys",
+                         "values"):
+                v = getattr(layer, attr, None)
+                if v is not None:
+                    sever(v)
+
     def _run_layers(self, indices, h, cache, pos, *, grad=False):
         pe = self._rotary(h, h.shape[1], pos)
         pos_ids = self._pos4(h.shape[1], pos)[0]
         for i in indices:
             layer = self.base.layers[i]
-            if grad and self.grad_checkpoint:
-                import torch.utils.checkpoint as cp
-                h = cp.checkpoint(layer, h, pe, None, pos_ids, cache,
-                                  use_reentrant=False, use_cache=True)
-            else:
-                h = layer(h, position_embeddings=pe, attention_mask=None,
-                          position_ids=pos_ids, past_key_values=cache,
-                          use_cache=True)
+            h = layer(h, position_embeddings=pe, attention_mask=None,
+                      position_ids=pos_ids, past_key_values=cache,
+                      use_cache=True)
+            if grad:
+                self._sever_cache_grads(cache)
         return h
 
     def _encode(self, input_ids_or_emb, *, grad=False):
@@ -243,21 +273,9 @@ class LocalizedRecurrence:
         t = emb.shape[1]
         ctx = contextlib.nullcontext() if grad else torch.no_grad()
         with ctx:
-            h = emb
-            pe = self._rotary(emb, t, 0)
-            pos_ids = self._pos4(t, 0)[0]
-            for i, layer in enumerate(self.base.layers):
-                h = self._wrap_cp(layer, h, pe, pos_ids, cache, grad)
+            h = self._run_layers(range(self.n_layers), emb, cache, 0,
+                                 grad=grad)
         return cache, h[:, -1:, :]
-
-    def _wrap_cp(self, layer, h, pe, pos_ids, cache, grad):
-        if grad and self.grad_checkpoint:
-            import torch.utils.checkpoint as cp
-            return cp.checkpoint(layer, h, pe, None, pos_ids, cache,
-                                 use_reentrant=False, use_cache=True)
-        return layer(h, position_embeddings=pe, attention_mask=None,
-                     position_ids=pos_ids, past_key_values=cache,
-                     use_cache=True)
 
     # -- stages ----------------------------------------------------------------
 
@@ -275,6 +293,13 @@ class LocalizedRecurrence:
         ablate = dict(ablate or {})
         if ablate.get("zero_state"):
             z = torch.zeros_like(z)
+        if ablate.get("noise_state"):
+            g = torch.Generator(device=z.device.type)
+            g.manual_seed(int(ablate.get("noise_seed", 1234)))
+            n = torch.randn(z.shape, generator=g, device=z.device,
+                            dtype=torch.float32).to(z.dtype)
+            n = n / (n.norm() + 1e-8) * (z.norm() + 1e-8)
+            z = n
         mode = ablate.get("clocks", "identity")
         eff_k = min(int(ablate.get("truncate_k", k_steps)), k_steps)
         idxs = list(range(eff_k))
@@ -290,7 +315,7 @@ class LocalizedRecurrence:
                 zz = z
                 if self.use_clock and mode != "off":
                     tok = torch.tensor([ci + 1], device=z.device)
-                    zz = zz + self.clock(tok).view(1, 1, -1)
+                    zz = zz + self.clock(tok).view(1, 1, -1).to(z.dtype)
                 if ablate.get("bypass_interval"):
                     z = zz
                 else:
@@ -307,16 +332,29 @@ class LocalizedRecurrence:
 
     @torch.no_grad()
     def rank_candidates(self, input_ids, candidate_ids, k_steps, *,
-                        ablate=None):
-        """Exact constrained scoring: log P(candidate | prompt, latent loop)."""
+                        ablate=None, partner_input_ids=None):
+        """Exact constrained scoring: log P(candidate | prompt, latent loop).
+
+        ablate.swap_state semantics: pass partner_input_ids; the loop then
+        runs on the PARTNER's post-encoding state while scoring this
+        example's candidates.
+        """
         import time
 
-        from ..backends.hf_qwen import cache_restore, cache_snapshot
+        from ..backends.hf_qwen import cache_snapshot, cache_restore
         t0 = time.perf_counter()
         cache, z0 = self._encode(input_ids)
+        if partner_input_ids is not None:
+            p_cache, p_z0 = self._encode(partner_input_ids)
+            from ..backends.hf_qwen import cache_restore as _cr
+            # run the loop against the partner's cache+state entirely
+            cache, z0 = p_cache, p_z0
         t1 = time.perf_counter()
+        ab = dict(ablate or {})
+        if partner_input_ids is not None:
+            ab["swap_state"] = True
         z, pos = self.latent_steps(z0, cache, input_ids.shape[1], k_steps,
-                                   ablate=ablate)
+                                   ablate=ab)
         t2 = time.perf_counter()
         snap = cache_snapshot(cache)
         scores = []
@@ -380,3 +418,22 @@ class LocalizedRecurrence:
         if self.use_clock:
             ps += list(self.clock.parameters())
         return ps
+
+    def adapter_state_dict(self):
+        """CPU clones of every trainable tensor (LoRA pairs + clock)."""
+        sd = {f"lora.{i}.A": l.lora_A.detach().to("cpu").clone()
+              for i, l in enumerate(self.injected)}
+        sd.update({f"lora.{i}.B": l.lora_B.detach().to("cpu").clone()
+                   for i, l in enumerate(self.injected)})
+        if self.use_clock:
+            sd["clock.weight"] = self.clock.weight.detach().to("cpu").clone()
+        return sd
+
+    def load_adapter_state(self, sd):
+        with torch.no_grad():
+            for i, l in enumerate(self.injected):
+                l.lora_A.copy_(sd[f"lora.{i}.A"].to(l.lora_A.device))
+                l.lora_B.copy_(sd[f"lora.{i}.B"].to(l.lora_B.device))
+            if self.use_clock and "clock.weight" in sd:
+                self.clock.weight.copy_(
+                    sd["clock.weight"].to(self.clock.weight.device))
