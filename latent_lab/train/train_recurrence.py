@@ -28,8 +28,8 @@ def _torch():
 
 def build_model(vocab: int = 128, dim: int = 32):
     torch = _torch()
-    import torch.nn as nn
     import torch.nn.functional as F
+    from torch import nn
 
     class IntervalBlock(nn.Module):
         """Stand-in for a localized recurrent interval."""

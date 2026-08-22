@@ -3,13 +3,13 @@ from .runner import evaluate, save_report, selfcheck
 from .tasks import TASKS, MultiHopChain, TaskInstance
 
 __all__ = [
-    "SelfCheckReport",
-    "TaskMetrics",
-    "manifest",
-    "evaluate",
-    "save_report",
-    "selfcheck",
     "TASKS",
     "MultiHopChain",
+    "SelfCheckReport",
     "TaskInstance",
+    "TaskMetrics",
+    "evaluate",
+    "manifest",
+    "save_report",
+    "selfcheck",
 ]

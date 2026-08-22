@@ -22,7 +22,7 @@ def test_rule_matrix():
 
 
 MODES_OK = {"DRAFT", "DIRECT", "SYMBOLIC", "EXPERT", "FULL"}
-from rcc.router import MODES  # noqa: E402
+from rcc.router import MODES
 
 
 def test_all_modes_valid():

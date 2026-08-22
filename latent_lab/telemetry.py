@@ -51,5 +51,4 @@ class TelemetrySink:
 
     def dump_jsonl(self, path) -> None:
         with open(path, "w", encoding="utf-8") as f:
-            for ev in self._events:
-                f.write(ev.to_json() + "\n")
+            f.writelines(ev.to_json() + "\n" for ev in self._events)

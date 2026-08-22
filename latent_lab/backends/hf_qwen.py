@@ -17,7 +17,7 @@ ATTN_KEYS = ("full_attention", "attention")
 
 def require_torch():
     try:
-        import torch  # noqa: F401
+        import torch
     except ImportError as e:
         raise RuntimeError(
             "torch is required for real-model probes. Install optional group: "
@@ -86,7 +86,7 @@ class CallCounter:
         self._handles: list = []
 
     def attach(self, module, name: str) -> None:
-        import torch.nn as nn
+        from torch import nn
 
         self.counts.setdefault(name, 0)
 
@@ -135,15 +135,11 @@ def cache_snapshot(cache) -> dict:
         rec = getattr(layer, "recurrent_states", None)
         if isinstance(conv, dict) and conv:
             snap["conv"][i] = {k: _clone_tree(v) for k, v in conv.items()}
-        elif isinstance(conv, (list, tuple)) and conv:
-            snap["conv"][i] = _clone_tree(conv)
-        elif torch.is_tensor(conv):
+        elif isinstance(conv, (list, tuple)) and conv or torch.is_tensor(conv):
             snap["conv"][i] = _clone_tree(conv)
         if isinstance(rec, dict) and rec:
             snap["recurrent"][i] = {k: _clone_tree(v) for k, v in rec.items()}
-        elif isinstance(rec, (list, tuple)) and rec:
-            snap["recurrent"][i] = _clone_tree(rec)
-        elif torch.is_tensor(rec):
+        elif isinstance(rec, (list, tuple)) and rec or torch.is_tensor(rec):
             snap["recurrent"][i] = _clone_tree(rec)
         ks = getattr(layer, "keys", None)
         vs = getattr(layer, "values", None)
@@ -199,6 +195,9 @@ def trees_equal(a, b) -> bool:
     torch = require_torch()
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
         return torch.equal(a, b)
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(
+            trees_equal(a[k], b[k]) for k in a)
     if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
         return len(a) == len(b) and all(trees_equal(x, y) for x, y in zip(a, b))
     return a == b

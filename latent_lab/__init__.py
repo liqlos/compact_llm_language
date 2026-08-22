@@ -20,28 +20,28 @@ from .protocols import (
 )
 from .provenance import ProvenanceLink, link_answer_to_evidence
 from .recurrence import DecodeInsideLatentLoopError, LoopResult, run_latent_loop
-from .state import RCCModelState, STATE_SCHEMA_VERSION, Vec
+from .state import STATE_SCHEMA_VERSION, RCCModelState, Vec
 from .telemetry import TelemetryEvent, TelemetrySink
 
 __all__ = [
+    "STATE_SCHEMA_VERSION",
     "ActionKind",
     "ControllerAction",
-    "RuleController",
-    "LayerInterval",
-    "candidate_intervals",
-    "natural_groups",
+    "DecodeInsideLatentLoopError",
     "LatentBackend",
+    "LayerInterval",
     "LoopResult",
     "ModelInfo",
     "ProblemInput",
-    "Readout",
     "ProvenanceLink",
-    "link_answer_to_evidence",
-    "DecodeInsideLatentLoopError",
-    "run_latent_loop",
     "RCCModelState",
-    "STATE_SCHEMA_VERSION",
-    "Vec",
+    "Readout",
+    "RuleController",
     "TelemetryEvent",
     "TelemetrySink",
+    "Vec",
+    "candidate_intervals",
+    "link_answer_to_evidence",
+    "natural_groups",
+    "run_latent_loop",
 ]

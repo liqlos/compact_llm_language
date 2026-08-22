@@ -50,7 +50,7 @@ class CacheHandle:
     deltanet_recurrent: dict[int, object] = field(default_factory=dict)
     deltanet_conv: dict[int, object] = field(default_factory=dict)
 
-    def clone(self) -> "CacheHandle":
+    def clone(self) -> CacheHandle:
         return CacheHandle(
             kv_layers=dict(self.kv_layers),
             deltanet_recurrent=dict(self.deltanet_recurrent),
@@ -90,7 +90,7 @@ class RCCModelState:
     def create(info, workspace: Workspace, cache: CacheHandle,
                interval: tuple[int, int], *,
                controller_state: Vec = (0.0,),
-               provenance_refs: tuple[str, ...] = ()) -> "RCCModelState":
+               provenance_refs: tuple[str, ...] = ()) -> RCCModelState:
         lo, hi = interval
         if not (0 <= lo < hi <= len(info.layer_types)):
             raise ValueError(f"interval {interval} outside 0..{len(info.layer_types)}")
@@ -113,7 +113,7 @@ class RCCModelState:
             provenance_refs=tuple(provenance_refs),
         )
 
-    def with_workspace(self, workspace: Workspace) -> "RCCModelState":
+    def with_workspace(self, workspace: Workspace) -> RCCModelState:
         return replace(self, workspace=workspace,
                        latent_step_index=self.latent_step_index + 1)
 

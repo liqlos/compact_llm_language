@@ -56,10 +56,9 @@ def main() -> int:
 
 
 def _run(args, report: dict) -> None:
-    import mlx.core as mx
-
     import importlib.metadata as im
 
+    import mlx.core as mx
     from mlx_lm import load
 
     report["versions"] = {

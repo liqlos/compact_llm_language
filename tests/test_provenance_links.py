@@ -73,7 +73,7 @@ def test_json_roundtrip_contains_ids():
     assert d["claims"][0]["spans"][0]["occurrence_id"] == "o1"
 
 
-import json  # noqa: E402
+import json
 
 
 def test_integration_with_rcc_store(tmp_path):

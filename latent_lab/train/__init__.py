@@ -4,7 +4,7 @@ from .train_recurrence import run_smoke_training
 
 __all__ = [
     "CurriculumExample",
-    "make_chain_dataset",
     "answer_and_align_loss",
+    "make_chain_dataset",
     "run_smoke_training",
 ]
