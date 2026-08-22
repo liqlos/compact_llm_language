@@ -106,7 +106,10 @@ representative scenarios; fact recall via expansion 100%; cumulative spend
 | 6 Dictionary encoding | SCAFFOLDED (experimental) |
 | 7 Break-even gate | SCAFFOLDED (deterministic core; q/N never calibrated) |
 | Behavioral fidelity on live model | NOT MEASURED — blocks all downstream claims |
-| Latent reasoning (`latent_lab/`) | SCAFFOLDED (mock unit tests) → state probe next |
+| Latent pipeline plumbing (`latent_lab/`) | UNIT_VERIFIED (mock; no-decode loop contract enforced) |
+| Real Qwen hybrid runtime control | MODEL_VERIFIED on Qwen3.5-0.8B proxy — cache snapshot/restore exact, K-step recurrence with zero lm_head calls (`latent_lab/bench/results/state_probe_*.json`) |
+| MLX off-vocabulary embedding path | MEASURED: exact-vocab embeds safe/fast; off-manifold inputs slow ~3.5–5×; hybrid prefix-cache trim unsupported (`results/mlx_soft_embedding_probe.json`) |
+| Localized recurrence quality / speedup | NOT MEASURED — T0/T1 next |
 | Qwen3.8-27B speedup ≥2× | NOT MEASURED |
 
 ```
