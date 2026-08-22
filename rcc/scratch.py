@@ -57,6 +57,8 @@ class Scratch:
         self._counter[kind] = self._counter.get(kind, 0) + 1
         aid = f"{kind.lower()}{self._counter[kind]:02d}"
         self._atoms.append(Atom(aid=aid, kind=kind, text=text, src=tuple(src), conf=conf))
+        if getattr(self._session, "journal", None) is not None:
+            self._session.journal.log_atom(aid, kind, text, list(src), conf)
         return aid
 
     def _validate_numbers(self, text: str, src: tuple[str, ...]) -> None:
