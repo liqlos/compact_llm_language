@@ -14,6 +14,20 @@ dev = [
     "pytest>=8.0",
     "tiktoken>=0.14.0",
 ]
+# Real-model experiments (never required for `import rcc`):
+lab = [
+    "torch>=2.13",
+    "transformers>=5.3",
+    "accelerate>=1.0",
+    "packaging>=24",
+]
+mlx = [
+    "mlx>=0.29",
+    "mlx-lm>=0.25",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["rcc", "latent_lab"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
