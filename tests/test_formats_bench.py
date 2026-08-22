@@ -26,7 +26,9 @@ def test_rir_is_cheapest_under_both_counters():
 
 
 def test_deterministic():
-    assert measure(count_tokens) == measure(count_tokens_exact) or True
     m1 = measure(count_tokens)
     m2 = measure(count_tokens)
-    assert m1 == m2
+    assert m1 == m2  # same counter, same input -> byte-identical measurements
+    e1 = measure(count_tokens_exact)
+    e2 = measure(count_tokens_exact)
+    assert e1 == e2

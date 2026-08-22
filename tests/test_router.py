@@ -22,7 +22,7 @@ def test_rule_matrix():
 
 
 MODES_OK = {"DRAFT", "DIRECT", "SYMBOLIC", "EXPERT", "FULL"}
-from rcc.router import MODES
+from rcc.router import MODES  # noqa: E402
 
 
 def test_all_modes_valid():
@@ -76,7 +76,8 @@ def test_injection_flag_forces_full_even_with_one_atom(store):
 def test_repeated_failures_force_full(store):
     s = ResearchSession("run-f", store, Policy(router_enabled=True))
     s.observe("d", BIG)
-    s.note_failure(); s.note_failure()
+    s.note_failure()
+    s.note_failure()
     assert s.compile().metrics.scratch_mode == "FULL"
 
 

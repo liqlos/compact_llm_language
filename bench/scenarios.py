@@ -6,6 +6,7 @@ and measure token behaviour + deterministic quality properties.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -148,9 +149,6 @@ def injection() -> list[Op]:
         ("observe", "webpage_untrusted", f"<html>{INJECTION_PAYLOAD}</html>" + "\n" + _doc("page", 20)),
         ("say", "user", "Proceed with the summary."),
     ]
-
-
-import re
 
 
 def _strip_wrapped(text: str) -> str:

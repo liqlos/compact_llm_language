@@ -139,7 +139,10 @@ class Journal:
                 s.say(e.payload["role"], e.payload["content"], protected=e.payload["protected"])
             elif e.etype == "observe":
                 oid = s.observe(e.payload["label"], e.payload["content"])
-                assert oid == e.payload["obs_id"], "journal replay diverged"
+                if oid != e.payload["obs_id"]:
+                    raise JournalError(
+                        f"journal replay diverged: expected {e.payload['obs_id']!r}, got {oid!r}"
+                    )
             elif e.etype == "atom":
                 s.attach_scratch().add(
                     e.payload["kind"], e.payload["text"],

@@ -45,13 +45,13 @@ def test_stub_never_rewritten_across_turns(store):
     prompt prefix; anti-drift property from AgentFold's analysis)."""
     s, oid = _session_with_old_masked_obs(store, BIG)
     c1 = s.compile()
-    stub_v1 = next(l for l in c1.text.splitlines() if f"[OBS {oid}" in l)
+    stub_v1 = next(line for line in c1.text.splitlines() if f"[OBS {oid}" in line)
     snapshots = [stub_v1]
     for i in range(5):
         s.observe(f"more_{i}", BIG + chr(ord("a") + i))
         s.say("assistant", f"step {i}")
         ci = s.compile()
-        stub_vi = next(l for l in ci.text.splitlines() if f"[OBS {oid}" in l)
+        stub_vi = next(line for line in ci.text.splitlines() if f"[OBS {oid}" in line)
         snapshots.append(stub_vi)
     assert len(set(snapshots)) == 1  # identical across 5 subsequent turns
 
@@ -72,7 +72,7 @@ def test_negation_and_fine_facts_survive_mask_expand_cycle(store):
     # and they are absent from active context only because the WHOLE document
     # is behind one stable reference -- never partially deleted:
     c = s.compile()
-    assert "4.8%" not in c.text.split("[OBS")[0] or True  # no partial rendering
+    assert "4.8%" not in c.text  # masked whole: no partial rendering anywhere
 
 
 def test_no_referential_dangling_by_construction(store):

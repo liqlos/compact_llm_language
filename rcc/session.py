@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -34,6 +35,30 @@ from .store import RawStore, StoredRef, StoreError
 from .tokens import TOKENIZER_ID, count_tokens
 
 OBS_STUB = "[OBS {obs_id} label={label} sha={sha} tok={tok}]"  # compact machine ref
+
+_ALLOWED_ROLES = frozenset({"system", "user", "assistant", "tool"})
+_SAFE_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,63}$")
+
+# Untrusted bodies must never close their own wrapper or open a trusted-looking
+# section. Rendered views neutralize these pseudo-tag prefixes; raw bytes stay
+# untouched in the store (storage-lossless is unaffected).
+_WRAPPER_TAGS = (
+    "OBSERVATION",
+    "UNTRUSTED_OBSERVATION",
+    "CONSTRAINT",
+    "SCRATCH",
+    "SYSTEM",
+    "USER",
+    "ASSISTANT",
+    "TOOL",
+)
+_PSEUDO_TAG_RE = re.compile(
+    r"<(/?(?:" + "|".join(_WRAPPER_TAGS) + r")\b)", re.IGNORECASE
+)
+
+
+def _sanitize_untrusted(text: str) -> str:
+    return _PSEUDO_TAG_RE.sub(lambda m: "&lt;" + m.group(1), text)
 
 
 class SessionError(Exception):
@@ -111,6 +136,9 @@ class ResearchSession:
     tokenizer: Callable[[str], int] = field(default=count_tokens)
 
     def __post_init__(self) -> None:
+        from .store import _check_component
+
+        _check_component(self.run_id, "run_id")  # run_id becomes a directory name
         self._seq = 0
         self._obs_counter = 0
         self._turns: list[Turn] = []
@@ -146,6 +174,10 @@ class ResearchSession:
     # ---- ingestion -------------------------------------------------
 
     def say(self, role: str, content: str, *, protected: bool = False) -> None:
+        if role not in _ALLOWED_ROLES:
+            raise SessionError(
+                f"unsafe role {role!r}: must be one of {sorted(_ALLOWED_ROLES)}"
+            )
         self._turns.append(Turn(MessageItem(role=role, content=content, protected=protected), self._seq))
         self._seq += 1
         if self.journal is not None:
@@ -156,7 +188,14 @@ class ResearchSession:
 
         Identical content maps to ONE canonical stable obs_id (dedup by
         content hash); repeat occurrences append further turns referencing it.
+        Labels render inside stubs/wrappers, so they are restricted to a safe
+        charset (no whitespace, brackets or angle brackets).
         """
+        if not isinstance(label, str) or not _SAFE_LABEL_RE.match(label):
+            raise SessionError(
+                f"unsafe observation label {label!r}: must match "
+                "[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,63}"
+            )
         ref = self.store.put(self.run_id, "observation", content, meta={"label": label})
         item = self._by_sha.get(ref.sha256)
         if item is None:
@@ -280,7 +319,7 @@ class ResearchSession:
                         m.jsonl_encoded += 1
                 parts.append(
                     f"<OBSERVATION id={it.obs_id} label={it.label} sha={it.ref.short_sha}>\n"
-                    + body
+                    + _sanitize_untrusted(body)
                     + "\n</OBSERVATION>"
                 )
                 m.inline_observation_tokens += self.tokenizer(body) + 6
@@ -367,7 +406,7 @@ class ResearchSession:
         content = self.store.get_text(it.ref)  # hash-verified, fail-closed
         return (
             f"<UNTRUSTED_OBSERVATION id={obs_id} label={it.label} "
-            f"sha={it.ref.sha256}>\n{content}\n</UNTRUSTED_OBSERVATION>"
+            f"sha={it.ref.sha256}>\n{_sanitize_untrusted(content)}\n</UNTRUSTED_OBSERVATION>"
         )
 
     # ---- persistence (resume support) -------------------------------
@@ -422,9 +461,11 @@ class ResearchSession:
         for o in d["observations"]:
             ref = StoredRef.from_json(o["ref_json"])
             n_tokens = s.tokenizer(store.get_text(ref)) if store.has(ref) else 0
-            s._by_id[o["obs_id"]] = ObservationItem(
+            item = ObservationItem(
                 obs_id=o["obs_id"], ref=ref, label=o["label"], n_tokens=n_tokens,
             )
+            s._by_id[o["obs_id"]] = item
+            s._by_sha[ref.sha256] = item  # dedup index must survive resume
         for t in d["turns"]:
             if t["kind"] == "message":
                 s._turns.append(Turn(

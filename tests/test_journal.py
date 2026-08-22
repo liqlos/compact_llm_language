@@ -80,7 +80,7 @@ def test_replay_divergence_detected(store, tmp_path):
     entries = j.entries()
     entries[-1].payload["obs_id"] = "obs-4242"  # forged log
     j.entries = lambda: entries  # type: ignore[method-assign]
-    with pytest.raises(AssertionError):
+    with pytest.raises(JournalError, match="diverged"):
         j.restore(store)
 
 
@@ -88,7 +88,10 @@ def test_tampered_header_rejected(store, tmp_path):
     j = ResearchSession("x", store).attach_journal(tmp_path / "j.jsonl")
     lines = j.path.read_text().splitlines()
     import json as _json
-    d = _json.loads(lines[0]); d["type"] = "bogus"; lines[0] = _json.dumps(d)
+
+    d = _json.loads(lines[0])
+    d["type"] = "bogus"
+    lines[0] = _json.dumps(d)
     j.path.write_text("\n".join(lines))
     with pytest.raises(JournalError, match="meta"):
         j.restore(store)
