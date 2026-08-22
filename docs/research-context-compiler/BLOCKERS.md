@@ -49,10 +49,21 @@ Updated: 2026-08-22. Each entry: claim, measurement, status.
 
 - Research status (2026-08-22): mlx-lm qwen3_5 support exists per docs;
   off-vocabulary embedding behaviour on hybrid cache unverified locally.
-- Consequence: dedicated soft-embedding blocker probe required before any
-  MLX-based latency claims (`latent_lab/bench/mlx_soft_embedding_probe.py`).
-  Until then no MLX speed claims.
-- Status: NOT MEASURED locally (no mlx installed).
+- **MEASURED 2026-08-22** (`latent_lab/bench/results/mlx_soft_embedding_probe.json`,
+  mlx 0.32.1 / mlx-lm 0.31.3 / macOS 26.4.1 / M1 Pro 16 GB,
+  Qwen3.5-0.8B bf16):
+  - exact vocabulary embeddings via `input_embeddings`: logits bit-identical
+    to token path, same speed (E2) — public soft-prompt entry point works;
+  - off-manifold embeddings (perturbed/zero/random): ~3.5–5× slowdown of the
+    pass AND of subsequent normal-token decode; ordering control (E6) recovers
+    full speed ⇒ effect is input-specific, suspected Metal subnormal handling;
+  - prefix-cache trim reuse: `can_trim_prompt_cache=False` for hybrid
+    ArraysCache ⇒ no public prompt-prefix reuse in mlx-lm 0.31.3.
+- Consequence: (a) internal localized recurrence must bypass the slow
+  off-manifold path or flush subnormals; (b) MLX latency benchmarking is
+  BLOCKED on cache-reuse + kernel mitigation; architecture results must be
+  separated from this runtime defect.
+- Status: MEASURED; two concrete mitigations identified.
 
 ## B7 — Environment-dependent test counts
 
@@ -61,3 +72,20 @@ Updated: 2026-08-22. Each entry: claim, measurement, status.
   observed 85 passed + 2 skipped modules without tiktoken.
 - Consequence: README/plan now phrase counts as environment-dependent.
 - Status: FIXED (docs).
+
+## B8 — State probe: RESOLVED (runtime control proven)
+
+- Claim: we cannot control hidden states/recurrent caches of a hybrid Qwen
+  without token generation.
+- Measurement 2026-08-22 (`latent_lab/bench/results/state_probe_{cpu,mps_fp16}.json`,
+  Qwen/Qwen3.5-0.8B rev 2fc0636, transformers 5.15.1, torch 2.13.0):
+  - config layer_types parsed (24 layers, 3×GDN+1×attn × 6);
+  - KV shapes [1,2,pos,256]; GDN conv+recurrent states ≈19.8 MB (fp16) per
+    prompt, snapshot/restore roundtrip EXACT (logits equal);
+  - `inputs_embeds` path matches token path;
+  - continuous recurrence K=3 through base model with ZERO lm_head calls
+    (no vocabulary decode inside loop);
+  - wall-clock per recurrence step: 5.9 s CPU fp32 → **16.9 ms MPS fp16**;
+    RSS ≤ 3.7 GB.
+- Status: MODEL_VERIFIED on the 0.8B proxy — localized-recurrence control
+  points all reachable. NOT evidence of reasoning quality.

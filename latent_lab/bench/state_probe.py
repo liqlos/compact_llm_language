@@ -30,6 +30,21 @@ import platform
 import time
 
 
+def _snapshot_bytes(snap: dict) -> int:
+    torch = __import__("torch")
+
+    def size(v) -> int:
+        if torch.is_tensor(v):
+            return v.numel() * v.element_size()
+        if isinstance(v, dict):
+            return sum(size(x) for x in v.values())
+        if isinstance(v, (list, tuple)):
+            return sum(size(x) for x in v)
+        return 0
+
+    return sum(size(x) for k in ("conv", "recurrent") for x in snap[k].values())
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3.5-0.8B")
@@ -72,13 +87,19 @@ def _run(args, report: dict) -> None:
 
     t0 = time.perf_counter()
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.model)
-    try:
-        model = transformers.AutoModelForCausalLM.from_pretrained(
-            args.model, dtype=dtype
-        )
-    except (ValueError, KeyError) as e:
-        checks["load_causal_lm"] = {"ok": False, "error": repr(e)}
-        model = transformers.AutoModel.from_pretrained(args.model, dtype=dtype)
+    model = None
+    load_errors = []
+    for cls_name in ("AutoModelForCausalLM", "AutoModelForImageTextToText",
+                     "AutoModel"):
+        try:
+            cls = getattr(transformers, cls_name)
+            model = cls.from_pretrained(args.model, dtype=dtype)
+            checks["load"] = {"ok": True, "auto_class": cls_name}
+            break
+        except Exception as e:  # noqa: BLE001 — try the next loader
+            load_errors.append(f"{cls_name}: {type(e).__name__}: {e}")
+    if model is None:
+        raise RuntimeError("all AutoModel loaders failed: " + " | ".join(load_errors))
     model.eval().to(device)
     load_s = time.perf_counter() - t0
 
@@ -126,23 +147,32 @@ def _run(args, report: dict) -> None:
     }
 
     # ---- cache structure (check 4) ------------------------------------
+    torch = __import__("torch")
     cache = out_tok.past_key_values
     cache_info = {"type": type(cache).__name__, "layers": []}
+
+    def shape_of(v):
+        if torch.is_tensor(v):
+            return list(v.shape)
+        if isinstance(v, dict) and v:
+            return {str(k): shape_of(x) for k, x in list(v.items())[:1]}
+        if isinstance(v, (list, tuple)) and v:
+            return [shape_of(x) for x in v[:1]]
+        return None
+
     for i, cl in enumerate(getattr(cache, "layers", [])):
-        entry = {"idx": i, "layer_type": layer_types[i] if i < n_layers else "?"}
+        entry = {"idx": i,
+                 "layer_type": layer_types[i] if i < n_layers else "?",
+                 "layer_class": type(cl).__name__}
         for attr in ("conv_states", "recurrent_states"):
             v = getattr(cl, attr, None)
-            entry[attr + "_shape"] = (
-                list(v.shape) if __import__("torch").is_tensor(v) else
-                [list(x.shape) for x in v][:1] if isinstance(v, (list, tuple)) and v
-                else None
-            )
+            entry[attr] = {"present": v is not None and (not isinstance(v, (list, tuple)) or len(v) > 0),
+                           "shape": shape_of(v)}
         ks = getattr(cl, "keys", None)
         vs = getattr(cl, "values", None)
-        entry["kv_shape"] = (
-            [list(ks.shape), list(vs.shape)]
-            if ks is not None and vs is not None else None
-        )
+        entry["kv"] = {"present": ks is not None and vs is not None,
+                       "shape": [list(ks.shape), list(vs.shape)]
+                       if ks is not None and vs is not None else None}
         cache_info["layers"].append(entry)
     checks["cache_structure"] = {"ok": len(cache_info["layers"]) == n_layers,
                                  **cache_info}
@@ -158,12 +188,7 @@ def _run(args, report: dict) -> None:
     checks["cache_clone_restore"] = {
         "ok": bool(eq),
         "logits_equal_after_restore": bool(eq),
-        "snapshot_bytes_approx": sum(
-            x.numel() * x.element_size()
-            for d in (snap["conv"], snap["recurrent"])
-            for v in d.values()
-            for x in ([v] if __import__("torch").is_tensor(v) else [])
-        ),
+        "snapshot_bytes_approx": _snapshot_bytes(snap),
     }
 
     # ---- 7. inputs_embeds path ----------------------------------------
@@ -187,15 +212,16 @@ def _run(args, report: dict) -> None:
     cc.counts = {k: 0 for k in cc.counts}
     h_last = out_emb.hidden_states[-1][:, -1:, :]          # [B,1,D]
     rec_cache = out_tok.past_key_values                    # reuse populated cache
+    base = model.model if hasattr(model, "model") else model  # no LM head
     step_shapes = []
     t0 = time.perf_counter()
     k_steps = 3
-    with __import__("torch").no_grad():
+    with torch.no_grad():
         for _ in range(k_steps):
-            step_out = model(inputs_embeds=h_last,
-                             past_key_values=rec_cache,
-                             use_cache=True,
-                             output_hidden_states=True)
+            step_out = base(inputs_embeds=h_last,
+                            past_key_values=rec_cache,
+                            use_cache=True,
+                            output_hidden_states=True)
             h_next = step_out.hidden_states[-1][:, -1:, :]
             step_shapes.append(list(h_next.shape))
             h_last = h_next

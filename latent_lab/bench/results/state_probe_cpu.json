@@ -1,0 +1,890 @@
+{
+  "checks": {
+    "cache_clone_restore": {
+      "logits_equal_after_restore": true,
+      "ok": true,
+      "snapshot_bytes_approx": 20643840
+    },
+    "cache_structure": {
+      "layers": [
+        {
+          "conv_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                6144,
+                4
+              ]
+            }
+          },
+          "idx": 0,
+          "kv": {
+            "present": false,
+            "shape": null
+          },
+          "layer_class": "LinearAttentionLayer",
+          "layer_type": "gdn",
+          "recurrent_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                16,
+                128,
+                128
+              ]
+            }
+          }
+        },
+        {
+          "conv_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                6144,
+                4
+              ]
+            }
+          },
+          "idx": 1,
+          "kv": {
+            "present": false,
+            "shape": null
+          },
+          "layer_class": "LinearAttentionLayer",
+          "layer_type": "gdn",
+          "recurrent_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                16,
+                128,
+                128
+              ]
+            }
+          }
+        },
+        {
+          "conv_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                6144,
+                4
+              ]
+            }
+          },
+          "idx": 2,
+          "kv": {
+            "present": false,
+            "shape": null
+          },
+          "layer_class": "LinearAttentionLayer",
+          "layer_type": "gdn",
+          "recurrent_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                16,
+                128,
+                128
+              ]
+            }
+          }
+        },
+        {
+          "conv_states": {
+            "present": false,
+            "shape": null
+          },
+          "idx": 3,
+          "kv": {
+            "present": true,
+            "shape": [
+              [
+                1,
+                2,
+                5,
+                256
+              ],
+              [
+                1,
+                2,
+                5,
+                256
+              ]
+            ]
+          },
+          "layer_class": "DynamicLayer",
+          "layer_type": "attn",
+          "recurrent_states": {
+            "present": false,
+            "shape": null
+          }
+        },
+        {
+          "conv_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                6144,
+                4
+              ]
+            }
+          },
+          "idx": 4,
+          "kv": {
+            "present": false,
+            "shape": null
+          },
+          "layer_class": "LinearAttentionLayer",
+          "layer_type": "gdn",
+          "recurrent_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                16,
+                128,
+                128
+              ]
+            }
+          }
+        },
+        {
+          "conv_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                6144,
+                4
+              ]
+            }
+          },
+          "idx": 5,
+          "kv": {
+            "present": false,
+            "shape": null
+          },
+          "layer_class": "LinearAttentionLayer",
+          "layer_type": "gdn",
+          "recurrent_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                16,
+                128,
+                128
+              ]
+            }
+          }
+        },
+        {
+          "conv_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                6144,
+                4
+              ]
+            }
+          },
+          "idx": 6,
+          "kv": {
+            "present": false,
+            "shape": null
+          },
+          "layer_class": "LinearAttentionLayer",
+          "layer_type": "gdn",
+          "recurrent_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                16,
+                128,
+                128
+              ]
+            }
+          }
+        },
+        {
+          "conv_states": {
+            "present": false,
+            "shape": null
+          },
+          "idx": 7,
+          "kv": {
+            "present": true,
+            "shape": [
+              [
+                1,
+                2,
+                5,
+                256
+              ],
+              [
+                1,
+                2,
+                5,
+                256
+              ]
+            ]
+          },
+          "layer_class": "DynamicLayer",
+          "layer_type": "attn",
+          "recurrent_states": {
+            "present": false,
+            "shape": null
+          }
+        },
+        {
+          "conv_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                6144,
+                4
+              ]
+            }
+          },
+          "idx": 8,
+          "kv": {
+            "present": false,
+            "shape": null
+          },
+          "layer_class": "LinearAttentionLayer",
+          "layer_type": "gdn",
+          "recurrent_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                16,
+                128,
+                128
+              ]
+            }
+          }
+        },
+        {
+          "conv_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                6144,
+                4
+              ]
+            }
+          },
+          "idx": 9,
+          "kv": {
+            "present": false,
+            "shape": null
+          },
+          "layer_class": "LinearAttentionLayer",
+          "layer_type": "gdn",
+          "recurrent_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                16,
+                128,
+                128
+              ]
+            }
+          }
+        },
+        {
+          "conv_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                6144,
+                4
+              ]
+            }
+          },
+          "idx": 10,
+          "kv": {
+            "present": false,
+            "shape": null
+          },
+          "layer_class": "LinearAttentionLayer",
+          "layer_type": "gdn",
+          "recurrent_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                16,
+                128,
+                128
+              ]
+            }
+          }
+        },
+        {
+          "conv_states": {
+            "present": false,
+            "shape": null
+          },
+          "idx": 11,
+          "kv": {
+            "present": true,
+            "shape": [
+              [
+                1,
+                2,
+                5,
+                256
+              ],
+              [
+                1,
+                2,
+                5,
+                256
+              ]
+            ]
+          },
+          "layer_class": "DynamicLayer",
+          "layer_type": "attn",
+          "recurrent_states": {
+            "present": false,
+            "shape": null
+          }
+        },
+        {
+          "conv_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                6144,
+                4
+              ]
+            }
+          },
+          "idx": 12,
+          "kv": {
+            "present": false,
+            "shape": null
+          },
+          "layer_class": "LinearAttentionLayer",
+          "layer_type": "gdn",
+          "recurrent_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                16,
+                128,
+                128
+              ]
+            }
+          }
+        },
+        {
+          "conv_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                6144,
+                4
+              ]
+            }
+          },
+          "idx": 13,
+          "kv": {
+            "present": false,
+            "shape": null
+          },
+          "layer_class": "LinearAttentionLayer",
+          "layer_type": "gdn",
+          "recurrent_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                16,
+                128,
+                128
+              ]
+            }
+          }
+        },
+        {
+          "conv_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                6144,
+                4
+              ]
+            }
+          },
+          "idx": 14,
+          "kv": {
+            "present": false,
+            "shape": null
+          },
+          "layer_class": "LinearAttentionLayer",
+          "layer_type": "gdn",
+          "recurrent_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                16,
+                128,
+                128
+              ]
+            }
+          }
+        },
+        {
+          "conv_states": {
+            "present": false,
+            "shape": null
+          },
+          "idx": 15,
+          "kv": {
+            "present": true,
+            "shape": [
+              [
+                1,
+                2,
+                5,
+                256
+              ],
+              [
+                1,
+                2,
+                5,
+                256
+              ]
+            ]
+          },
+          "layer_class": "DynamicLayer",
+          "layer_type": "attn",
+          "recurrent_states": {
+            "present": false,
+            "shape": null
+          }
+        },
+        {
+          "conv_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                6144,
+                4
+              ]
+            }
+          },
+          "idx": 16,
+          "kv": {
+            "present": false,
+            "shape": null
+          },
+          "layer_class": "LinearAttentionLayer",
+          "layer_type": "gdn",
+          "recurrent_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                16,
+                128,
+                128
+              ]
+            }
+          }
+        },
+        {
+          "conv_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                6144,
+                4
+              ]
+            }
+          },
+          "idx": 17,
+          "kv": {
+            "present": false,
+            "shape": null
+          },
+          "layer_class": "LinearAttentionLayer",
+          "layer_type": "gdn",
+          "recurrent_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                16,
+                128,
+                128
+              ]
+            }
+          }
+        },
+        {
+          "conv_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                6144,
+                4
+              ]
+            }
+          },
+          "idx": 18,
+          "kv": {
+            "present": false,
+            "shape": null
+          },
+          "layer_class": "LinearAttentionLayer",
+          "layer_type": "gdn",
+          "recurrent_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                16,
+                128,
+                128
+              ]
+            }
+          }
+        },
+        {
+          "conv_states": {
+            "present": false,
+            "shape": null
+          },
+          "idx": 19,
+          "kv": {
+            "present": true,
+            "shape": [
+              [
+                1,
+                2,
+                5,
+                256
+              ],
+              [
+                1,
+                2,
+                5,
+                256
+              ]
+            ]
+          },
+          "layer_class": "DynamicLayer",
+          "layer_type": "attn",
+          "recurrent_states": {
+            "present": false,
+            "shape": null
+          }
+        },
+        {
+          "conv_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                6144,
+                4
+              ]
+            }
+          },
+          "idx": 20,
+          "kv": {
+            "present": false,
+            "shape": null
+          },
+          "layer_class": "LinearAttentionLayer",
+          "layer_type": "gdn",
+          "recurrent_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                16,
+                128,
+                128
+              ]
+            }
+          }
+        },
+        {
+          "conv_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                6144,
+                4
+              ]
+            }
+          },
+          "idx": 21,
+          "kv": {
+            "present": false,
+            "shape": null
+          },
+          "layer_class": "LinearAttentionLayer",
+          "layer_type": "gdn",
+          "recurrent_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                16,
+                128,
+                128
+              ]
+            }
+          }
+        },
+        {
+          "conv_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                6144,
+                4
+              ]
+            }
+          },
+          "idx": 22,
+          "kv": {
+            "present": false,
+            "shape": null
+          },
+          "layer_class": "LinearAttentionLayer",
+          "layer_type": "gdn",
+          "recurrent_states": {
+            "present": true,
+            "shape": {
+              "0": [
+                1,
+                16,
+                128,
+                128
+              ]
+            }
+          }
+        },
+        {
+          "conv_states": {
+            "present": false,
+            "shape": null
+          },
+          "idx": 23,
+          "kv": {
+            "present": true,
+            "shape": [
+              [
+                1,
+                2,
+                5,
+                256
+              ],
+              [
+                1,
+                2,
+                5,
+                256
+              ]
+            ]
+          },
+          "layer_class": "DynamicLayer",
+          "layer_type": "attn",
+          "recurrent_states": {
+            "present": false,
+            "shape": null
+          }
+        }
+      ],
+      "ok": true,
+      "type": "DynamicCache"
+    },
+    "config": {
+      "arch": null,
+      "hidden_size": 1024,
+      "layer_types": [
+        "gdn",
+        "gdn",
+        "gdn",
+        "attn",
+        "gdn",
+        "gdn",
+        "gdn",
+        "attn",
+        "gdn",
+        "gdn",
+        "gdn",
+        "attn",
+        "gdn",
+        "gdn",
+        "gdn",
+        "attn",
+        "gdn",
+        "gdn",
+        "gdn",
+        "attn",
+        "gdn",
+        "gdn",
+        "gdn",
+        "attn"
+      ],
+      "load_seconds": 6.09,
+      "n_layers": 24,
+      "ok": true,
+      "torch_version": "2.13.0",
+      "transformers_version": "5.15.1",
+      "vocab_size": 248320
+    },
+    "continuous_recurrence": {
+      "k_steps": 3,
+      "layer_calls_during_loop": {
+        "layer_0": 3,
+        "layer_1": 3,
+        "layer_10": 3,
+        "layer_11": 3,
+        "layer_12": 3,
+        "layer_13": 3,
+        "layer_14": 3,
+        "layer_15": 3,
+        "layer_16": 3,
+        "layer_17": 3,
+        "layer_18": 3,
+        "layer_19": 3,
+        "layer_2": 3,
+        "layer_20": 3,
+        "layer_21": 3,
+        "layer_22": 3,
+        "layer_23": 3,
+        "layer_3": 3,
+        "layer_4": 3,
+        "layer_5": 3,
+        "layer_6": 3,
+        "layer_7": 3,
+        "layer_8": 3,
+        "layer_9": 3
+      },
+      "lm_head_calls_during_loop": 0,
+      "ok": true,
+      "seconds_per_step": 6.0702,
+      "seconds_total": 18.2105,
+      "step_hidden_shapes": [
+        [
+          1,
+          1,
+          1024
+        ],
+        [
+          1,
+          1,
+          1024
+        ],
+        [
+          1,
+          1,
+          1024
+        ]
+      ],
+      "verdict": "hidden state fed back without vocabulary decode (structural control proven; NOT yet evidence of reasoning)"
+    },
+    "inputs_embeds_path": {
+      "embed_shape": [
+        1,
+        5,
+        1024
+      ],
+      "logits_match_token_path_exactly": true,
+      "note": "",
+      "ok": true
+    },
+    "load": {
+      "auto_class": "AutoModelForCausalLM",
+      "ok": true
+    },
+    "memory": {
+      "ok": true,
+      "rss_mib": 3855.9375
+    },
+    "token_path": {
+      "hidden_shape": [
+        1,
+        5,
+        1024
+      ],
+      "layer_calls": {
+        "layer_0": 1,
+        "layer_1": 1,
+        "layer_10": 1,
+        "layer_11": 1,
+        "layer_12": 1,
+        "layer_13": 1,
+        "layer_14": 1,
+        "layer_15": 1,
+        "layer_16": 1,
+        "layer_17": 1,
+        "layer_18": 1,
+        "layer_19": 1,
+        "layer_2": 1,
+        "layer_20": 1,
+        "layer_21": 1,
+        "layer_22": 1,
+        "layer_23": 1,
+        "layer_3": 1,
+        "layer_4": 1,
+        "layer_5": 1,
+        "layer_6": 1,
+        "layer_7": 1,
+        "layer_8": 1,
+        "layer_9": 1
+      },
+      "lm_head_calls": 1,
+      "n_hidden_tensors": 25,
+      "ok": true,
+      "seconds": 7.2068
+    }
+  },
+  "device": "cpu",
+  "dtype": "torch.float32",
+  "imports_seconds": 50.06,
+  "model": "Qwen/Qwen3.5-0.8B",
+  "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+  "probe": "rcc_state_probe",
+  "run_manifest": {
+    "command": ".venv/bin/python -m latent_lab.bench.state_probe --model Qwen/Qwen3.5-0.8B --out {out} --device {dev} --dtype fp32",
+    "hardware": "Apple M1 Pro, 16 GB unified memory",
+    "model_revision": "2fc06364715b967f1860aea9cf38778875588b17"
+  },
+  "status": "ok",
+  "version": 1
+}

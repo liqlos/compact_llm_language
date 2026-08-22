@@ -1,0 +1,127 @@
+{
+  "experiments": {
+    "E1_baseline_tokens": {
+      "decode_seconds": 0.4456,
+      "decode_tok_per_s": 71.8,
+      "generated_first10": [
+        3,
+        415,
+        3,
+        415,
+        3,
+        415,
+        3,
+        415,
+        3,
+        3
+      ],
+      "label": "tokens",
+      "prefill_seconds": 0.0453,
+      "prefill_tok_per_s": 1413.0
+    },
+    "E2_exact_vocab_embeds": {
+      "decode_seconds": 0.4251,
+      "decode_tok_per_s": 75.3,
+      "generated_first10": [
+        3,
+        415,
+        3,
+        415,
+        3,
+        415,
+        3,
+        415,
+        3,
+        3
+      ],
+      "label": "exact_vocab_embeds",
+      "logits_equal_token_path": true,
+      "max_abs_logit_diff": 0.0,
+      "prefill_seconds": 0.0452,
+      "prefill_tok_per_s": 1416.9,
+      "same_continuation_as_baseline": true
+    },
+    "E3_perturbed_embeds": {
+      "decode_seconds": 1.5558,
+      "decode_slowdown_vs_E2": 0.27,
+      "decode_tok_per_s": 20.6,
+      "generated_first10": [
+        3,
+        415,
+        3,
+        415,
+        3,
+        415,
+        3,
+        415,
+        3,
+        415
+      ],
+      "kl_vs_token_path": 3.713984915520996e-05,
+      "label": "perturbed_embeds",
+      "prefill_seconds": 0.2162,
+      "prefill_tok_per_s": 296.0
+    },
+    "E4_zero_random_latent_token": {
+      "random": {
+        "baseline_decode_tok_per_s": 71.8,
+        "continuation_matches_baseline": false,
+        "kl_next_token_vs_baseline": 0.02078421786427498,
+        "next_token_diverges_from_baseline": false,
+        "post_offmanifold_decode_tok_per_s": 22.1,
+        "supported": true
+      },
+      "zero": {
+        "baseline_decode_tok_per_s": 71.8,
+        "continuation_matches_baseline": false,
+        "kl_next_token_vs_baseline": 0.0011508179595693946,
+        "next_token_diverges_from_baseline": false,
+        "post_offmanifold_decode_tok_per_s": 22.0,
+        "supported": true
+      }
+    },
+    "E5_prefix_cache_reuse": {
+      "can_trim": false,
+      "supported": false
+    },
+    "E6_baseline_recheck": {
+      "decode_tok_per_s": 75.1,
+      "note": "compare against E1/E2 before attributing any slowdown to off-vocabulary inputs",
+      "prefill_tok_per_s": 1367.4
+    },
+    "structure": {
+      "cache_classes_per_layer_group": [
+        "ArraysCache",
+        "ArraysCache",
+        "ArraysCache",
+        "KVCache",
+        "ArraysCache",
+        "ArraysCache",
+        "ArraysCache",
+        "KVCache"
+      ],
+      "input_embeddings_supported": false,
+      "n_layers": 24
+    }
+  },
+  "macos": "26.4.1",
+  "model": "Qwen/Qwen3.5-0.8B",
+  "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+  "probe": "rcc_mlx_soft_embedding_probe",
+  "run_manifest": {
+    "command": ".venv/bin/python -m latent_lab.bench.mlx_soft_embedding_probe --out <path>",
+    "hardware": "Apple M1 Pro, 16 GB unified memory",
+    "model_revision_hf": "2fc06364715b967f1860aea9cf38778875588b17",
+    "verdicts": {
+      "exact_vocab_embeds_via_input_embeddings": "SAFE: bit-identical logits, same speed as tokens",
+      "off_manifold_embeddings": "SLOWDOWN: ~3.5-5x on the pass AND subsequent normal-token decode; NOT a process-order effect (E6 control recovers); suspected Metal subnormal handling \u2014 kernel-level mitigation needed before MLX latency claims",
+      "prefix_cache_reuse": "UNSUPPORTED for hybrid ArraysCache (can_trim_prompt_cache=False) in mlx-lm 0.31.3"
+    }
+  },
+  "status": "ok",
+  "version": 1,
+  "versions": {
+    "mlx": "0.32.1",
+    "mlx-lm": "0.31.3"
+  }
+}

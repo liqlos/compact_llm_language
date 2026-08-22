@@ -11,8 +11,8 @@ from __future__ import annotations
 import hashlib
 import json
 
-GDN_KEYS = ("gated_deltanet", "gdn", "linear_attn", "delta_net")
-ATTN_KEYS = ("attention", "full_attention")
+GDN_KEYS = ("gated_deltanet", "gdn", "linear_attention", "linear_attn", "delta_net")
+ATTN_KEYS = ("full_attention", "attention")
 
 
 def require_torch():
@@ -122,14 +122,28 @@ def attach_layer_counters(model) -> tuple[CallCounter, list]:
 
 
 def cache_snapshot(cache) -> dict:
-    """Copy conv/recurrent/KV state tensors of a Qwen3_5DynamicCache."""
+    """Copy conv/recurrent/KV state tensors of a Qwen3_5DynamicCache.
+
+    transformers >= 5.x layout: cache.layers[i] is a DynamicLayer (attention
+    KV: .keys/.values) or LinearAttentionLayer (GDN: .conv_states[state_idx]
+    / .recurrent_states[state_idx] lists).
+    """
     snap: dict[str, dict] = {"conv": {}, "recurrent": {}, "kv": {}}
+    torch = require_torch()
     for i, layer in enumerate(cache.layers):
         conv = getattr(layer, "conv_states", None)
         rec = getattr(layer, "recurrent_states", None)
-        if conv is not None:
+        if isinstance(conv, dict) and conv:
+            snap["conv"][i] = {k: _clone_tree(v) for k, v in conv.items()}
+        elif isinstance(conv, (list, tuple)) and conv:
             snap["conv"][i] = _clone_tree(conv)
-        if rec is not None:
+        elif torch.is_tensor(conv):
+            snap["conv"][i] = _clone_tree(conv)
+        if isinstance(rec, dict) and rec:
+            snap["recurrent"][i] = {k: _clone_tree(v) for k, v in rec.items()}
+        elif isinstance(rec, (list, tuple)) and rec:
+            snap["recurrent"][i] = _clone_tree(rec)
+        elif torch.is_tensor(rec):
             snap["recurrent"][i] = _clone_tree(rec)
         ks = getattr(layer, "keys", None)
         vs = getattr(layer, "values", None)
@@ -139,11 +153,33 @@ def cache_snapshot(cache) -> dict:
 
 
 def cache_restore(cache, snap: dict) -> None:
+    torch = require_torch()
+
+    def restore_like(slot, value):
+        """Write cloned tensors back into the cache's live containers."""
+        if isinstance(slot, dict) and isinstance(value, dict):
+            for k, v in value.items():
+                if k in slot:
+                    slot[k] = _clone_tree(v)
+        elif isinstance(slot, (list, tuple)) and isinstance(value, (list, tuple)):
+            for j in range(min(len(slot), len(value))):
+                slot[j] = _clone_tree(value[j])
+
     for i, layer in enumerate(cache.layers):
         if i in snap["conv"]:
-            layer.conv_states = _clone_tree(snap["conv"][i])
+            conv = getattr(layer, "conv_states", None)
+            v = snap["conv"][i]
+            if torch.is_tensor(conv):
+                layer.conv_states = _clone_tree(v)
+            else:
+                restore_like(conv, v)
         if i in snap["recurrent"]:
-            layer.recurrent_states = _clone_tree(snap["recurrent"][i])
+            rec = getattr(layer, "recurrent_states", None)
+            v = snap["recurrent"][i]
+            if torch.is_tensor(rec):
+                layer.recurrent_states = _clone_tree(v)
+            else:
+                restore_like(rec, v)
         kv = snap["kv"].get(i)
         if kv is not None:
             layer.keys = _clone_tree(kv[0])
