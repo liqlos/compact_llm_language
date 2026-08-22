@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rcc"
+version = "0.1.0"
+description = "Research Context Compiler - compiles long research/coding context into compact, recoverable structured state."
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "tiktoken>=0.14.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
