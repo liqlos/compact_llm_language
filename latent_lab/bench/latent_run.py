@@ -67,17 +67,19 @@ def _gpu_mem_report(device: str) -> dict:
     return out
 
 
-def load_model(device="mps"):
+def load_model(device="mps", model_id=None, revision=None):
     import torch
     import transformers
 
     from latent_lab.backends.gdn_patch import install
     install()
 
-    tok = transformers.AutoTokenizer.from_pretrained(MODEL_ID,
-                                                     revision=REVISION)
+    model_id = model_id or DEFAULT_MODEL_ID
+    revision = revision or DEFAULT_REVISION
+    tok = transformers.AutoTokenizer.from_pretrained(model_id,
+                                                     revision=revision)
     model = transformers.AutoModelForCausalLM.from_pretrained(
-        MODEL_ID, revision=REVISION, dtype=torch.bfloat16).eval()
+        model_id, revision=revision, dtype=torch.bfloat16).eval()
     model.to(device)
     return model, tok
 
@@ -228,7 +230,7 @@ def cmd_train(args):
             "detach_z0": args.detach_z0, "device": device,
             "train_examples": len(train), "grad_checkpoint": True,
         },
-        "model": MODEL_ID, "revision": REVISION,
+        "model": args.model, "revision": args.revision,
         "suite_sha256": suite.manifest()["sha256"],
         "best_val_acc": best["acc"], "best_step": best["step"],
         "val_history": history,
