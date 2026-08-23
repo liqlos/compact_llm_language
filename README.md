@@ -76,9 +76,8 @@ fail-open — so nothing happens invisibly "until the end".
 ## Tests & benchmark
 
 ```bash
-uv sync && uv run pytest          # 93 tests WITH tiktoken installed (this env);
-                                  # without tiktoken: 85 pass + 2 modules skip.
-                                  # Counts are environment-dependent by design.
+uv sync && uv run pytest          # 173 tests (suite/localized/runtime included;
+                                  # torch-dependent tests skip without lab group).
 uvx ruff check rcc bench tests    # lint (legacy files may carry minor warnings)
 uv run python -m bench.run_bench --exact --json .rcc_bench/results.json
 ```
@@ -109,8 +108,10 @@ representative scenarios; fact recall via expansion 100%; cumulative spend
 | Latent pipeline plumbing (`latent_lab/`) | UNIT_VERIFIED (mock; no-decode loop contract enforced) |
 | Real Qwen hybrid runtime control | MODEL_VERIFIED on Qwen3.5-0.8B proxy — cache snapshot/restore exact, K-step recurrence with zero lm_head calls (`latent_lab/bench/results/state_probe_*.json`) |
 | MLX off-vocabulary embedding path | MEASURED: exact-vocab embeds safe/fast; off-manifold inputs slow ~3.5–5×; hybrid prefix-cache trim unsupported (`results/mlx_soft_embedding_probe.json`) |
-| Localized recurrence quality / speedup | NOT MEASURED — T0/T1 next |
-| Qwen3.8-27B speedup ≥2× | NOT MEASURED |
+| Localized recurrence quality / speedup | MODEL_MEASURED @ Qwen3.5-2B behavioral gate | suite v2 (7 families): latent E(K=4) LoRA 0.43–0.52 test-ID vs chance 0.07 vs K=0 control 0.375; partial OOD length-gen 0.29–0.49; causal ablations seed-dependent (`latent_lab/bench/GATE_SUMMARY.md`, `.rcc_work/GATE_SUMMARY.md`) |
+| Textual baselines @2B | REJECTED_BY_EVIDENCE (capability limit) | direct/thinking/capped all 0.0% acc, up to 100% NON_TERMINATION incl. 1024-token budget |
+| MLX internal-recurrence path | MEASURED: bit-exact composition, speed BLOCKED without compile | `latent_lab/bench/mlx_internal_recurrence_probe.py` |
+| Qwen3.8-27B speedup ≥2× | NOT MEASURED | gated by 4B step (MODEL_CAPABILITY_LIMIT at 2B) |
 
 ```
 rcc/            core library (tokens, store, scratch, session, journal,

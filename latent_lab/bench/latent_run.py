@@ -49,7 +49,7 @@ def _gpu_mem_report(device: str) -> dict:
         try:
             out["mps_current_mib"] = round(
                 torch.mps.current_allocated_memory() / 2 ** 20, 1)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 — memory probe is best-effort
             pass
     return out
 

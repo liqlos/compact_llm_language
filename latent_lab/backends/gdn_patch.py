@@ -159,9 +159,6 @@ def install() -> None:
     mq.torch_recurrent_gated_delta_rule = torch_recurrent_gated_delta_rule_safe
 
     if not getattr(LinearAttentionLayer, "_rcc_rebind_patched", False):
-        orig_rec = LinearAttentionLayer.update_recurrent_state
-        orig_conv = LinearAttentionLayer.update_conv_state
-
         def rec_rebind(self, recurrent_states, state_idx=0, **kwargs):
             # rebind a detached clone instead of copy_ into a buffer that
             # lazy-initialization may have aliased to a graph tensor

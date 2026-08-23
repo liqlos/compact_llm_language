@@ -26,16 +26,24 @@ Updated: 2026-08-22 (state probe + MLX blocker probe measured).
 
 ## Stages
 
-### T0 — Baselines (NEXT)
-Reproducible visible-CoT traces, direct answers, labels, latency,
-layer-call counts, cache sizes on Qwen3.5-0.8B/4B via the proven control
-points (see B8). No closed teacher API.
+### T0 — Baselines (DONE 2026-08-23, 2B)
+Behavioral suite v2: 7 procedural state-tracking families, parse-back
+verified answers, balanced candidates, leakage audit. Textual baselines on
+Qwen3.5-2B: ALL 0.0% accuracy (direct/thinking/capped, incl. 1024-token
+budget; up to 100% NON_TERMINATION from re-reading loops) =>
+MODEL_CAPABILITY_LIMIT for textual reasoning at this scale.
 
-### T1 — Full-decoder latent baseline (Coconut-like)
-Plumbing already proven at toy scale (`latent_lab/train`, loss ↓ + causal
-ablation). Remaining: same proof with the real 0.8B checkpoint — hidden
-state fed back across steps, causal influence on answers, small-task
-training. Gate to T2.
+### T1/T2 — Latent recurrence @2B (MEASURED 2026-08-23)
+Frozen backbone + interval LoRA + zero-init step clock; guarded loop (zero
+lm_head/tokenizer calls, unit-tested). Attempt-1 (constant lr): E(K=4)
+test-ID 0.4375/0.5179/0.4286 (mean .461) vs K=0 control .375 vs full-decoder
+.304; OOD depth5-8 mean .399 (s1 .491). K dose-response peaks at trained
+depth. Ablations seed-dependent: s0 strongly causal (bypass −26pp, noise
+−24pp), s1 weakly loop-reliant. Attempt-2 (cosine 5e-5, paired seeds):
+E>F on ID both seeds (+5..6pp), F>E on OOD (+12..14pp); schedule variance
+dominates. VERDICT: above-chance learning replicates across seeds;
+advantage over single-pass control is NOT yet robust => conditional GO to
+4B under MODEL_CAPABILITY_LIMIT rule with paired-seed protocol mandatory.
 
 ### T2 — Localized recurrence
 Boundary memory/readout slots; selected layer interval; cache-compatible

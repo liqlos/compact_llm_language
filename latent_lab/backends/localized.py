@@ -24,7 +24,6 @@ from dataclasses import dataclass, field
 
 try:
     import torch
-    from torch.utils.checkpoint import checkpoint as cp_checkpoint
 except ImportError:  # pragma: no cover - import-safety without lab group
     torch = None
 
@@ -237,10 +236,7 @@ class LocalizedRecurrence:
             elif isinstance(v, dict):
                 for x in v.values():
                     sever(x)
-            elif isinstance(v, list):
-                for x in v:
-                    sever(x)
-            elif isinstance(v, tuple):
+            elif isinstance(v, (list, tuple)):
                 for x in v:
                     sever(x)
 
@@ -270,7 +266,6 @@ class LocalizedRecurrence:
         emb = (input_ids_or_emb if not torch.is_tensor(input_ids_or_emb)
                or input_ids_or_emb.dtype.is_floating_point
                else self.base.embed_tokens(input_ids_or_emb))
-        t = emb.shape[1]
         ctx = contextlib.nullcontext() if grad else torch.no_grad()
         with ctx:
             h = self._run_layers(range(self.n_layers), emb, cache, 0,
@@ -341,7 +336,7 @@ class LocalizedRecurrence:
         """
         import time
 
-        from ..backends.hf_qwen import cache_snapshot, cache_restore
+        from ..backends.hf_qwen import cache_restore, cache_snapshot
         t0 = time.perf_counter()
         cache, z0 = self._encode(input_ids)
         loop_start = input_ids.shape[1]

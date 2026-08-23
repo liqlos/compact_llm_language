@@ -15,7 +15,7 @@ def load_all(d: Path) -> dict[str, dict]:
     for p in sorted(d.glob("*.json")):
         try:
             out[p.stem] = json.loads(p.read_text())
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — aggregate never dies
             out[p.stem] = {"error": str(e)}
     return out
 
