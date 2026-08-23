@@ -22,8 +22,8 @@ import re
 import resource
 import time
 
-MODEL_ID = "Qwen/Qwen3.5-2B"
-REVISION = "15852e8c16360a2fea060d615a32b45270f8a8fc"
+DEFAULT_MODEL_ID = "Qwen/Qwen3.5-2B"
+DEFAULT_REVISION = "15852e8c16360a2fea060d615a32b45270f8a8fc"
 
 SYSTEM_THINK = ("You are a precise solver. Work out the answer step by "
                 "step, then finish with a final line 'Answer: X' where X is "
@@ -131,7 +131,11 @@ def main() -> int:
                     help="cap total examples (smoke runs)")
     ap.add_argument("--batch", type=int, default=1)
     ap.add_argument("--device", default="mps")
+    ap.add_argument("--model", default=DEFAULT_MODEL_ID)
+    ap.add_argument("--revision", default=DEFAULT_REVISION)
     args = ap.parse_args()
+    MODEL_ID, REVISION = args.model, args.revision
+    globals()["MODEL_ID"], globals()["REVISION"] = MODEL_ID, REVISION
 
     import torch
     import transformers

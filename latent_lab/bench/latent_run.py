@@ -26,9 +26,22 @@ import resource
 import time
 from pathlib import Path
 
-MODEL_ID = "Qwen/Qwen3.5-2B"
-REVISION = "15852e8c16360a2fea060d615a32b45270f8a8fc"
-INTERVALS = {"mid": (12, 18), "full": (0, 24), "head": (18, 24)}
+DEFAULT_MODEL_ID = "Qwen/Qwen3.5-2B"
+DEFAULT_REVISION = "15852e8c16360a2fea060d615a32b45270f8a8fc"
+
+
+def interval_from_spec(spec: str, n_layers: int) -> tuple[int, int]:
+    """'mid'/'full'/'head' proportional to depth, or explicit 'lo,hi'."""
+    if "," in spec:
+        lo, hi = (int(x) for x in spec.split(","))
+        return (lo, hi)
+    if spec == "full":
+        return (0, n_layers)
+    if spec == "mid":
+        return (n_layers // 2, n_layers * 3 // 4)
+    if spec == "head":
+        return (n_layers * 3 // 4, n_layers)
+    raise ValueError(f"unknown interval spec {spec}")
 
 ANSWER_PREFIX = " "  # prompt ends with "Answer:" -> continuation " <ans>"
 
@@ -140,8 +153,9 @@ def cmd_train(args):
 
     torch.manual_seed(args.seed)
     device = args.device
-    model, tok = load_model(device)
-    interval = INTERVALS[args.interval]
+    model, tok = load_model(device, args.model, args.revision)
+    interval = interval_from_spec(
+        args.interval, model.config.num_hidden_layers)
     rec = LocalizedRecurrence(model, None, interval=interval, max_k=args.max_k,
                               lora_r=args.lora_r, grad_checkpoint=True)
     rec.clock.to(device)
@@ -246,7 +260,7 @@ def cmd_eval(args):
     device = args.device
     cfg = json.load(open(Path(args.adapter) / "train_report.json")
                     )["config"]
-    model, tok = load_model(device)
+    model, tok = load_model(device, cfg.get("model"), cfg.get("revision"))
     interval = tuple(cfg["interval"])
     rec = LocalizedRecurrence(model, None, interval=interval,
                               max_k=cfg["max_k"], lora_r=cfg["lora_r"],
@@ -288,7 +302,8 @@ def cmd_eval(args):
     if args.out:
         payload = {
             "adapter": args.adapter, "split": split_name,
-            "config": cfg, "model": MODEL_ID, "revision": REVISION,
+            "config": cfg, "model": cfg.get("model"),
+            "revision": cfg.get("revision"),
             "suite_sha256": suite.manifest()["sha256"],
             "device": device, "seed": args.seed,
             "results": results,
@@ -304,7 +319,7 @@ def main():
     tr = sub.add_parser("train")
     tr.add_argument("--k", type=int, default=4)
     tr.add_argument("--interval", default="mid",
-                    choices=list(INTERVALS))
+                    help="'mid'|'full'|'head'|'lo,hi'")
     tr.add_argument("--steps", type=int, default=600)
     tr.add_argument("--lr", type=float, default=2e-4)
     tr.add_argument("--lora-r", type=int, default=8)
@@ -318,6 +333,8 @@ def main():
     tr.add_argument("--clip", type=float, default=0.5)
     tr.add_argument("--detach-z0", action="store_true")
     tr.add_argument("--device", default="mps")
+    tr.add_argument("--model", default=DEFAULT_MODEL_ID)
+    tr.add_argument("--revision", default=DEFAULT_REVISION)
     tr.add_argument("--out", required=True)
     ev = sub.add_parser("eval")
     ev.add_argument("--adapter", required=True)
