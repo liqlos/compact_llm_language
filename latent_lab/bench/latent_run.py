@@ -163,6 +163,10 @@ def cmd_train(args):
     def lr_at(step: int) -> float:
         if step < args.warmup:
             return base_lr * (step + 1) / args.warmup
+        if args.lr_schedule == "cosine":
+            import math
+            t = (step - args.warmup) / max(1, args.steps - args.warmup)
+            return base_lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * t)))
         return base_lr
 
     perm = None
@@ -309,6 +313,8 @@ def main():
     tr.add_argument("--eval-every", type=int, default=100)
     tr.add_argument("--val-examples", type=int, default=28)
     tr.add_argument("--warmup", type=int, default=30)
+    tr.add_argument("--lr-schedule", default="constant",
+                    choices=["constant", "cosine"])
     tr.add_argument("--clip", type=float, default=0.5)
     tr.add_argument("--detach-z0", action="store_true")
     tr.add_argument("--device", default="mps")

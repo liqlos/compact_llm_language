@@ -344,16 +344,18 @@ class LocalizedRecurrence:
         from ..backends.hf_qwen import cache_snapshot, cache_restore
         t0 = time.perf_counter()
         cache, z0 = self._encode(input_ids)
+        loop_start = input_ids.shape[1]
         if partner_input_ids is not None:
-            p_cache, p_z0 = self._encode(partner_input_ids)
-            from ..backends.hf_qwen import cache_restore as _cr
-            # run the loop against the partner's cache+state entirely
-            cache, z0 = p_cache, p_z0
+            # swap_state: run the loop on the PARTNER's cache+state; loop
+            # positions must follow the PARTNER's prompt length so KV
+            # alignment stays valid (only the candidates remain this ex's)
+            loop_start = partner_input_ids.shape[1]
+            cache, z0 = self._encode(partner_input_ids)
         t1 = time.perf_counter()
         ab = dict(ablate or {})
         if partner_input_ids is not None:
             ab["swap_state"] = True
-        z, pos = self.latent_steps(z0, cache, input_ids.shape[1], k_steps,
+        z, pos = self.latent_steps(z0, cache, loop_start, k_steps,
                                    ablate=ab)
         t2 = time.perf_counter()
         snap = cache_snapshot(cache)
