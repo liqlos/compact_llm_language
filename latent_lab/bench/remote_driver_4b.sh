@@ -11,7 +11,9 @@ REV=851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
 COMMON="--model $MODEL --revision $REV"
 
 echo "=== setup ==="
-pip install --no-cache-dir -q -U torch transformers packaging pytest huggingface_hub || true
+# image pytorch:2.13.0-cuda12.6 ships the exact torch we need — do NOT
+# touch torch; only small deps
+pip install --no-cache-dir -q -U transformers packaging pytest huggingface_hub || true
 pip uninstall -y -q torchaudio torchvision 2>/dev/null || true
 apt-get update -qq >/dev/null 2>&1 || true
 apt-get install -y -qq build-essential >/dev/null 2>&1 || true

@@ -36,8 +36,21 @@ def canonical(text: str) -> str:
     return t
 
 
+SPECIAL_TOKENS = ("<|im_end|>", "<|endoftext|>", "<|im_start|>")
+
+
+def strip_special(text: str) -> str:
+    """Cut everything from the first special token onward."""
+    for tok in SPECIAL_TOKENS:
+        idx = text.find(tok)
+        if idx != -1:
+            text = text[:idx]
+    return text
+
+
 def parse_answer(generated: str) -> tuple[str | None, str]:
     """Returns (parsed_answer_or_None, status)."""
+    generated = strip_special(generated)
     matches = ANSWER_RE.findall(generated)
     if not matches:
         return None, "no_answer_marker"
@@ -103,6 +116,7 @@ def run_batched(model, tok, prompts_ids, max_new, device):
 
 def score_example(generated: str, ex) -> dict:
     terminated = "<|im_end|>" in generated or "<|endoftext|>" in generated
+    generated = strip_special(generated)
     ans, status = parse_answer(generated)
     correct = 0.0
     if ans is None:

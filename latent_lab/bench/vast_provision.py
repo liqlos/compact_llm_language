@@ -22,7 +22,7 @@ STATE = ROOT / ".rcc_work" / "vast_instance.json"
 QUERY = ("verified=true rentable=true gpu_arch=nvidia num_gpus=1 "
          "gpu_name in [RTX_3090,RTX_4090] gpu_ram>=22 direct_port_count>=1 "
          "reliability>=0.98 cpu_ram>=16 inet_down>=500 disk_space>=40")
-IMAGE = "pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime"
+IMAGE = "pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime"
 LABEL = "rcc-latent-gate"
 
 
