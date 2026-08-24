@@ -7,6 +7,7 @@ the hybrid model is built locally from a config with a fixed seed).
 
 import json
 import os
+from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +17,8 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 import torch
+
+import latent_lab.train.checkpointing as _checkpointing_mod
 
 from latent_lab.backends.localized import (
     LoRALinear,
@@ -1183,6 +1186,339 @@ def test_adversarial_outer_param_groups_list_identity_restored():
                     opt_ctl.state[c]["momentum_buffer"])
         for a, c in zip(ps_adv, ps_ctl)), \
         "optimizer state diverges from the clean control after retry"
+
+
+# ---------------------------------------------------------------------------
+# graph-preserving optimizer-state transaction (views/aliases/repeats)
+# ---------------------------------------------------------------------------
+
+def _alias_graph(seed: int) -> dict:
+    """Deterministic state-value graph exercising every relationship a
+    recursive per-leaf ``detach().clone()`` destroys: one full base
+    storage carrying a distinct storage-offset view, a non-dense strided
+    view, an OVERLAPPING as_strided view, a 0-dim scalar view, a
+    zero-stride expanded view, a repeated reference to the very same
+    base object, and one further base view shared ACROSS parameter
+    entries."""
+    g = torch.Generator().manual_seed(seed)
+    base = torch.randn(6, 6, generator=g)
+    return {
+        "base": base,
+        "offset_view": base[2:5, 1:5],                     # offset != 0
+        "strided_view": base[:, ::2],                      # non-dense strides
+        "overlap_view": torch.as_strided(base, (4, 4), (1, 7)),
+        "scalar": base[3, 3],                              # 0-dim w/ offset
+        "zero_stride": base[0:1, :].expand(4, 6),          # stride (0, 6)
+        "repeat": base,                                    # SAME object again
+        "cross_shared": base[1:2, :],                      # shared cross-entry
+    }
+
+
+def _tensor_meta(t):
+    return (tuple(t.shape), t.dtype, t.device, t.layout,
+            tuple(t.stride()), t.storage_offset())
+
+
+def _record_state_graph(opt, params) -> dict:
+    """Per-entry record of the live state graph: cloned values for later
+    equality plus every structural fact as data (metadata, storage
+    extent, object identity) — a correct rollback must reproduce the
+    RELATIONS, not the old addresses."""
+    per = {}
+    for p in params:
+        entry = {}
+        for k, v in opt.state[p].items():
+            if torch.is_tensor(v):
+                entry[k] = {"value": v.detach().clone(),
+                            "meta": _tensor_meta(v),
+                            "ptr": v.untyped_storage().data_ptr(),
+                            "nbytes": v.untyped_storage().nbytes(),
+                            "oid": id(v)}
+            else:
+                entry[k] = {"other": v}
+        per[id(p)] = entry
+    return per
+
+
+class _AliasPoisonSGD(torch.optim.SGD):
+    """Performs a REAL update, then corrupts through the alias graph
+    itself (mutating the shared base AND writing via two of its views),
+    swaps a view for an unaliased wrong-dtype dense tensor, deletes a
+    field, injects junk fields, rewrites gradients and group topology,
+    REBINDS the whole ``state`` mapping to a hostile mapping holding a
+    foreign key, and finally raises."""
+
+    def __init__(self, params, lr):
+        super().__init__(params, lr=lr, momentum=0.9)
+        self.armed = False
+        self.foreign = torch.nn.Parameter(torch.zeros(1))
+
+    def step(self, closure=None):
+        super().step(closure)
+        if not self.armed:
+            return
+        st = self.state[self.param_groups[0]["params"][0]]
+        with torch.no_grad():
+            st["base"].add_(11.0)              # moves base AND every view
+            st["offset_view"].mul_(-2.0)       # writes through the view
+            st["overlap_view"].add_(1.0)       # ...and through the overlap
+        st["offset_view"] = torch.full((3, 4), -1.0, dtype=torch.float64)
+        del st["strided_view"]
+        st["poison_flag"] = "corrupted"
+        for group in self.param_groups:
+            group["lr"] = 123.0
+            group["injected_meta"] = {"evil": [1]}
+        self.param_groups[0]["params"].reverse()
+        self.param_groups[0]["params"].append(self.foreign)
+        self.state = defaultdict(dict, {self.foreign: {"evil": True}})
+        raise ValueError("alias-adversarial failure")
+
+
+def test_adversarial_alias_graph_rollback_preserves_views_and_identity():
+    def build(seed):
+        torch.manual_seed(seed)
+        m = torch.nn.Linear(4, 4)
+        return m, list(m.parameters())
+
+    torch.manual_seed(22)
+    x = torch.randn(8, 4)
+    m_adv, ps_adv = build(31)
+    m_ctl, ps_ctl = build(31)
+    w_a, b_a = ps_adv
+    opt_adv = _AliasPoisonSGD(ps_adv, lr=0.05)
+    opt_ctl = torch.optim.SGD(ps_ctl, lr=0.05, momentum=0.9)
+    foreign = opt_adv.foreign
+
+    def fresh_grads(m):
+        m.zero_grad(set_to_none=True)
+        loss = (m(x) ** 2).mean()
+        loss.backward()
+        return loss
+
+    def ctl_step(drop_bias_grad=False):
+        fresh_grads(m_ctl)
+        if drop_bias_grad:
+            with torch.no_grad():
+                ps_ctl[1].grad = None
+        torch.nn.utils.clip_grad_norm_(ps_ctl, 1.0)
+        opt_ctl.step()
+
+    # one clean step on both sides -> identical momentum buffers
+    guarded_optimizer_step(opt_adv, fresh_grads(m_adv).detach(), ps_adv, 1.0)
+    ctl_step()
+    assert torch.equal(w_a.detach(), ps_ctl[0].detach())
+
+    # inject the SAME structured alias graph into BOTH optimizers
+    opt_adv.state[w_a].update(_alias_graph(101))
+    opt_adv.state[b_a]["cross_shared"] = \
+        opt_adv.state[w_a]["cross_shared"]
+    ctl_graph = _alias_graph(101)
+    opt_ctl.state[ps_ctl[0]].update(ctl_graph)
+    opt_ctl.state[ps_ctl[1]]["cross_shared"] = ctl_graph["cross_shared"]
+
+    original_mapping = opt_adv.state
+    original_keys = list(original_mapping.keys())
+    pre = _record_state_graph(opt_adv, ps_adv)
+
+    # -- armed failure after a real, corrupting update ----------------------
+    opt_adv.armed = True
+    fresh_grads(m_adv)
+    with torch.no_grad():
+        b_a.grad = None                     # None-vs-tensor grad pattern
+    pre_params = _snapshot(ps_adv)
+    pre_grads = {id(p): (None if p.grad is None else p.grad.detach().clone())
+                 for p in ps_adv}
+    pre_groups = _param_groups_snapshot(opt_adv)
+    pre_ids = _param_group_param_ids(opt_adv)
+
+    with pytest.raises(ValueError, match="alias-adversarial") as e:
+        guarded_optimizer_step(opt_adv, torch.tensor(0.5), ps_adv, 1.0)
+    assert type(e.value) is ValueError, \
+        "original step exception was masked or replaced"
+
+    # original state MAPPING object and PARAMETER-KEY identities back,
+    # hostile rebinding and injected foreign keys gone
+    assert opt_adv.state is original_mapping, \
+        "hostile optimizer.state rebind survived the rollback"
+    live_keys = list(opt_adv.state.keys())
+    assert len(live_keys) == len(original_keys) and all(
+        a is b for a, b in zip(live_keys, original_keys)), \
+        "rollback did not reinstate the original ordered key objects"
+    assert id(foreign) not in {id(k) for k in live_keys}, \
+        "hostilely-injected foreign state key survived"
+
+    # per-parameter: field sets, exact values + metadata, full storage
+    # extents, and pairwise shared-storage / same-object RELATIONS
+    for p in ps_adv:
+        ctx = f"state[{id(p) % 10000}]"
+        live_entry = opt_adv.state[p]
+        rec_entry = pre[id(p)]
+        assert set(live_entry.keys()) == set(rec_entry.keys()), \
+            f"{ctx}: injected/deleted state fields survived rollback"
+        for k, was in rec_entry.items():
+            now = live_entry[k]
+            if "ptr" not in was:
+                assert not torch.is_tensor(now) and \
+                    type(now) is type(was["other"]) and \
+                    now == was["other"], \
+                    f"{ctx}[{k}]: non-tensor field not verbatim"
+                continue
+            assert torch.is_tensor(now), f"{ctx}[{k}]: tensor became other"
+            assert _tensor_meta(now) == was["meta"], \
+                f"{ctx}[{k}]: metadata lost (offset/strides/dtype)"
+            assert bool(torch.equal(now, was["value"])), \
+                f"{ctx}[{k}]: values not bit-exact"
+            assert now.untyped_storage().nbytes() == was["nbytes"], \
+                f"{ctx}[{k}]: full backing-storage extent not preserved"
+        names = sorted(k for k in rec_entry if "ptr" in rec_entry[k])
+        for i, a in enumerate(names):
+            for b in names[i + 1:]:
+                na, nb = live_entry[a], live_entry[b]
+                wa_, wb_ = rec_entry[a], rec_entry[b]
+                assert (
+                    na.untyped_storage().data_ptr() ==
+                    nb.untyped_storage().data_ptr(),
+                    na is nb) == (wa_["ptr"] == wb_["ptr"],
+                                  wa_["oid"] == wb_["oid"]), \
+                    f"{ctx}: storage/object alias relations broke ({a},{b})"
+
+    # same-object equivalence: repeated ref and cross-entry alias intact
+    assert opt_adv.state[w_a]["repeat"] is opt_adv.state[w_a]["base"], \
+        "repeated reference split into independent objects"
+    assert opt_adv.state[w_a]["cross_shared"] is \
+        opt_adv.state[b_a]["cross_shared"], \
+        "cross-entry shared tensor no longer aliases one storage"
+
+    # parameters, gradients (incl. rewritten + None pattern), groups
+    assert _unchanged(ps_adv, pre_params), "param corruption survived"
+    for p in ps_adv:
+        saved = pre_grads[id(p)]
+        if saved is None:
+            assert p.grad is None, "None gradient became a tensor"
+        else:
+            assert p.grad is not None and bool(torch.equal(p.grad, saved)), \
+                "hostilely rewritten gradient not restored bit-exactly"
+    assert _param_groups_unchanged(opt_adv, pre_groups), \
+        "group fields differ after rollback"
+    assert [g["lr"] for g in opt_adv.param_groups] == [0.05], \
+        "mutated LR not rolled back"
+    assert all("injected_meta" not in g for g in opt_adv.param_groups)
+    assert _param_group_param_ids(opt_adv) == pre_ids, \
+        "per-group Parameter identity/order broken"
+
+    # -- disarmed retry of the SAME update vs independent control ----------
+    opt_adv.armed = False
+    fresh_grads(m_adv)
+    with torch.no_grad():
+        b_a.grad = None
+    guarded_optimizer_step(opt_adv, (m_adv(x) ** 2).mean(), ps_adv, 1.0)
+    ctl_step(drop_bias_grad=True)
+
+    assert opt_adv.state is original_mapping
+    assert torch.equal(w_a.detach(), ps_ctl[0].detach()), \
+        "post-retry trajectory diverges from the clean control"
+    assert torch.equal(b_a.detach(), ps_ctl[1].detach())
+    assert all(
+        torch.equal(opt_adv.state[a]["momentum_buffer"],
+                    opt_ctl.state[c]["momentum_buffer"])
+        for a, c in zip(ps_adv, ps_ctl)), \
+        "momentum buffers diverge from the clean control after retry"
+    for k in ("base", "offset_view", "strided_view", "overlap_view",
+              "scalar", "zero_stride"):
+        av, cv = opt_adv.state[w_a][k], opt_ctl.state[ps_ctl[0]][k]
+        assert torch.is_tensor(av) and torch.equal(av, cv), \
+            f"{k}: value diverged from control"
+        assert _tensor_meta(av) == _tensor_meta(cv), \
+            f"{k}: metadata diverged from control"
+    assert opt_adv.state[w_a]["base"] is opt_adv.state[w_a]["repeat"]
+    assert opt_adv.state[w_a]["cross_shared"] is \
+        opt_adv.state[b_a]["cross_shared"]
+
+    # -- alias VISIBILITY post-retry: writes through the base must be
+    # visible through every view sharing its storage (and vice versa) ------
+    entry = opt_adv.state[w_a]
+    with torch.no_grad():
+        off_before = entry["offset_view"][0, 0].item()
+        sc_before = entry["scalar"].item()
+        zs_before = entry["zero_stride"][2, 3].item()
+        ov_before = entry["overlap_view"][1, 2].item()
+        entry["base"].add_(5.0)
+        assert entry["offset_view"][0, 0].item() == \
+            pytest.approx(off_before + 5.0, rel=1e-6)
+        assert entry["scalar"].item() == \
+            pytest.approx(sc_before + 5.0, rel=1e-6)
+        assert entry["zero_stride"][2, 3].item() == \
+            pytest.approx(zs_before + 5.0, rel=1e-6)
+        assert entry["overlap_view"][1, 2].item() == \
+            pytest.approx(ov_before + 5.0, rel=1e-6)
+        bv_before = entry["base"][2, 1].item()
+        entry["offset_view"].mul_(2.0)      # write THROUGH the view...
+        assert entry["base"][2, 1].item() == \
+            pytest.approx(bv_before * 2.0, rel=1e-6)   # ...hits base
+
+
+def test_cross_dtype_storage_alias_fail_closed_before_clip_and_step(
+        monkeypatch):
+    """Two views of ONE untyped storage under different dtypes cannot be
+    serialized faithfully; the transaction must reject them fail-closed
+    BEFORE any mutation — provably before gradient clipping runs and
+    before optimizer.step can ever be reached."""
+    err_cls = getattr(_checkpointing_mod, "OptimizerStateGraphError", None)
+    if err_cls is None:
+        pytest.fail("fail-closed OptimizerStateGraphError preflight missing")
+    torch.manual_seed(9)
+    m = torch.nn.Linear(4, 4)
+    x = torch.randn(6, 4)
+    ps = list(m.parameters())
+    opt = torch.optim.SGD(ps, lr=0.1, momentum=0.9)
+
+    def fresh_grads():
+        m.zero_grad(set_to_none=True)
+        (m(x) ** 2).mean().backward()
+
+    fresh_grads()
+    opt.step()                          # build a real momentum state
+    u = torch.randn(8)
+    halves = u.view(torch.float16)      # SAME untyped storage, fp16 view
+    assert halves.untyped_storage().data_ptr() == \
+        u.untyped_storage().data_ptr()
+    w = ps[0]
+    opt.state[w]["alias_f32"] = u
+    opt.state[w]["alias_f16_view"] = halves
+
+    fresh_grads()
+    pre_params = _snapshot(ps)
+    pre_grads = [p.grad.detach().clone() for p in ps]
+    pre_state = _deep_opt_state(opt)
+
+    clipped, stepped = [], []
+    real_clip = torch.nn.utils.clip_grad_norm_
+
+    def spying_clip(*a, **kw):
+        clipped.append(1)
+        return real_clip(*a, **kw)
+
+    def forbidden_step(*a, **kw):
+        stepped.append(1)
+        raise AssertionError("optimizer.step ran despite unsupported alias")
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", spying_clip)
+    monkeypatch.setattr(opt, "step", forbidden_step)
+
+    with pytest.raises(err_cls, match="different dtypes"):
+        guarded_optimizer_step(opt, (m(x) ** 2).mean(), ps, 1.0)
+
+    assert clipped == [], "gradients were clipped despite unsupported alias"
+    assert stepped == []
+    assert _unchanged(ps, pre_params), "parameters mutated on rejection"
+    for p, g0 in zip(ps, pre_grads):
+        assert p.grad is not None and bool(torch.equal(p.grad, g0)), \
+            "gradients disturbed by the rejection"
+    assert _opt_state_unchanged(opt, pre_state), \
+        "state mutated by the rejection"
+    assert opt.state[w]["alias_f16_view"].untyped_storage().data_ptr() == \
+        opt.state[w]["alias_f32"].untyped_storage().data_ptr(), \
+        "offending alias pair disturbed by the rejection"
 
 
 # ---------------------------------------------------------------------------
