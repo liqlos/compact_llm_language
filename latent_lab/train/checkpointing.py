@@ -13,7 +13,11 @@ Three responsibilities live here:
     optimizer.step() unless loss, the clip configuration, parameters,
     gradients and the clip norm are all finite, with rechecks after
     clipping and after the update; any post-step corruption rolls the
-    parameters and the complete optimizer state back bit-exactly.
+    parameters, the complete optimizer state and the full param-group
+    topology (group count/order, fields, per-group Parameter identities
+    and order) back bit-exactly. The transaction set is derived from the
+    optimizer's own groups, so Parameters omitted by the caller stay
+    covered.
 """
 
 from __future__ import annotations
@@ -365,29 +369,75 @@ def _restore_optimizer_state(optimizer, snap) -> None:
                 live_entry[name] = _deep_clone_tree(val)
 
 
+def _optimizer_owned_params(optimizer) -> list:
+    """Authoritative pre-step Parameter set: every tensor owned by the
+    optimizer's ``param_groups``, in deterministic first-occurrence order.
+    The caller-supplied iterable is never trusted as exhaustive."""
+    owned, seen = [], set()
+    for group in optimizer.param_groups:
+        if isinstance(group, dict):
+            plist = group.get("params", ())
+        else:  # exotic non-dict group objects
+            plist = getattr(group, "params", ())
+        if not isinstance(plist, (list, tuple)):
+            continue
+        for p in plist:
+            if torch.is_tensor(p) and id(p) not in seen:
+                seen.add(id(p))
+                owned.append(p)
+    return owned
+
+
 def _snapshot_param_groups(optimizer) -> list:
-    """Deep-copy every ``param_groups`` field except the live params list."""
-    return [
-        {k: (v.detach().clone() if torch.is_tensor(v) else copy.deepcopy(v))
-         for k, v in group.items() if k != "params"}
-        for group in optimizer.param_groups
-    ]
+    """Structural snapshot of ``param_groups`` sufficient to rebuild the
+    exact pre-step topology. Per group it records the live group dict (by
+    reference), deep copies of every non-``params`` field, whether a
+    ``params`` entry existed, the live params list object (by reference)
+    and a copy of its Parameter order. Parameter objects themselves are
+    never copied or replaced."""
+    snap = []
+    for group in optimizer.param_groups:
+        fields = {
+            k: (v.detach().clone() if torch.is_tensor(v) else copy.deepcopy(v))
+            for k, v in group.items() if k != "params"}
+        had_params = "params" in group
+        plist = group["params"] if had_params else ()
+        params_ref = plist if isinstance(plist, list) else None
+        snap.append((group, fields, had_params, params_ref, list(plist)))
+    return snap
 
 
 def _restore_param_groups(optimizer, snap) -> None:
-    """Restore param-group values IN PLACE: the group dicts and the
-    identity/order of their live Parameter objects are never replaced;
-    fields injected after the snapshot are removed."""
-    if len(optimizer.param_groups) != len(snap):
-        raise RuntimeError(
-            "optimizer.param_groups changed size mid-step; cannot roll back")
-    for group, snap_group in zip(optimizer.param_groups, snap):
+    """Rebuild ``param_groups`` IN PLACE from the snapshot: exact original
+    group count/order, the original group dicts with their original field
+    values, and each group's original live Parameter objects in their
+    exact original order. Hostile additions (groups or per-group params)
+    are undone by removal, hostile removals/reordering by reinsertion of
+    the original objects; no Parameter object is ever replaced."""
+    live = optimizer.param_groups
+    present = {id(g) for g in live}
+    rebuilt = []
+    for group, fields, had_params, params_ref, params_order in snap:
+        if id(group) not in present:      # hostile group removal: reinsert
+            live.append(group)
+            present.add(id(group))
         for key in list(group.keys()):
-            if key != "params" and key not in snap_group:
-                del group[key]
-        for key, val in snap_group.items():
+            if key != "params" and key not in fields:
+                del group[key]            # field injected mid-step
+        for key, val in fields.items():
             group[key] = (val.detach().clone() if torch.is_tensor(val)
                           else copy.deepcopy(val))
+        if had_params:
+            if params_ref is None:        # non-list container: restore contents
+                group["params"] = params_order
+            else:
+                if group.get("params") is not params_ref:
+                    group["params"] = params_ref   # hostile list replacement
+                params_ref[:] = params_order       # identities + order, in place
+        elif "params" in group:
+            del group["params"]
+        rebuilt.append(group)
+    live[:] = rebuilt               # drop injected groups, restore order
 
 
 def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
@@ -401,13 +451,21 @@ def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
         restores the pre-clip gradients.
       * Every trainable parameter, every pre-clip gradient (including the
         ``None`` versus tensor distinction and exact bytes), a deep exact
-        copy of the optimizer state and every ``param_groups`` field are
-        snapshotted before ``optimizer.step()``. If the step raises, or any
-        post-step parameter or optimizer-state tensor is non-finite, all of
-        it — parameters, gradients, complete optimizer state including
-        injected fields, and param-group values — is restored exactly while
-        keeping the live Parameter identities, then the error is raised.
-        The optimizer remains usable after rollback.
+        copy of the optimizer state and the complete ``param_groups``
+        topology (group count/order, every group field, and each group's
+        live Parameter identities in exact order) are snapshotted before
+        ``optimizer.step()``. If the step raises, or any post-step
+        parameter or optimizer-state tensor is non-finite, all of it —
+        parameters, gradients, complete optimizer state including
+        injected fields, and the full param-group structure — is restored
+        exactly while keeping the live Parameter identities, then the
+        error is raised. The optimizer remains usable after rollback.
+      * The caller-supplied ``params`` iterable is never trusted as
+        exhaustive: the authoritative transaction/finite-check set is the
+        deterministic first-occurrence union of the supplied Parameters
+        with every Parameter owned by the optimizer's param_groups, so no
+        optimizer-owned Parameter can be updated by ``optimizer.step()``
+        without snapshot, post-check and rollback coverage.
     """
     _require_torch()
     # -- pre-step validation: nothing has been mutated yet -------------------
@@ -419,7 +477,12 @@ def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
     if not math.isfinite(clip) or clip <= 0.0:
         raise NonFiniteTrainingStateError(
             f"refusing optimizer.step: invalid clip norm {clip_norm!r}")
-    params = list(params)
+    supplied = list(params)
+    params, seen = [], set()
+    for p in supplied + _optimizer_owned_params(optimizer):
+        if id(p) not in seen:
+            seen.add(id(p))
+            params.append(p)
     for p in params:
         if not bool(torch.isfinite(p.detach()).all()):
             raise NonFiniteTrainingStateError(

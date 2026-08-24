@@ -312,7 +312,8 @@ def test_optimizer_step_fail_closed():
 
 
 class _PoisonParamAdam(torch.optim.Adam):
-    """Adam that corrupts a parameter after its own update once armed."""
+    """Adam that corrupts a parameter AND rewrites its per-group params
+    topology after its own update once armed."""
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
@@ -323,10 +324,12 @@ class _PoisonParamAdam(torch.optim.Adam):
         if self.armed:
             with torch.no_grad():
                 self.param_groups[0]["params"][0].add_(float("inf"))
+            self.param_groups[0]["params"].reverse()
 
 
 class _PoisonStateAdam(torch.optim.Adam):
-    """Adam that corrupts its own state after a real update once armed."""
+    """Adam that corrupts its own state AND injects a foreign Parameter at
+    the front of its group after a real update once armed."""
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
@@ -338,6 +341,8 @@ class _PoisonStateAdam(torch.optim.Adam):
             with torch.no_grad():
                 self.state[self.param_groups[0]["params"][0]][
                     "exp_avg"].fill_(float("nan"))
+            self.param_groups[0]["params"].insert(
+                0, torch.nn.Parameter(torch.zeros(1)))
 
 
 def _adam_with_nonempty_state():
@@ -467,8 +472,9 @@ def test_poststep_poisoned_optimizer_state_rolls_back_exactly():
 
 class _AdversarialSGD(torch.optim.SGD):
     """Performs a REAL update, then corrupts parameters, tensor and
-    non-tensor optimizer state and ``param_groups`` (LR + injected
-    metadata), and finally raises — the worst-case mid-step failure."""
+    non-tensor optimizer state, ``param_groups`` (LR + injected metadata +
+    per-group params topology), and finally raises — the worst-case
+    mid-step failure."""
 
     def __init__(self, params, lr):
         super().__init__(params, lr=lr, momentum=0.9)
@@ -487,6 +493,10 @@ class _AdversarialSGD(torch.optim.SGD):
                     state["momentum_buffer"].add_(11.0)
                     state["poison_flag"] = "corrupted"
             self.param_groups[0]["params"][0].add_(7.0)
+        # hostile params-topology rewrite: reorder + foreign addition
+        self.param_groups[0]["params"].reverse()
+        self.param_groups[0]["params"].append(
+            torch.nn.Parameter(torch.zeros(1)))
         raise RuntimeError("adversarial failure after full corruption")
 
 
@@ -584,6 +594,230 @@ def test_adversarial_step_rolls_back_everything_then_matches_control():
         "optimizer state diverges from the clean control after retry"
     assert all(g["lr"] == 0.05 and "injected_meta" not in g
                for g in opt_adv.param_groups)
+
+
+class _OmittedParamPoisonSGD(torch.optim.SGD):
+    """Performs a real update over BOTH owned Parameters, then corrupts
+    the caller-OMITTED one (finitely) and raises — coverage must not
+    depend on the caller's iterable."""
+
+    def __init__(self, params, lr):
+        super().__init__(params, lr=lr, momentum=0.9)
+        self.armed = False
+        self.calls = 0
+        self.omitted_after = None
+
+    def step(self, closure=None):
+        super().step(closure)
+        self.calls += 1
+        if self.armed:
+            victim = self.param_groups[0]["params"][1]
+            with torch.no_grad():
+                victim.add_(5.0)
+                self.omitted_after = victim.detach().clone()
+            raise RuntimeError("omitted-param adversarial failure")
+
+
+def test_caller_omitted_owned_parameter_is_fully_covered():
+    torch.manual_seed(11)
+    m = torch.nn.Linear(4, 4)
+    x = torch.randn(6, 4)
+    ps = list(m.parameters())
+    assert len(ps) >= 2
+    opt = _OmittedParamPoisonSGD(ps, lr=0.1)
+
+    def fresh_grads():
+        m.zero_grad(set_to_none=True)
+        loss = (m(x) ** 2).mean()
+        loss.backward()
+        return loss
+
+    # clean build-up step: identical supplied/owned sets
+    guarded_optimizer_step(opt, fresh_grads().detach(), ps, 1.0)
+    assert opt.calls == 1
+    omitted = ps[1]
+
+    opt.armed = True
+    fresh_grads()
+    pre_params = _snapshot(ps)
+    pre_grads = {id(p): p.grad.detach().clone() for p in ps}
+    pre_state = _deep_opt_state(opt)
+    pre_groups = _param_groups_snapshot(opt)
+    pre_ids = _param_group_param_ids(opt)
+
+    with pytest.raises(RuntimeError, match="omitted-param"):
+        guarded_optimizer_step(opt, torch.tensor(0.5), [ps[0]], 1.0)
+
+    assert opt.calls == 2, "adversarial step never ran; coverage unproven"
+    assert opt.omitted_after is not None and \
+        not torch.equal(opt.omitted_after, pre_params[id(omitted)]), \
+        "the caller-omitted Parameter was never actually mutated mid-step"
+    assert _unchanged(ps, pre_params), \
+        "supplied Parameter corruption survived the rollback"
+    assert bool(torch.equal(omitted.detach(), pre_params[id(omitted)])), \
+        "optimizer-owned Parameter omitted by the caller was not rolled back"
+    for p in ps:
+        assert p.grad is not None and bool(torch.equal(p.grad,
+                                                       pre_grads[id(p)])), \
+            "pre-clip gradients were not restored bit-exactly"
+    assert _opt_state_unchanged(opt, pre_state), \
+        "optimizer state differs after rollback"
+    assert _param_groups_unchanged(opt, pre_groups), \
+        "param-group fields differ after rollback"
+    assert _param_group_param_ids(opt) == pre_ids, \
+        "params topology not restored by rollback"
+
+    # disarmed retry with the SAME partial iterable still covers everything
+    opt.armed = False
+    guarded_optimizer_step(opt, fresh_grads().detach(), [ps[0]], 1.0)
+    assert not _unchanged(ps, pre_params), \
+        "retry after disarm did not update every owned parameter"
+
+
+class _TopologyPoisonSGD(torch.optim.SGD):
+    """Two param groups with different hyperparameters: performs a REAL
+    update, then rewrites group AND per-group params topology (cross-group
+    move, reorder, hostile addition, hostile removal, full group-list
+    reversal), corrupts values/state/metadata, and finally raises."""
+
+    def __init__(self, groups, lr):
+        super().__init__(groups, lr=lr)
+        self.armed = False
+        self.foreign = torch.nn.Parameter(torch.zeros(2))
+
+    def step(self, closure=None):
+        super().step(closure)
+        if not self.armed:
+            return
+        g0, g1 = self.param_groups[0], self.param_groups[1]
+        with torch.no_grad():
+            for group in self.param_groups:
+                group["lr"] = 123.0
+                group["injected_meta"] = {"evil": [1]}
+            for state in self.state.values():
+                if "momentum_buffer" in state:
+                    state["momentum_buffer"].add_(11.0)
+                    state["poison_flag"] = "corrupted"
+            g0["params"][0].add_(7.0)          # value corruption
+        moved = g1["params"][0]                # hostile cross-group move...
+        del g1["params"][0]                    # ...and per-group removal
+        g0["params"].insert(0, moved)          # ...plus in-group reorder
+        g0["params"].append(self.foreign)      # hostile param addition
+        self.param_groups.reverse()            # hostile group reorder
+        raise RuntimeError("topology-adversarial failure")
+
+
+def test_adversarial_two_group_topology_rollback_then_matches_control():
+    def _build(seed):
+        torch.manual_seed(seed)
+        m = torch.nn.Linear(4, 4)
+        return m, list(m.parameters())
+
+    torch.manual_seed(21)
+    x = torch.randn(8, 4)
+    m_adv, ps_adv = _build(31)
+    m_ctl, ps_ctl = _build(31)
+    w_a, b_a = ps_adv
+    w_c, b_c = ps_ctl
+
+    groups_adv = [{"params": [w_a], "lr": 0.05, "momentum": 0.9},
+                  {"params": [b_a], "lr": 0.20, "momentum": 0.5}]
+    groups_ctl = [{"params": [w_c], "lr": 0.05, "momentum": 0.9},
+                  {"params": [b_c], "lr": 0.20, "momentum": 0.5}]
+    opt_adv = _TopologyPoisonSGD(groups_adv, lr=0.05)
+    opt_ctl = torch.optim.SGD(groups_ctl, lr=0.05)
+    foreign = opt_adv.foreign
+
+    def fresh_grads(m):
+        m.zero_grad(set_to_none=True)
+        loss = (m(x) ** 2).mean()
+        loss.backward()
+        return loss
+
+    def ctl_step(drop_bias_grad=False):
+        fresh_grads(m_ctl)
+        if drop_bias_grad:                  # mirror None-vs-tensor pattern
+            with torch.no_grad():
+                b_c.grad = None
+        torch.nn.utils.clip_grad_norm_(ps_ctl, 1.0)
+        opt_ctl.step()
+
+    # one clean step on both sides -> identical non-empty momentum state
+    guarded_optimizer_step(opt_adv, fresh_grads(m_adv).detach(), ps_adv, 1.0)
+    ctl_step()
+    assert bool(torch.equal(w_a.detach(), w_c.detach())) and \
+        bool(torch.equal(b_a.detach(), b_c.detach()))
+    assert all(
+        torch.equal(opt_adv.state[a]["momentum_buffer"],
+                    opt_ctl.state[b]["momentum_buffer"])
+        for a, b in zip(ps_adv, ps_ctl)), \
+        "pairs did not start from identical optimizer state"
+
+    # -- armed failure after a real, topology-rewriting update --------------
+    opt_adv.armed = True
+    fresh_grads(m_adv)
+    with torch.no_grad():
+        b_a.grad = None                     # None-vs-tensor grad pattern
+    pre_params = _snapshot(ps_adv)
+    pre_grads = {id(p): (None if p.grad is None else p.grad.detach().clone())
+                 for p in ps_adv}
+    pre_state = _deep_opt_state(opt_adv)
+    pre_groups = _param_groups_snapshot(opt_adv)
+    pre_ids = _param_group_param_ids(opt_adv)
+    assert pre_ids == [[id(w_a)], [id(b_a)]]
+
+    with pytest.raises(RuntimeError, match="topology-adversarial"):
+        guarded_optimizer_step(opt_adv, torch.tensor(0.5), ps_adv, 1.0)
+
+    # exact original group count/order and mappings
+    assert len(opt_adv.param_groups) == 2, "group count not restored"
+    assert _param_group_param_ids(opt_adv) == pre_ids, \
+        "per-group Parameter identity/order not restored"
+    assert [g["lr"] for g in opt_adv.param_groups] == [0.05, 0.20], \
+        "group order / hyperparameter mapping not restored"
+    assert [g["momentum"] for g in opt_adv.param_groups] == [0.9, 0.5]
+    assert all("injected_meta" not in g for g in opt_adv.param_groups), \
+        "injected group field survived rollback"
+    assert all(id(foreign) not in {id(p) for p in g["params"]}
+               for g in opt_adv.param_groups), \
+        "hostilely-added foreign Parameter survived rollback"
+    # bit-exact parameters, gradients, optimizer state, non-params fields
+    assert _unchanged(ps_adv, pre_params), "value corruption survived"
+    for p in ps_adv:
+        saved = pre_grads[id(p)]
+        if saved is None:
+            assert p.grad is None, "None gradient became a tensor"
+        else:
+            assert p.grad is not None and bool(torch.equal(p.grad, saved))
+    assert _opt_state_unchanged(opt_adv, pre_state), \
+        "optimizer state not restored bit-exactly"
+    assert all("poison_flag" not in st for st in opt_adv.state.values()), \
+        "injected state field survived rollback"
+    assert _param_groups_unchanged(opt_adv, pre_groups), \
+        "non-params group fields not restored bit-exactly"
+
+    # -- disarmed retry of the SAME update vs independent control ----------
+    opt_adv.armed = False
+    fresh_grads(m_adv)
+    with torch.no_grad():
+        b_a.grad = None                     # control mirrors this pattern
+    guarded_optimizer_step(opt_adv, (m_adv(x) ** 2).mean(), ps_adv, 1.0)
+    ctl_step(drop_bias_grad=True)
+
+    assert bool(torch.equal(w_a.detach(), w_c.detach())), \
+        "post-retry weight trajectory diverges from the clean control"
+    assert bool(torch.equal(b_a.detach(), b_c.detach())), \
+        "post-retry bias trajectory diverges from the clean control"
+    assert all(
+        torch.equal(opt_adv.state[a]["momentum_buffer"],
+                    opt_ctl.state[b]["momentum_buffer"])
+        for a, b in zip(ps_adv, ps_ctl)), \
+        "optimizer state diverges from the clean control after retry"
+    assert _param_group_param_ids(opt_adv) == [[id(w_a)], [id(b_a)]], \
+        "retry topology diverges from the clean control mapping"
+    assert [g["lr"] for g in opt_adv.param_groups] == [0.05, 0.20]
+    assert [g["momentum"] for g in opt_adv.param_groups] == [0.9, 0.5]
+    assert all("injected_meta" not in g for g in opt_adv.param_groups)
 
 
 # ---------------------------------------------------------------------------
