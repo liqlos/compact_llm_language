@@ -14,13 +14,15 @@ Three responsibilities live here:
     gradients and the clip norm are all finite, with rechecks after
     clipping and after the update; any post-step corruption rolls the
     parameters, the complete optimizer state (every tensor's values AND
-    its exact shape/dtype/device/layout/stride metadata, structurally
-    exact) and the full param-group topology (the original outer list
-    object, group count/order, fields, per-group Parameter identities
-    and order) back bit-exactly, without ever masking or replacing the
-    original step exception. The transaction set is derived from the
-    optimizer's own groups, so Parameters omitted by the caller stay
-    covered.
+    its exact shape/dtype/device/layout/stride/storage-offset metadata,
+    structurally exact, WITH the full shared-storage alias graph — each
+    distinct backing storage is cloned once and every view is rebuilt
+    onto that clone) and the full param-group topology (the original
+    outer list object, group count/order, fields, per-group Parameter
+    identities and order) back bit-exactly, without ever masking or
+    replacing the original step exception. The transaction set is
+    derived from the optimizer's own groups, so Parameters omitted by
+    the caller stay covered.
 """
 
 from __future__ import annotations
@@ -325,17 +327,90 @@ def load_adapter_bundle(path, *, model_id, revision) -> dict:
 # fail-closed optimizer stepping
 # ---------------------------------------------------------------------------
 
-def _deep_clone_tree(obj):
-    """Exact deep copy of a tensor tree (optimizer state shapes)."""
+def _iter_unique_tensors(obj, out, seen) -> None:
+    """Depth-first collection of every UNIQUE tensor object in obj."""
     if torch.is_tensor(obj):
-        return obj.detach().clone()
+        if id(obj) not in seen:
+            seen.add(id(obj))
+            out.append(obj)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _iter_unique_tensors(v, out, seen)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            _iter_unique_tensors(v, out, seen)
+
+
+def _exact_tensor_clone(t):
+    """Reproduce ``t`` exactly — values, dtype, device, layout, shape,
+    strides AND storage offset — as a fresh untracked tensor backed by a
+    full clone of its underlying storage (not a normalized dense copy)."""
+    new_storage = t.untyped_storage().clone()
+    out = torch.empty(0, dtype=t.dtype, device=t.device)
+    out.set_(new_storage, t.storage_offset(), tuple(t.shape),
+             tuple(t.stride()))
+    return out
+
+
+def _build_exact_tensor_clones(tensors) -> dict:
+    """One exact clone per unique tensor; tensors that SHARE a backing
+    storage are rebuilt as views onto ONE cloned storage, so alias
+    relationships survive the snapshot verbatim. Non-strided layouts
+    fall back to ``detach().clone()`` (already layout-exact); empty
+    storages carry no addressable bytes and are never deduplicated."""
+    clones, storage_clones = {}, {}
+    for t in tensors:
+        if t.layout != torch.strided:
+            clones[id(t)] = t.detach().clone()
+            continue
+        storage = t.untyped_storage()
+        if storage.nbytes() == 0:
+            clones[id(t)] = _exact_tensor_clone(t)
+            continue
+        key = (storage.data_ptr(), storage.nbytes())
+        new_storage = storage_clones.get(key)
+        if new_storage is None:
+            new_storage = storage.clone()
+            storage_clones[key] = new_storage
+        out = torch.empty(0, dtype=t.dtype, device=t.device)
+        out.set_(new_storage, t.storage_offset(), tuple(t.shape),
+                 tuple(t.stride()))
+        clones[id(t)] = out
+    return clones
+
+
+def _rebuild_tree(obj, clones, memo):
+    if torch.is_tensor(obj):
+        return clones[id(obj)]
+    if id(obj) in memo:
+        return memo[id(obj)]
     if isinstance(obj, dict):
-        return {k: _deep_clone_tree(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_deep_clone_tree(v) for v in obj]
-    if isinstance(obj, tuple):
-        return tuple(_deep_clone_tree(v) for v in obj)
-    return obj
+        out = {k: _rebuild_tree(v, clones, memo) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        out = [_rebuild_tree(v, clones, memo) for v in obj]
+    elif isinstance(obj, tuple):
+        out = tuple(_rebuild_tree(v, clones, memo) for v in obj)
+    else:
+        return obj
+    memo[id(obj)] = out
+    return out
+
+
+def _deep_clone_tree(obj):
+    """Exact deep copy of a tensor tree (optimizer state shapes).
+
+    Beyond values, every tensor's dtype, device, layout, shape, strides
+    and storage offset are reproduced, and the FULL reachable storage
+    graph is preserved: each distinct backing storage is cloned once and
+    every view is rebuilt onto that clone, so shared-storage alias
+    relationships between leaves and repeated tensor objects survive
+    verbatim (container objects are memoized too; dict KEYS — e.g. the
+    Parameters keying ``optimizer.state`` — are never cloned).
+    """
+    tensors: list = []
+    _iter_unique_tensors(obj, tensors, set())
+    clones = _build_exact_tensor_clones(tensors)
+    return _rebuild_tree(obj, clones, {})
 
 
 def _tree_is_finite(obj) -> bool:
@@ -362,37 +437,106 @@ def _inplace_exact_restore_possible(live, snap) -> bool:
             and live.storage_offset() == snap.storage_offset())
 
 
-def _restore_optimizer_state(optimizer, snap) -> None:
-    """Roll optimizer.state back to the snapshot bit-exactly, in place.
+def _match_state_trees(live, snap, pairs, scalars) -> bool:
+    """Structurally position ``snap`` against ``live``.
 
-    A snapshot leaf is restored through its live tensor object ONLY when
-    that object is structurally compatible (same shape, dtype, device,
-    layout, strides, storage offset), so in-place restoration is exact;
-    every other leaf — replaced objects, mismatched metadata, non-tensor
-    values, injected fields — is rebound to a fresh clone of the pristine
-    snapshot. ``Tensor.copy_`` therefore can never cast dtypes, coerce
-    shapes or fail with a size mismatch during rollback."""
-    state = optimizer.state
-    for key in list(state.keys()):
-        if key not in snap:
-            del state[key]
-    for key, snap_entry in snap.items():
-        live_entry = state.get(key) if hasattr(state, "get") else None
-        if not isinstance(live_entry, dict) or \
-                not isinstance(snap_entry, dict):
-            state[key] = _deep_clone_tree(snap_entry)
-            continue
-        for name in list(live_entry.keys()):
-            if name not in snap_entry:
-                del live_entry[name]
-        for name, val in snap_entry.items():
-            live_val = live_entry.get(name)
-            if torch.is_tensor(val) and torch.is_tensor(live_val) and \
-                    _inplace_exact_restore_possible(live_val, val):
-                with torch.no_grad():
-                    live_val.copy_(val)
+    Records ``(live_tensor, snap_tensor)`` in-place restore pairs and
+    ``(container, key, snapshot_value)`` scalar rebinding records along
+    the way. Returns False on ANY divergence that makes positional
+    restoration impossible: missing/extra keys, container-kind/length
+    mismatch, or a tensor position held by a non-tensor (or vice versa).
+    Scalar leaves never block — they are simply rebound."""
+    if torch.is_tensor(snap):
+        if not torch.is_tensor(live):
+            return False
+        pairs.append((live, snap))
+        return True
+    if isinstance(snap, dict):
+        if not isinstance(live, dict) or set(live.keys()) != set(snap.keys()):
+            return False
+        for k, v in snap.items():
+            if torch.is_tensor(v) or isinstance(v, (dict, list, tuple)):
+                if not _match_state_trees(live[k], v, pairs, scalars):
+                    return False
             else:
-                live_entry[name] = _deep_clone_tree(val)
+                scalars.append((live, k, v))
+        return True
+    if isinstance(snap, (list, tuple)):
+        if type(live) is not type(snap) or len(live) != len(snap):
+            return False
+        for i, v in enumerate(snap):
+            if torch.is_tensor(v) or isinstance(v, (dict, list, tuple)):
+                if not _match_state_trees(live[i], v, pairs, scalars):
+                    return False
+            else:
+                scalars.append((live, i, v))
+        return True
+    return True
+
+
+def _same_storage(a, b) -> bool:
+    sa, sb = a.untyped_storage(), b.untyped_storage()
+    return (sa.nbytes() > 0 and sa.nbytes() == sb.nbytes()
+            and sa.data_ptr() == sb.data_ptr())
+
+
+def _storage_partition_signature(tensors) -> tuple:
+    """Group id per tensor: the index of the first member of its shared-
+    storage group. Equal signatures mean equal storage partitions."""
+    sig = []
+    for i, t in enumerate(tensors):
+        root = i
+        for j in range(i):
+            if _same_storage(t, tensors[j]):
+                root = sig[j]
+                break
+        sig.append(root)
+    return tuple(sig)
+
+
+def _restore_optimizer_state(optimizer, snap) -> None:
+    """Roll optimizer.state back to the snapshot bit-exactly.
+
+    The decision is ALL-OR-NOTHING per rollback so an alias group can
+    never be torn apart by mixed strategies. When the live tree still
+    realizes the snapshot's exact structure (identical key sets and
+    container shapes, a tensor at every tensor position), every leaf is
+    metadata-compatible for ``Tensor.copy_``, and the live tensors
+    realize exactly the snapshot's shared-storage partition, each scalar
+    is rebound and every tensor is restored through its live object —
+    keeping external references and alias groupings coherent. ANY other
+    situation — replaced objects, swapped shape/dtype/device/layout/
+    stride/storage-offset metadata, injected or deleted fields, broken
+    alias groupings — rebinds the whole state to fresh exact clones of
+    the pristine snapshot, which carry every tensor's values AND full
+    metadata plus the complete shared-storage graph (views share one
+    cloned backing storage). Either way restoration is bit-exact,
+    structurally exact and alias-exact, and can never raise a size/dtype
+    mismatch during rollback.
+    """
+    state = optimizer.state
+    pairs: list = []
+    scalars: list = []
+    inplace = (
+        isinstance(state, dict)
+        and set(state.keys()) == set(snap.keys())
+        and _match_state_trees(state, snap, pairs, scalars)
+        and all(_inplace_exact_restore_possible(t, s) for t, s in pairs)
+        and (_storage_partition_signature([t for t, _ in pairs])
+             == _storage_partition_signature([s for _, s in pairs]))
+    )
+    if inplace:
+        for container, k, v in scalars:
+            container[k] = v
+        with torch.no_grad():
+            for live_t, snap_t in pairs:
+                live_t.copy_(snap_t)
+        return
+    rebuilt = _deep_clone_tree(snap)
+    for k in list(state.keys()):
+        del state[k]
+    for k, v in rebuilt.items():
+        state[k] = v
 
 
 def _optimizer_owned_params(optimizer) -> list:
@@ -427,7 +571,8 @@ def _snapshot_param_groups(optimizer) -> tuple:
     snap = []
     for group in groups_obj:
         fields = {
-            k: (v.detach().clone() if torch.is_tensor(v) else copy.deepcopy(v))
+            k: (_deep_clone_tree(v) if torch.is_tensor(v)
+                else copy.deepcopy(v))
             for k, v in group.items() if k != "params"}
         had_params = "params" in group
         plist = group["params"] if had_params else ()
@@ -463,7 +608,7 @@ def _restore_param_groups(optimizer, snap) -> None:
             if key != "params" and key not in fields:
                 del group[key]            # field injected mid-step
         for key, val in fields.items():
-            group[key] = (val.detach().clone() if torch.is_tensor(val)
+            group[key] = (_deep_clone_tree(val) if torch.is_tensor(val)
                           else copy.deepcopy(val))
         if had_params:
             if params_ref is None:        # non-list container: restore contents
@@ -488,22 +633,29 @@ def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
       * Gradients are rechecked after clipping; a post-clip rejection also
         restores the pre-clip gradients.
       * Every trainable parameter, every pre-clip gradient (including the
-        ``None`` versus tensor distinction and exact bytes), a deep exact
-        copy of the optimizer state and the complete ``param_groups``
+        ``None`` versus tensor distinction and exact bytes), an alias-and-
+        metadata-exact deep copy of the optimizer state (every reachable
+        storage cloned once, views rebound onto shared clones, so values,
+        dtype, device, layout, shape, strides, storage offset AND shared-
+        storage relationships survive) and the complete ``param_groups``
         topology (the original outer list object, group count/order,
         every group field, and each group's live Parameter identities in
         exact order) are snapshotted before ``optimizer.step()``. If the
         step raises, or any post-step parameter or optimizer-state tensor
         is non-finite, all of it — parameters, gradients, complete
         optimizer state including injected fields with every tensor's
-        exact shape/dtype/device/layout/stride metadata, and the full
-        param-group structure down to outer-list identity — is restored
-        exactly while keeping the live Parameter identities; a state leaf
-        whose metadata was swapped mid-step is rebound from the pristine
-        snapshot rather than copied through, so rollback itself can never
-        raise a size/dtype mismatch. The original step exception is then
-        re-raised intact (rollback failures chain onto it as __cause__,
-        never replacing it). The optimizer remains usable after rollback.
+        exact shape/dtype/device/layout/stride/storage-offset metadata
+        and the full shared-storage alias graph, and the full param-group
+        structure down to outer-list identity — is restored
+        exactly while keeping the live Parameter identities; state is
+        either restored in place through its live tensors (structure,
+        metadata and alias partition all intact) or rebound wholesale
+        from the pristine snapshot — never a torn mix of both, so an
+        alias group can never be split across storages, and rollback
+        itself can never raise a size/dtype mismatch. The original step
+        exception is then re-raised intact (rollback failures chain onto
+        it as __cause__, never replacing it). The optimizer remains
+        usable after rollback.
       * The caller-supplied ``params`` iterable is never trusted as
         exhaustive: the authoritative transaction/finite-check set is the
         deterministic first-occurrence union of the supplied Parameters

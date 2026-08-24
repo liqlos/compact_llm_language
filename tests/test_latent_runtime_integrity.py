@@ -1186,6 +1186,307 @@ def test_adversarial_outer_param_groups_list_identity_restored():
 
 
 # ---------------------------------------------------------------------------
+# alias/view-exact optimizer-state rollback (shared-storage graph)
+# ---------------------------------------------------------------------------
+
+def _meta(t) -> tuple:
+    """Observable tensor metadata: shape, strides, storage offset,
+    dtype, device, layout."""
+    return (tuple(t.shape), tuple(t.stride()), t.storage_offset(),
+            t.dtype, t.device, t.layout)
+
+
+def _storage_overlay(t):
+    """A detached dense copy of t's FULL backing storage (every byte the
+    storage can address, not just the tensor's view of it)."""
+    storage = t.untyped_storage()
+    n = storage.nbytes() // t.element_size()
+    overlay = torch.empty(0, dtype=t.dtype, device=t.device)
+    overlay.set_(storage, 0, (n,), (1,))
+    return overlay.clone()
+
+
+def _alias_fixture(seed: int, optimizer_factory=None):
+    """Model/optimizer pair whose weight state holds an offset base
+    tensor plus a non-dense strided ALIAS VIEW of the same storage."""
+    torch.manual_seed(seed)
+    m = torch.nn.Linear(4, 4)
+    x = torch.randn(8, 4)
+    ps = list(m.parameters())
+    if optimizer_factory is None:
+        opt = torch.optim.SGD(ps, lr=0.05, momentum=0.9)
+    else:
+        opt = optimizer_factory(ps)
+    backing = torch.arange(24, dtype=torch.float32).reshape(4, 6) * 0.5 - 3.25
+    base = backing[:, 1:5]              # offset 1, strides (6, 1)
+    view = base[::2, ::2]               # offset 1, strides (12, 2), (2, 2)
+    assert base.storage_offset() == 1 and tuple(base.stride()) == (6, 1)
+    assert view.storage_offset() == 1 and tuple(view.stride()) == (12, 2)
+    opt.state[ps[0]]["alias_base"] = base
+    opt.state[ps[0]]["alias_view"] = view
+    return m, x, ps, opt, base, view
+
+
+class _AliasViewPoisonSGD(torch.optim.SGD):
+    """Performs a REAL update, then corrupts the aliased state pair —
+    values rewritten through the base (hence through the shared
+    storage), momentum corrupted, the view REPLACED by a dense foreign
+    tensor (destroying offset and alias), junk state injected — plus a
+    hostile parameter update, gradient rewrite, group-metadata rewrite
+    and params reorder, and finally raises."""
+
+    def __init__(self, params, lr):
+        super().__init__(params, lr=lr, momentum=0.9)
+        self.armed = False
+
+    def step(self, closure=None):
+        super().step(closure)
+        if not self.armed:
+            return
+        w = self.param_groups[0]["params"][0]
+        b = self.param_groups[0]["params"][1]
+        st = self.state[w]
+        with torch.no_grad():
+            st["alias_base"].fill_(-666.0)     # corrupt THROUGH the alias
+            st["momentum_buffer"].add_(11.0)
+            w.add_(7.0)                        # real parameter corruption
+            for g in self.param_groups:
+                g["lr"] = 123.0
+                g["injected_meta"] = {"evil": [1]}
+            if b.grad is not None:
+                b.grad.fill_(99.0)             # hostile gradient rewrite
+        st["alias_view"] = torch.full((2, 2), 777.0)   # alias DESTROYED
+        st["evil_flag"] = "corrupted"                  # injected field
+        self.param_groups[0]["params"].reverse()       # hostile reorder
+        raise RuntimeError("alias-view adversarial failure")
+
+
+def test_adversarial_alias_view_state_rolls_back_exactly_then_matches_control():
+    m_adv, x, ps_adv, opt_adv, base_a, view_a = _alias_fixture(
+        13, lambda ps: _AliasViewPoisonSGD(ps, lr=0.05))
+    # independent control pair, identically initialized:
+    m_ctl, x_c, ps_ctl, opt_ctl, base_c, view_c = _alias_fixture(13)
+
+    def plain_step(m, ps, opt, xv):
+        m.zero_grad(set_to_none=True)
+        loss = (m(xv) ** 2).mean()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(ps, 1.0)
+        opt.step()
+
+    # one clean step on both sides -> identical state incl. the aliases
+    m_adv.zero_grad(set_to_none=True)
+    loss_a = (m_adv(x) ** 2).mean()
+    loss_a.backward()
+    guarded_optimizer_step(opt_adv, loss_a.detach(), ps_adv, 1.0)
+    plain_step(m_ctl, ps_ctl, opt_ctl, x_c)
+    assert bool(torch.equal(ps_adv[0].detach(), ps_ctl[0].detach()))
+    assert torch.equal(base_a, base_c) and torch.equal(view_a, view_c)
+
+    opt_adv.armed = True
+    m_adv.zero_grad(set_to_none=True)
+    (m_adv(x) ** 2).mean().backward()
+    w_a = ps_adv[0]
+    st = opt_adv.state[w_a]
+    pre_params = _snapshot(ps_adv)
+    pre_grads = {id(p): p.grad.detach().clone() for p in ps_adv}
+    pre_momentum = st["momentum_buffer"].detach().clone()
+    exp_base_vals, exp_view_vals = base_a.clone(), view_a.clone()
+    exp_backing = _storage_overlay(base_a)
+    meta_base, meta_view = _meta(base_a), _meta(view_a)
+    pre_keys = set(st.keys())
+    pre_ids = _param_group_param_ids(opt_adv)
+
+    with pytest.raises(RuntimeError,
+                       match="alias-view adversarial failure") as e:
+        guarded_optimizer_step(opt_adv, torch.tensor(0.5), ps_adv, 1.0)
+    assert type(e.value) is RuntimeError, \
+        "original step exception was masked by a rollback failure"
+
+    # parameters, gradients, group metadata/topology restored exactly
+    assert _unchanged(ps_adv, pre_params), "parameter corruption survived"
+    for p in ps_adv:
+        assert p.grad is not None and \
+            bool(torch.equal(p.grad, pre_grads[id(p)])), \
+            "pre-step gradients were not restored bit-exactly"
+    assert [g["lr"] for g in opt_adv.param_groups] == [0.05], \
+        "mutated LR was not rolled back"
+    assert all("injected_meta" not in g for g in opt_adv.param_groups)
+    assert _param_group_param_ids(opt_adv) == pre_ids, \
+        "per-group Parameter identity/order not restored"
+
+    # state topology restored; injected field gone (re-fetch: a rebind
+    # rollback may install fresh per-param dicts)
+    st = opt_adv.state[w_a]
+    live_base, live_view = st["alias_base"], st["alias_view"]
+    assert set(st.keys()) == pre_keys, "state key set not restored exactly"
+    assert "evil_flag" not in st
+
+    # exact post-rollback metadata + storage alias proof
+    assert _meta(live_base) == meta_base, \
+        "base tensor metadata (strides/offset) not preserved"
+    assert _meta(live_view) == meta_view, \
+        "view tensor metadata (strides/storage_offset) not preserved"
+    sb, sv = live_base.untyped_storage(), live_view.untyped_storage()
+    assert sv.data_ptr() == sb.data_ptr() and sv.nbytes() == sb.nbytes(), \
+        "shared-storage alias relationship was destroyed by rollback"
+    assert torch.equal(live_base, exp_base_vals), \
+        "base values not restored bit-exactly"
+    assert torch.equal(live_view, exp_view_vals), \
+        "view values not restored bit-exactly"
+    assert torch.equal(_storage_overlay(live_base), exp_backing), \
+        "full backing storage bytes were not restored bit-exactly"
+    assert torch.equal(st["momentum_buffer"], pre_momentum)
+
+    # -- disarmed retry of the SAME update vs independent control ----------
+    opt_adv.armed = False
+    guarded_optimizer_step(opt_adv, (m_adv(x) ** 2).mean(), ps_adv, 1.0)
+    plain_step(m_ctl, ps_ctl, opt_ctl, x_c)
+
+    st = opt_adv.state[w_a]
+    assert bool(torch.equal(ps_adv[0].detach(), ps_ctl[0].detach())) and \
+        bool(torch.equal(ps_adv[1].detach(), ps_ctl[1].detach())), \
+        "post-retry trajectory diverges from the clean control"
+    assert all(
+        torch.equal(opt_adv.state[a]["momentum_buffer"],
+                    opt_ctl.state[c]["momentum_buffer"])
+        for a, c in zip(ps_adv, ps_ctl)), \
+        "optimizer state diverges from the clean control after retry"
+    assert torch.equal(st["alias_base"],
+                       opt_ctl.state[ps_ctl[0]]["alias_base"]) and \
+        torch.equal(st["alias_view"],
+                    opt_ctl.state[ps_ctl[0]]["alias_view"]), \
+        "aliased state tensors diverge from the clean control after retry"
+    assert _meta(st["alias_base"]) == meta_base and \
+        _meta(st["alias_view"]) == meta_view, \
+        "retry lost the exact alias-view metadata"
+    sv2 = st["alias_view"].untyped_storage()
+    sb2 = st["alias_base"].untyped_storage()
+    assert sv2.data_ptr() == sb2.data_ptr() and sv2.nbytes() == sb2.nbytes()
+
+
+class _AliasValueOnlyPoisonSGD(torch.optim.SGD):
+    """Performs a REAL update, then corrupts ONLY VALUES (through the
+    aliased base and the view itself) and raises — no object is replaced,
+    so rollback must restore in place with identities AND aliases kept."""
+
+    def __init__(self, params, lr):
+        super().__init__(params, lr=lr, momentum=0.9)
+        self.armed = False
+
+    def step(self, closure=None):
+        super().step(closure)
+        if not self.armed:
+            return
+        st = self.state[self.param_groups[0]["params"][0]]
+        with torch.no_grad():
+            st["alias_base"].fill_(-666.0)
+            st["alias_view"].fill_(777.0)
+            st["momentum_buffer"].add_(11.0)
+        raise RuntimeError("value-only alias corruption")
+
+
+def test_alias_view_value_corruption_restored_in_place_aliases_intact():
+    m_adv, x, ps_adv, opt_adv, base_a, view_a = _alias_fixture(
+        29, lambda ps: _AliasValueOnlyPoisonSGD(ps, lr=0.05))
+    m_adv.zero_grad(set_to_none=True)
+    loss_a = (m_adv(x) ** 2).mean()
+    loss_a.backward()
+    guarded_optimizer_step(opt_adv, loss_a.detach(), ps_adv, 1.0)
+    w_a = ps_adv[0]
+    st = opt_adv.state[w_a]
+
+    opt_adv.armed = True
+    m_adv.zero_grad(set_to_none=True)
+    (m_adv(x) ** 2).mean().backward()
+    pre_params = _snapshot(ps_adv)
+    exp_base_vals, exp_view_vals = base_a.clone(), view_a.clone()
+    exp_backing = _storage_overlay(base_a)
+    pre_momentum = st["momentum_buffer"].detach().clone()
+
+    with pytest.raises(RuntimeError, match="value-only alias corruption"):
+        guarded_optimizer_step(opt_adv, torch.tensor(0.5), ps_adv, 1.0)
+
+    assert st["alias_base"] is base_a and st["alias_view"] is view_a, \
+        "rollback rebound structurally-intact tensors instead of an " \
+        "exact in-place restore"
+    assert _unchanged(ps_adv, pre_params)
+    assert _meta(st["alias_base"]) == _meta(base_a)
+    assert _meta(st["alias_view"]) == _meta(view_a)
+    assert torch.equal(st["alias_base"], exp_base_vals)
+    assert torch.equal(st["alias_view"], exp_view_vals)
+    sb = st["alias_base"].untyped_storage()
+    sv = st["alias_view"].untyped_storage()
+    assert sv.data_ptr() == sb.data_ptr() and sv.nbytes() == sb.nbytes(), \
+        "aliases broken despite fully in-place restoration"
+    assert torch.equal(_storage_overlay(st["alias_base"]), exp_backing)
+    assert torch.equal(st["momentum_buffer"], pre_momentum)
+
+
+class _TwinRefSwapSGD(torch.optim.SGD):
+    """State holds the SAME tensor object under two keys; when armed it
+    performs a real update, replaces one twin with a dense foreign
+    tensor (breaking the sharing) and raises."""
+
+    def __init__(self, params, lr):
+        super().__init__(params, lr=lr, momentum=0.9)
+        self.armed = False
+        self.twin = torch.full((3, 4), 2.5)[:, 1:3]   # offset 1
+
+    def step(self, closure=None):
+        super().step(closure)
+        if not self.armed:
+            return
+        st = self.state[self.param_groups[0]["params"][0]]
+        st["twin_b"] = torch.full((3, 2), -7.0)       # break the sharing
+        raise RuntimeError("twin reference swap")
+
+
+def test_adversarial_repeated_state_reference_rebound_identically():
+    """The SAME tensor object stored under two state keys must come back
+    as ONE shared clone with its exact view metadata after a hostile
+    replacement forces a full rebind."""
+    torch.manual_seed(17)
+    m = torch.nn.Linear(4, 2)
+    x = torch.randn(6, 4)
+    ps = list(m.parameters())
+    opt = _TwinRefSwapSGD(ps, lr=0.1)
+    holder = opt.twin
+    assert holder.storage_offset() == 1 and tuple(holder.stride()) == (4, 1)
+    opt.state[ps[0]]["twin_a"] = holder
+    opt.state[ps[0]]["twin_b"] = holder           # repeated reference
+
+    # one clean step creates momentum state alongside the twins
+    m.zero_grad(set_to_none=True)
+    loss = (m(x) ** 2).mean()
+    loss.backward()
+    guarded_optimizer_step(opt, loss.detach(), ps, 1.0)
+
+    opt.armed = True
+    m.zero_grad(set_to_none=True)
+    (m(x) ** 2).mean().backward()
+    pre_params = _snapshot(ps)
+    exp_holder = holder.clone()
+    meta_holder = _meta(holder)
+    pre_momentum = opt.state[ps[0]]["momentum_buffer"].detach().clone()
+
+    with pytest.raises(RuntimeError, match="twin reference swap") as e:
+        guarded_optimizer_step(opt, torch.tensor(0.5), ps, 1.0)
+    assert type(e.value) is RuntimeError, \
+        "original step exception was masked by a rollback failure"
+
+    st = opt.state[ps[0]]
+    assert set(st.keys()) == {"twin_a", "twin_b", "momentum_buffer"}
+    assert st["twin_a"] is st["twin_b"], \
+        "repeated state reference came back as two independent tensors"
+    assert _meta(st["twin_a"]) == meta_holder, \
+        "rebound twin lost its original storage_offset/strides"
+    assert torch.equal(st["twin_a"], exp_holder)
+    assert torch.equal(st["momentum_buffer"], pre_momentum)
+    assert _unchanged(ps, pre_params)
+
+
+# ---------------------------------------------------------------------------
 # fp32 trainables over a lower-precision backbone
 # ---------------------------------------------------------------------------
 
