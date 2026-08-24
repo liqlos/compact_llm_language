@@ -1944,3 +1944,358 @@ def test_cmd_eval_identity_mismatch_aborts_before_load_model(
     with pytest.raises(RuntimeError, match="stop-right-after-load-model"):
         latent_run.cmd_eval(args)
     assert reached == [("M", REV_B)]
+
+
+# ---------------------------------------------------------------------------
+# transactional finalization: preflight scope, byte budget,
+# snapshot-before-clip, transactional post-step validation, complex
+# finiteness, device-safe identity
+# ---------------------------------------------------------------------------
+
+from latent_lab.train import checkpointing as _chk
+
+
+class _PlainSubclassTensor(torch.Tensor):
+    """A Tensor subclass: cannot be rebuilt as the same semantic type by
+    the snapshot machinery (plain-Tensor leaves), so state containing it
+    must fail closed."""
+
+
+class _CounterSGD(torch.optim.SGD):
+    def __init__(self, params, lr):
+        super().__init__(params, lr=lr, momentum=0.9)
+        self.steps = 0
+
+    def step(self, closure=None):
+        self.steps += 1
+        return super().step(closure)
+
+
+def _sgd_with_momentum_state(seed=17):
+    torch.manual_seed(seed)
+    m = torch.nn.Linear(4, 4)
+    x = torch.randn(6, 4)
+    ps = list(m.parameters())
+
+    def fresh_grads():
+        m.zero_grad(set_to_none=True)
+        ((m(x) ** 2).mean()).backward()
+
+    opt = _CounterSGD(ps, lr=0.1)
+    fresh_grads()
+    guarded_optimizer_step(opt, (m(x) ** 2).mean(), ps, 1.0)
+    assert opt.steps == 1 and opt.state, "stateful base step failed"
+    return m, x, ps, opt, fresh_grads
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning")
+def test_capturable_reason_codes_and_device_safe_identity_keys_are_stable():
+    assert _chk._capturable_rejection_reason(
+        torch.randn(2).as_subclass(_PlainSubclassTensor)) == "tensor-subclass"
+    # live Parameters are the normal parameter case and must NOT be rejected
+    assert _chk._capturable_rejection_reason(
+        torch.nn.Parameter(torch.randn(2)), allow_parameter=True) is None
+    # ...but a Parameter stored INSIDE optimizer state is still rejected:
+    # rollback would silently downgrade its semantic type to plain Tensor
+    assert _chk._capturable_rejection_reason(
+        torch.nn.Parameter(torch.randn(2))) == "tensor-subclass"
+    assert _chk._capturable_rejection_reason(
+        torch.empty(2, device="meta")) == "meta-device"
+    f = torch.arange(4, dtype=torch.float32)
+    assert _chk._capturable_rejection_reason(f) is None
+    # device-safe identity: (device type/index, _cdata) — not data_ptr-only;
+    # even two distinct EMPTY storages stay separate identities
+    e1, e2 = torch.empty(0), torch.empty(0)
+    k1, k2 = _chk._storage_identity_key(e1), _chk._storage_identity_key(e2)
+    assert k1 != k2
+    assert k1 == ("cpu", None, e1.untyped_storage()._cdata)
+    with torch.sparse.check_sparse_tensor_invariants(False):
+        sp = torch.sparse_coo_tensor(torch.tensor([[0]]).long(),
+                                     torch.tensor([1.0]), (4,))
+    assert _chk._capturable_rejection_reason(sp) == "sparse-layout"
+    q = torch.quantize_per_tensor(torch.ones(4), 1.0, 0, torch.qint8)
+    assert _chk._capturable_rejection_reason(q) == "quantized-tensor"
+    c = torch.randn(4, dtype=torch.float32)
+    assert _chk._capturable_rejection_reason(
+        c.view(torch.complex64)) is None   # same storage, complex dtype: ok
+
+
+@pytest.mark.parametrize("kind", ["subclass", "meta"])
+def test_preflight_rejects_subclass_and_meta_state_before_any_mutation(kind):
+    m, x, ps, opt, fresh_grads = _sgd_with_momentum_state()
+    if kind == "subclass":
+        evil = torch.randn(4, 4).as_subclass(_PlainSubclassTensor)
+    else:
+        evil = torch.empty(4, device="meta")
+    params_snap = _snapshot(ps)
+    grads_snap = [p.grad.detach().clone() for p in ps]
+    state_snap = _deep_opt_state(opt)
+    lr_before = opt.param_groups[0]["lr"]
+    opt.state[ps[0]]["evil"] = evil
+
+    with pytest.raises(OptimizerStateGraphError,
+                       match=r"\[(tensor-subclass|meta-device)\]"):
+        guarded_optimizer_step(opt, torch.tensor(0.5), ps, 1.0)
+
+    assert opt.steps == 1, "optimizer.step ran despite uninspectable state"
+    assert _unchanged(ps, params_snap), "parameters moved before rejection"
+    for p, g0 in zip(ps, grads_snap):      # clipping must not have run either
+        assert p.grad is not None and bool(torch.equal(p.grad, g0)), \
+            "gradients were clipped before the preflight rejection"
+    assert opt.param_groups[0]["lr"] == lr_before
+    del opt.state[ps[0]]["evil"]           # fail-closed stays recoverable
+    assert _opt_state_unchanged(opt, state_snap), \
+        "rejection mutated reachable optimizer state"
+
+    guarded_optimizer_step(opt, (m(x) ** 2).mean(), ps, 1.0)
+    assert opt.steps == 2                  # usable again after removal
+
+
+def test_tiny_views_over_large_backing_store_rejected_by_explicit_budget():
+    big = torch.zeros(1 << 20, dtype=torch.float32)   # bounded synthetic 4 MiB
+    m, x, ps, opt, fresh_grads = _sgd_with_momentum_state()
+    st = opt.state[ps[0]]
+    params_snap = _snapshot(ps)
+    grads_snap = [p.grad.detach().clone() for p in ps]
+    state_snap = _deep_opt_state(opt)
+    lr_before = opt.param_groups[0]["lr"]
+    st["tiny_a"] = big[:2]                 # 8 visible bytes...
+    st["tiny_b"] = big[-2:]                # ...sharing ONE 4 MiB storage
+    tensors = []
+    _chk._collect_state_tensors(opt.state, tensors, set(), set())
+    need = _chk._unique_storage_bytes(tensors)
+    assert need >= big.untyped_storage().nbytes(), \
+        "budget must count FULL backing extents of unique storages"
+
+    params_snap = _snapshot(ps)
+    grads_snap = [p.grad.detach().clone() for p in ps]
+    lr_before = opt.param_groups[0]["lr"]
+    with pytest.raises(OptimizerStateGraphError,
+                       match=r"\[state-byte-budget-exceeded\]") as ei:
+        guarded_optimizer_step(opt, torch.tensor(0.5), ps, 1.0,
+                               state_byte_budget=need - 1)
+    assert str(need) in ei.value.args[0] and str(need - 1) in ei.value.args[0], \
+        "rejection message must state counted bytes vs configured budget"
+    assert opt.steps == 1, "optimizer.step ran despite budget rejection"
+    assert _unchanged(ps, params_snap)
+    for p, g0 in zip(ps, grads_snap):
+        assert p.grad is not None and bool(torch.equal(p.grad, g0))
+    assert opt.param_groups[0]["lr"] == lr_before
+    del st["tiny_a"], st["tiny_b"]
+    assert _opt_state_unchanged(opt, state_snap)
+
+    # exactly-at-budget succeeds: alias views count their storage ONCE
+    st["tiny_a"] = big[:2]
+    st["tiny_b"] = big[-2:]
+    tensors = []
+    _chk._collect_state_tensors(opt.state, tensors, set(), set())
+    assert _chk._unique_storage_bytes(tensors) == need, \
+        "two views over one storage were double-counted"
+    guarded_optimizer_step(opt, (m(x) ** 2).mean(), ps, 1.0,
+                           state_byte_budget=need)
+    assert opt.steps == 2
+
+
+def test_default_budget_constant_and_invalid_budget_values_rejected():
+    assert _chk.DEFAULT_STATE_BYTE_BUDGET_BYTES == (1 << 34)
+    m, x, ps, opt, fresh_grads = _sgd_with_momentum_state()
+    for bad in (-1, 1.5, "16 GiB", True):
+        with pytest.raises(ValueError, match="state_byte_budget"):
+            guarded_optimizer_step(opt, torch.tensor(0.5), ps, 1.0,
+                                   state_byte_budget=bad)
+    assert opt.steps == 1, "invalid configuration must not step"
+    # default route (keyword omitted) accepts honest AdamW-scale state
+    guarded_optimizer_step(opt, (m(x) ** 2).mean(), ps, 1.0)
+    assert opt.steps == 2
+
+
+def test_snapshot_failure_before_clip_leaves_grads_unclipped_and_intact():
+    class _DeepcopyBomb:
+        def __deepcopy__(self, memo):
+            raise RuntimeError("deepcopy bomb")
+
+    m, x, ps, opt, fresh_grads = _sgd_with_momentum_state()
+    bomb = _DeepcopyBomb()
+    opt.param_groups[0]["calibration"] = bomb
+    fresh_grads()
+    with torch.no_grad():                  # norms > 1 so clipping WOULD rescale
+        for p in ps:
+            p.grad.mul_(8.0)
+    grads_before = [p.grad.detach().clone() for p in ps]
+    norms_before = [float(p.grad.norm()) for p in ps]
+    assert max(norms_before) > 1.0, "test setup: clipping must be observable"
+    params_snap = _snapshot(ps)
+    state_snap = _deep_opt_state(opt)
+
+    with pytest.raises(RuntimeError, match="deepcopy bomb"):
+        guarded_optimizer_step(opt, torch.tensor(0.5), ps, 1.0)
+
+    assert opt.steps == 1, "optimizer.step ran despite snapshot failure"
+    for p, g0, n0 in zip(ps, grads_before, norms_before):
+        assert torch.equal(p.grad, g0), \
+            "gradients were clipped although the snapshot never completed"
+        assert float(p.grad.norm()) == n0, "gradient norm was rescaled"
+    assert _unchanged(ps, params_snap)
+    assert _opt_state_unchanged(opt, state_snap)
+    assert opt.param_groups[0]["calibration"] is bomb, \
+        "snapshot failure disturbed the hostile group field itself"
+
+
+class _SuccessfulStepExoticInjector(_CounterSGD):
+    """Performs a REAL momentum update that SUCCEEDS, then — while armed —
+    injects an uninspectable leaf into optimizer.state without raising."""
+
+    def __init__(self, params, lr, kind):
+        super().__init__(params, lr=lr)
+        self.kind = kind
+        self.armed = True
+
+    def _evil(self):
+        if self.kind == "meta":
+            return torch.empty(4, device="meta")
+        if self.kind == "quantized":
+            return torch.quantize_per_tensor(torch.ones(4), 1.0, 0,
+                                             torch.qint8)
+        return torch.ones(4).as_subclass(_PlainSubclassTensor)
+
+    def step(self, closure=None):
+        super().step(closure)
+        if not self.armed:
+            return
+        w = self.param_groups[0]["params"][0]
+        self.state[w]["poison"] = self._evil()
+
+
+@pytest.mark.parametrize("kind", ["meta", "quantized", "subclass"])
+@pytest.mark.filterwarnings("ignore::UserWarning")
+def test_successful_step_then_uninspectable_state_rolls_back_whole_transaction(
+        kind):
+    # REAL-step repro: grad 1.0 at lr 0.1 moves w 1.0 -> 0.9; the buggy
+    # behavior abandoned the updated parameter at exactly 0.9.
+    torch.manual_seed(23)
+    w_adv = torch.nn.Parameter(torch.ones(1))
+    w_ctl = torch.nn.Parameter(torch.ones(1))
+    opt_adv = _SuccessfulStepExoticInjector([w_adv], lr=0.1, kind=kind)
+    opt_ctl = torch.optim.SGD([w_ctl], lr=0.1, momentum=0.9)
+    ctl_grad = torch.ones_like(w_ctl)
+
+    def arm_both():
+        for w in (w_adv, w_ctl):
+            w.grad = None
+        w_adv.grad = torch.ones_like(w_adv)
+        w_ctl.grad = ctl_grad.clone()
+
+    arm_both()
+    with pytest.raises(OptimizerStateGraphError,
+                       match=r"\[post-step-uninspectable-state\]") as ei:
+        guarded_optimizer_step(opt_adv, torch.tensor(0.25), [w_adv], 1.0)
+    assert type(ei.value) is OptimizerStateGraphError
+    assert float(w_adv.detach()) == 1.0, \
+        "a successful step whose validation failed left its update applied"
+    assert "poison" not in opt_adv.state[w_adv], \
+        "injected uninspectable state survived the rollback"
+    assert w_adv.grad is not None and float(w_adv.grad.squeeze()) == 1.0, \
+        "pre-clip gradients were not restored"
+    assert opt_adv.param_groups[0]["lr"] == 0.1
+
+    # retry must equal a clean control that always stepped cleanly
+    opt_adv.armed = False
+    arm_both()
+    guarded_optimizer_step(opt_adv, torch.tensor(0.25), [w_adv], 1.0)
+    torch.nn.utils.clip_grad_norm_([w_ctl], 1.0)
+    opt_ctl.step()
+    assert float(w_adv.detach()) != 1.0 and \
+        bool(torch.equal(w_adv.detach(), w_ctl.detach())) and \
+        abs(float(w_adv.detach()) - 0.9) < 1e-6, \
+        "retry after guard rollback diverged from the clean control"
+    assert torch.equal(opt_adv.state[w_adv]["momentum_buffer"],
+                       opt_ctl.state[w_ctl]["momentum_buffer"]), \
+        "optimizer state diverged from the clean control after retry"
+
+
+def test_validation_crash_after_step_wraps_as_guard_error_after_rollback(
+        monkeypatch):
+    torch.manual_seed(29)
+    w = torch.nn.Parameter(torch.ones(1))
+    opt = _CounterSGD([w], lr=0.1)
+    w.grad = torch.ones_like(w)
+
+    def _boom(*a, **kw):
+        raise ValueError("validation machinery exploded")
+
+    monkeypatch.setattr(_chk, "_require_post_step_transaction_valid", _boom)
+    with pytest.raises(OptimizerStateGraphError,
+                       match="validation machinery exploded") as ei:
+        guarded_optimizer_step(opt, torch.tensor(0.25), [w], 1.0)
+    assert isinstance(ei.value.__cause__, ValueError), \
+        "crashing validation error was not chained as the cause"
+    assert float(w.detach()) == 1.0, \
+        "update survived a crashing post-step validation"
+    assert w not in opt.state, "rolled-back step left state behind"
+
+
+def test_complex_nonfinite_state_rejected_pre_step_and_post_step():
+    m, x, ps, opt, fresh_grads = _sgd_with_momentum_state()
+    z_nan = torch.zeros(4, dtype=torch.complex64)
+    z_nan[1] = complex(float("nan"), float("inf"))
+    z_ok = torch.zeros(4, dtype=torch.complex128)
+
+    # -- pre-existing complex NaN: rejected BEFORE any mutation -------------
+    params_snap = _snapshot(ps)
+    grads_snap = [p.grad.detach().clone() for p in ps]
+    state_snap = _deep_opt_state(opt)
+    lr_before = opt.param_groups[0]["lr"]
+    opt.state[ps[0]]["z"] = z_nan
+    with pytest.raises(NonFiniteTrainingStateError,
+                       match="non-finite complex optimizer-state"):
+        guarded_optimizer_step(opt, torch.tensor(0.5), ps, 1.0)
+    assert opt.steps == 1, "stepped on pre-existing non-finite complex state"
+    assert _unchanged(ps, params_snap)
+    for p, g0 in zip(ps, grads_snap):
+        assert p.grad is not None and bool(torch.equal(p.grad, g0))
+    assert opt.param_groups[0]["lr"] == lr_before
+    del opt.state[ps[0]]["z"]
+    assert _opt_state_unchanged(opt, state_snap)
+
+    # finite complex state steps cleanly
+    opt.state[ps[0]]["z"] = z_ok
+    guarded_optimizer_step(opt, (m(x) ** 2).mean(), ps, 1.0)
+    assert opt.steps == 2
+
+    # -- post-step complex poisoning: rolled back exactly --------------------
+    class _ComplexPoisonSGD(_CounterSGD):
+        def __init__(self, params, lr):
+            super().__init__(params, lr=lr)
+            self.armed = False
+
+        def step(self, closure=None):
+            super().step(closure)
+            if self.armed:
+                w = self.param_groups[0]["params"][0]
+                self.state[w]["z"] = torch.full(
+                    (4,), 1.0, dtype=torch.complex64) * (
+                    float("inf") + 1j * float("nan"))
+
+    opt2 = _ComplexPoisonSGD(ps, lr=0.1)
+    opt2.state[ps[0]]["z"] = torch.arange(
+        4, dtype=torch.float32).to(torch.complex64)
+    fresh_grads()
+    guarded_optimizer_step(opt2, (m(x) ** 2).mean(), ps, 1.0)
+    assert opt2.steps == 1
+    pristine_z = opt2.state[ps[0]]["z"].detach().clone()
+    param_snap2 = _snapshot(ps)
+    state_snap2 = _deep_opt_state(opt2)
+    opt2.armed = True
+    fresh_grads()
+    grad_snap2 = [p.grad.detach().clone() for p in ps]
+    with pytest.raises(NonFiniteTrainingStateError,
+                       match="state became non-finite after optimizer.step"):
+        guarded_optimizer_step(opt2, (m(x) ** 2).mean(), ps, 1.0)
+    assert _unchanged(ps, param_snap2), \
+        "complex-poisoned update was left applied"
+    for p, g0 in zip(ps, grad_snap2):
+        assert p.grad is not None and bool(torch.equal(p.grad, g0))
+    assert torch.equal(opt2.state[ps[0]]["z"], pristine_z), \
+        "complex state values were not restored bit-exactly"
+    assert _opt_state_unchanged(opt2, state_snap2), \
+        "state beyond the poisoned leaf was disturbed by the rollback"

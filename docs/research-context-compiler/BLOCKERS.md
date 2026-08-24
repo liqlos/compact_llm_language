@@ -89,3 +89,19 @@ Updated: 2026-08-22. Each entry: claim, measurement, status.
     RSS ≤ 3.7 GB.
 - Status: MODEL_VERIFIED on the 0.8B proxy — localized-recurrence control
   points all reachable. NOT evidence of reasoning quality.
+
+## B9 — Guarded optimizer step: paid Vast/CUDA training blocked pending A/B
+
+- Claim: `guarded_optimizer_step` (latent_lab/train/checkpointing.py) is
+  safe to wrap around paid Vast/CUDA training runs.
+- Measurement: none on CUDA. The transaction's cost is bounded by design —
+  no CPU serialization, no per-leaf copies; exactly ONE on-device clone per
+  unique backing storage plus metadata/finiteness reads (complex-aware) —
+  but finiteness reductions synchronize per state/grad tensor, so the
+  step-time impact on CUDA is UNKNOWN until measured.
+- Consequence: paid Vast/CUDA training REMAINS BLOCKED on this guard until
+  a target-CUDA A/B shows <= 5% median AND p95 step-time regression versus
+  the unguarded baseline. No CUDA numbers are claimed or fabricated here;
+  CPU-only tests prove correctness only.
+- Status: BLOCKED (documentation of boundary; correctness suite: 41
+  runtime-integrity tests green on CPU).
