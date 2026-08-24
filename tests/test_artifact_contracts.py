@@ -1134,3 +1134,119 @@ def test_validate_eval_extended_identity_fields_are_well_formed(tmp_path):
     ep.write_text(json.dumps(bad_max_k))
     with pytest.raises(ValueError, match="identity.max_k"):
         artifacts.validate_eval(ep)
+
+
+# ---------------------------------------------------------------------------
+# Regression: artifact validation enforces candidates[gold] == answer —
+# rescoring derives gold identity from answer/candidates and rejects a
+# missing, ambiguous/duplicated or substituted gold instead of trusting
+# the supplied index.
+# ---------------------------------------------------------------------------
+
+def _stealthy_substituted_gold_record():
+    """A record whose index names the top-scored rival while rank_of_gold/
+    correct/accuracy are rewritten to stay self-consistent: index-trusting
+    scoring accepts this wholesale."""
+    rec = eval_record()                # candidates c0..c2, answer c0, gold 0
+    assert rec["answer"] == "c0"
+    rec["gold_candidate_index"] = 1    # substitute
+    rec["rank_of_gold"] = 0            # keep derived fields consistent...
+    rec["correct"] = 1.0               # ...so ONLY content binding catches it
+    return rec
+
+
+def test_validate_eval_rejects_substituted_gold_identity(tmp_path):
+    ep = tmp_path / "ev.json"
+    ep.write_text(json.dumps(build_eval_payload(
+        records=[_stealthy_substituted_gold_record()])))
+    with pytest.raises(ValueError) as ei:
+        artifacts.validate_eval(ep)
+    assert "gold_candidate_index" in str(ei.value)
+
+
+def test_validate_eval_rejects_missing_and_duplicated_gold(tmp_path):
+    missing = eval_record()
+    missing["answer"] = "zzz"          # absent from candidates
+    ep = tmp_path / "ev_missing.json"
+    ep.write_text(json.dumps(build_eval_payload(records=[missing])))
+    with pytest.raises(ValueError, match="missing from"):
+        artifacts.validate_eval(ep)
+
+    dup = eval_record(scores=(2.0, 1.0))
+    dup["candidates"] = ["c0", "c0"]   # gold present twice: ambiguous
+    dup["score_order"] = [0, 1]
+    ep = tmp_path / "ev_dup.json"
+    ep.write_text(json.dumps(build_eval_payload(records=[dup])))
+    with pytest.raises(ValueError, match="duplicated"):
+        artifacts.validate_eval(ep)
+
+
+# ---------------------------------------------------------------------------
+# Regression: unknown ablations such as 'bogus' are rejected by the
+# artifact validator EXACTLY as by the CLI via ONE shared whitelist/
+# normalizer (normalize_ablation).
+# ---------------------------------------------------------------------------
+
+def test_validate_eval_rejects_unknown_ablation_like_cli(tmp_path):
+    ablation = "bogus"
+    payload = build_eval_payload(identity={
+        **EVAL_IDENTITY, "ablation": ablation})
+    # results are already keyed/tagged self-consistently with 'bogus':
+    # ONLY the shared whitelist can reject this payload
+    assert list(payload["results"]) == [ablation]
+    payload["results"][ablation]["tag"] = \
+        f"E-localized|test_id|{ablation}|K=4"
+    ep = tmp_path / "ev.json"
+    ep.write_text(json.dumps(payload))
+    with pytest.raises(ValueError) as ei:
+        artifacts.validate_eval(ep)
+    assert "unknown ablation 'bogus'" in str(ei.value)
+    # identical rejection by the CLI parser for the same name
+    with pytest.raises(ValueError) as cli_ei:
+        latent_run.parse_ablation_cli(ablation, 4)
+    assert str(cli_ei.value) == str(ei.value).split(
+        "identity.ablation rejected: ", 1)[-1]
+
+
+@pytest.mark.parametrize("name,k,spec", [
+    (None, 4, None),
+    ("clean", 4, None),
+    ("zero_state", 4, {"zero_state": True}),
+    ("bypass_interval", 4, {"bypass_interval": True}),
+    ("swap_state", 4, {"swap_state": True}),
+    ("noise_state", 4, {"noise_state": True}),
+    ("clocks_off", 4, {"clocks": "off"}),
+    ("reverse_clocks", 4, {"clocks": "reverse"}),
+    ("shuffle_clocks:2,0,1", 3, {"clocks": "shuffle_perm:2,0,1"}),
+    ("truncate_half", 5, {"truncate_k": 2}),
+])
+def test_shared_normalizer_whitelist_used_by_cli_and_validator(name, k, spec):
+    assert latent_run.normalize_ablation(name, k) == spec
+    assert latent_run.parse_ablation_cli(name, k) == spec
+
+
+@pytest.mark.parametrize("name", ["make_it_better", "shuffle:0,1", "",
+                                  "truncate_half "])
+def test_shared_normalizer_rejects_unknown_names_identically(name):
+    import re
+
+    with pytest.raises(ValueError) as norm_ei:
+        latent_run.normalize_ablation(name, 4)
+    with pytest.raises(ValueError) as cli_ei:
+        latent_run.parse_ablation_cli(name, 4)
+    assert str(norm_ei.value) == str(cli_ei.value)
+    assert re.search(r"unknown ablation", str(norm_ei.value))
+
+
+def test_validate_eval_accepts_every_whitelisted_ablation_name(tmp_path):
+    for name, ablate in (("zero_state", {"zero_state": True}),
+                         ("clocks_off", {"clocks": "off"}),
+                         ("truncate_half", {"truncate_k": 2})):
+        payload = build_eval_payload(identity={
+            **EVAL_IDENTITY, "ablation": name})
+        res = payload["results"][name]
+        res["ablate"] = ablate
+        res["tag"] = f"E-localized|test_id|{name}|K=4"
+        ep = tmp_path / f"ev_{name}.json"
+        ep.write_text(json.dumps(payload))
+        assert artifacts.validate_eval(ep) is not None
