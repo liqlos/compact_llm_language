@@ -21,6 +21,7 @@ Design contract under test:
 import copy
 import json
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -72,8 +73,30 @@ REV_A = "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b"
 REV_B = "0f9e8d7c6b5a49382715040302010ffedcba9876"
 SUITE_SHA = "ab" * 32
 
-RECIPE = {"interval": [1, 4], "max_k": 4, "lora_r": 8, "lora_alpha": 16.0,
-          "mode": "E-localized", "suite_sha256": SUITE_SHA}
+# Full training-semantic config; every field below is canonically bound
+# into the recipe identity (K/LR/steps/seed/optimizer changes all matter).
+TRAIN_CFG = {
+    "mode": "E-localized",
+    "interval": [1, 4],
+    "k": 4, "max_k": 4,
+    "lora_r": 8, "lora_alpha": 16.0,
+    "lr": 2e-4, "steps": 600, "seed": 0,
+    "optimizer": "adamw", "weight_decay": 0.01,
+    "lr_schedule": "constant", "warmup": 30, "clip": 0.5,
+    "detach_z0": False, "grad_checkpoint": True,
+}
+
+
+def _cfg(**over) -> dict:
+    return {**TRAIN_CFG, "suite_sha256": SUITE_SHA, **over}
+
+
+def _recipe(**over) -> dict:
+    from latent_lab.train.checkpointing import recipe_from_config
+    return recipe_from_config(_cfg(**over), SUITE_SHA)
+
+
+RECIPE = _recipe()
 
 
 def _state(value: float, key: str = "w") -> dict:
@@ -567,13 +590,11 @@ def test_recovery_uses_last_committed_bundle_in_fresh_runtime(tmp_path):
     layers = 4
     rec = _nonzero_adapted_rec(_tiny_qwen35(11, layers))
     path = tmp_path / "best_params.pt"
-    recipe = {"interval": [0, layers], "max_k": 4, "lora_r": 4,
-              "lora_alpha": 8.0, "mode": "D-full",
-              "suite_sha256": SUITE_SHA}
+    cfg = _cfg(mode="D-full", interval=[0, layers], k=1, max_k=4,
+               lora_r=4, lora_alpha=8.0)
     committed = rec.adapter_state_dict()
     rec.export_adapter_bundle(path, model_id="tiny-qwen35", revision=REV_A,
-                              suite_sha256=SUITE_SHA, mode="D-full",
-                              metrics={"val_acc": 0.25})
+                              config=cfg, metrics={"val_acc": 0.25})
 
     # hostile in-memory drift AFTER commit (the mutated process is abandoned)
     with torch.no_grad():
@@ -582,7 +603,7 @@ def test_recovery_uses_last_committed_bundle_in_fresh_runtime(tmp_path):
 
     fresh = _nonzero_adapted_rec(_tiny_qwen35(23, layers))  # new weights
     fresh.load_adapter_bundle(path, model_id="tiny-qwen35", revision=REV_A,
-                              suite_sha256=SUITE_SHA, mode="D-full")
+                              config=cfg)
     now = fresh.adapter_state_dict()
     assert set(now) == set(committed)
     for k in committed:
@@ -698,11 +719,11 @@ def test_equal_shaped_weights_into_different_recipe_rejected(tmp_path):
     save_adapter_bundle(path, sd, model_id="M", revision=REV_A,
                         recipe=dict(RECIPE))
 
-    other_interval = {**RECIPE, "interval": [2, 4]}       # same shapes!
+    other_interval = _recipe(interval=[2, 4])              # same shapes!
     with pytest.raises(AdapterBundleIdentityError):
         load_adapter_bundle(path, model_id="M", revision=REV_A,
                             recipe=other_interval)
-    other_mode = {**RECIPE, "mode": "D-full"}
+    other_mode = _recipe(mode="D-full")
     with pytest.raises(AdapterBundleIdentityError):
         load_adapter_bundle(path, model_id="M", revision=REV_A,
                             recipe=other_mode)
@@ -710,10 +731,18 @@ def test_equal_shaped_weights_into_different_recipe_rejected(tmp_path):
     with pytest.raises(AdapterBundleIdentityError):
         load_adapter_bundle(path, model_id="M", revision=REV_A,
                             recipe=other_suite)
-    extra_key = {**RECIPE, "lr": 1e-4}
+    changed_lr = {**RECIPE, "lr": 9.9e-4}   # materially different identity
+    with pytest.raises(AdapterBundleIdentityError):
+        load_adapter_bundle(path, model_id="M", revision=REV_A,
+                            recipe=changed_lr)
+    extra_key = {**RECIPE, "unexpected_field": 1}
     with pytest.raises(AdapterBundleSchemaError):
         load_adapter_bundle(path, model_id="M", revision=REV_A,
                             recipe=extra_key)
+    missing_key = {k: v for k, v in RECIPE.items() if k != "seed"}
+    with pytest.raises(AdapterBundleSchemaError):
+        load_adapter_bundle(path, model_id="M", revision=REV_A,
+                            recipe=missing_key)
     # exact match still passes
     load_adapter_bundle(path, model_id="M", revision=REV_A,
                         recipe=dict(RECIPE))
@@ -869,20 +898,22 @@ def test_cached_localized_full_equivalence_across_fp32_roundtrip(
 
     mode = "D-full" if interval == (0, layers) else "E-localized"
     path = tmp_path / f"best_{interval[0]}_{interval[1]}_k{k}.pt"
+    cfg = _cfg(mode=mode, interval=list(interval), k=k, max_k=4,
+               lora_r=4, lora_alpha=8.0)
     rec1.export_adapter_bundle(path, model_id="tiny-qwen35",
-                               revision=REV_A, suite_sha256=SUITE_SHA,
-                               mode=mode, metrics={"val_acc": 0.75})
+                               revision=REV_A, config=cfg,
+                               metrics={"val_acc": 0.75})
     assert not any(p.name.endswith(".tmp") for p in tmp_path.iterdir())
 
     rec2 = LocalizedRecurrence(_tiny_qwen35(11, layers), None,
                                interval=interval, max_k=4, lora_r=4,
                                lora_alpha=8, grad_checkpoint=False)
     wrong_rev_kwargs = dict(model_id="tiny-qwen35", revision=REV_B,
-                            suite_sha256=SUITE_SHA, mode=mode)
+                            config=cfg)
     with pytest.raises(AdapterBundleIdentityError):
         rec2.load_adapter_bundle(path, **wrong_rev_kwargs)
     rec2.load_adapter_bundle(path, model_id="tiny-qwen35", revision=REV_A,
-                             suite_sha256=SUITE_SHA, mode=mode)
+                             config=cfg)
     assert all(p.dtype == torch.float32
                for p in rec2.trainable_parameters())
 
@@ -992,8 +1023,107 @@ def test_zero_state_resets_all_prompt_derived_cache_state():
 
 
 # ---------------------------------------------------------------------------
-# run status / provenance semantics
+# accelerator coverage: bounded-sync fused checks on real devices
 # ---------------------------------------------------------------------------
+
+def _assert_bounded_sync_step(device: str, monkeypatch) -> None:
+    """Full guarded step on `device` — precheck, REAL clipping, step,
+    parameter + optimizer-state postchecks — while proving:
+
+      * every accumulator the fused checks allocate is created ON that
+        bucket's device with an explicit device argument (fails on the
+        CPU/device-unspecified accumulator of the rejected candidate);
+      * host decisions stay bounded per phase/bucket, never one per
+        gradient/parameter/tensor.
+    """
+    torch.manual_seed(7)
+    model = torch.nn.Sequential(*[torch.nn.Linear(8, 8)
+                                  for _ in range(2)]).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-2)
+
+    allocs = []
+    reads = {"item": 0, "bool": 0}
+    real_zeros = torch.zeros
+    real_item = torch.Tensor.item
+    real_bool = torch.Tensor.__bool__
+
+    def spy_zeros(*a, **kw):
+        t = real_zeros(*a, **kw)
+        # attribute allocations to OUR fused checks only: anything torch's
+        # own optimizers allocate internally is not a check accumulator
+        frame = sys._getframe(1)
+        caller = frame.f_globals.get("__name__", "")
+        if "checkpointing" in str(caller):
+            allocs.append((str(t.device), kw.get("device", "<UNSET>")))
+        return t
+
+    def spy_item(self, *a, **kw):
+        reads["item"] += 1
+        return real_item(self, *a, **kw)
+
+    def spy_bool(self):
+        if self.device.type == device.split(":")[0] and self.numel() > 0:
+            reads["bool"] += 1
+        return real_bool(self)
+
+    x = torch.randn(4, 8, device=device)
+    ((model(x) ** 2).mean()).backward()
+
+    monkeypatch.setattr(torch, "zeros", spy_zeros)
+    monkeypatch.setattr(torch.Tensor, "item", spy_item)
+    monkeypatch.setattr(torch.Tensor, "__bool__", spy_bool)
+    # clip 0.01 forces a real foreach clipping pass; then optimizer
+    # step() and BOTH postchecks run on-device tensors
+    guarded_optimizer_step(opt, (model(x) ** 2).mean(),
+                           list(model.parameters()), 0.01)
+
+    assert allocs, "fused reductions allocated nothing"
+    # devices that genuinely host checked tensors (params/grads/state);
+    # NOTE: standard AdamW keeps float32 `step` counters on CPU even for
+    # accelerator params, so a CPU bucket may legitimately exist
+    domain_devices = {str(p.device) for p in model.parameters()}
+    for st in opt.state.values():
+        for v in st.values():
+            if torch.is_tensor(v):
+                domain_devices.add(str(v.device))
+    dev_type = device.split(":")[0]
+    for got_dev, declared in allocs:
+        assert declared != "<UNSET>", \
+            f"device-unspecified CPU accumulator allocated: {allocs}"
+        assert got_dev == device or got_dev.startswith(dev_type) \
+            or got_dev in domain_devices, \
+            f"accumulator {got_dev} is off-bucket for {device}: {allocs}"
+    n_trainables = sum(1 for _ in model.parameters())
+    # phases that may read host-side: pre-params, grad-norm, post-clip,
+    # post-params, opt-state (+ the single loss check) — NOT per tensor
+    assert reads["item"] <= 6, \
+        f"unbounded host reads for {n_trainables} trainables: {reads}"
+    assert reads["bool"] <= 2, \
+        f"per-gradient host decisions (post-clip loop?) returned: {reads}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),
+                    reason="real CUDA device required")
+def test_cuda_guarded_step_bounded_sync_and_on_device_accumulators(
+        monkeypatch):
+    """CUDA regression: exercises precheck -> clipping -> optimizer.step
+    -> parameter/optimizer-state postchecks on real CUDA tensors and
+    FAILS on any CPU/device-unspecified accumulator or per-gradient
+    host synchronization."""
+    _assert_bounded_sync_step("cuda:0"
+                              if torch.cuda.device_count() > 1 else "cuda",
+                              monkeypatch)
+
+
+@pytest.mark.skipif(not getattr(torch.backends, "mps", None)
+                    or not torch.backends.mps.is_available(),
+                    reason="MPS supplement; cannot replace the CUDA test")
+def test_mps_guarded_step_bounded_sync_and_on_device_accumulators(
+        monkeypatch):
+    _assert_bounded_sync_step("mps", monkeypatch)
+
+
+
 
 def test_run_status_blocks_incomplete_evidence(tmp_path):
     write_run_status(tmp_path, "running")
@@ -1022,11 +1152,18 @@ def test_atomic_write_json_is_durable_and_digest_linked(tmp_path):
 def test_verify_generation_rejects_tampered_artifacts(tmp_path):
     from latent_lab.train.checkpointing import verify_generation
 
-    write_run_status(tmp_path, "complete")
-    atomic_write_json(tmp_path / "train_report.json", {"ok": True})
-    (tmp_path / "best_params.pt").write_bytes(b"\x00\x01")
-    manifest = {
-        "kind": "latent_lab.train_generation", "status": "complete",
+    from tests.artifact_fakes import (
+        CHECKPOINT_FILE,
+        RUN_MANIFEST_FILE,
+        build_verified_run,
+    )
+
+    build_verified_run(tmp_path)
+    verify_generation(tmp_path)
+
+    # full schema is enforced: a two-hash manifest with no kind/status/
+    # identity/recipe is NOT evidence even when its digests cohere
+    minimal = {
         "report_sha256":
             __import__("hashlib").sha256(
                 (tmp_path / "train_report.json").read_bytes()).hexdigest(),
@@ -1034,11 +1171,17 @@ def test_verify_generation_rejects_tampered_artifacts(tmp_path):
             __import__("hashlib").sha256(
                 (tmp_path / "best_params.pt").read_bytes()).hexdigest(),
     }
-    atomic_write_json(tmp_path / "run_manifest.json", manifest)
-    verify_generation(tmp_path)
+    atomic_write_json(tmp_path / RUN_MANIFEST_FILE, minimal)
+    with pytest.raises(Exception):
+        verify_generation(tmp_path)
 
-    # flip one byte of the checkpoint: digests no longer cohere
-    (tmp_path / "best_params.pt").write_bytes(b"\x00\x02")
+    # rebuild a coherent generation, then flip one checkpoint byte:
+    # digests no longer cohere
+    build_verified_run(tmp_path)
+    with open(tmp_path / CHECKPOINT_FILE, "rb") as fh:
+        raw = fh.read()
+    with open(tmp_path / CHECKPOINT_FILE, "wb") as fh:
+        fh.write(raw[:-1] + bytes([raw[-1] ^ 0xFF]))
     with pytest.raises(Exception):
         verify_generation(tmp_path)
 
@@ -1069,33 +1212,32 @@ def test_lock_is_exclusive_and_breaks_stale_holders(tmp_path):
 def test_artifact_validation_cli_contract(tmp_path):
     from latent_lab.bench.artifacts import main as artifacts_main
 
+    from tests.artifact_fakes import build_eval_payload, build_verified_run
+
     # missing everything -> invalid
     assert artifacts_main(["validate-run", str(tmp_path)]) == 1
 
-    write_run_status(tmp_path, "complete")
-    assert artifacts_main(["validate-run", str(tmp_path)]) == 1  # no manifest
-
-    atomic_write_json(tmp_path / "train_report.json", {"ok": True})
-    (tmp_path / "best_params.pt").write_bytes(b"\x00\x01")
-    import hashlib
-    manifest = {
-        "report_sha256": hashlib.sha256(
-            (tmp_path / "train_report.json").read_bytes()).hexdigest(),
-        "checkpoint_sha256": hashlib.sha256(
-            (tmp_path / "best_params.pt").read_bytes()).hexdigest(),
-    }
-    atomic_write_json(tmp_path / "run_manifest.json", manifest)
+    # a fully coherent generation validates, and expected contracts bind
+    build_verified_run(tmp_path)
     assert artifacts_main(["validate-run", str(tmp_path)]) == 0
+    assert artifacts_main(
+        ["validate-run", str(tmp_path), "--expect-seed", "0",
+         "--expect-label", "E4_k4_s0"]) == 0
+    assert artifacts_main(
+        ["validate-run", str(tmp_path), "--expect-seed", "2"]) == 1
+    assert artifacts_main(
+        ["validate-run", str(tmp_path),
+         "--expect-model", "WRONG-MODEL"]) == 1
 
-    eval_payload = {
-        "status": "complete",
-        "identity": {"model_id": "M", "revision": REV_A,
-                     "suite_sha256": SUITE_SHA},
-        "results": {"clean": {"accuracy": 1.0}},
-    }
+    eval_payload = build_eval_payload()
     ep = tmp_path / "eval.json"
     ep.write_text(json.dumps(eval_payload))
     assert artifacts_main(["validate-eval", str(ep)]) == 0
+    assert artifacts_main(
+        ["validate-eval", str(ep), "--expect-k", "4",
+         "--expect-split", "test_id"]) == 0
+    assert artifacts_main(
+        ["validate-eval", str(ep), "--expect-k", "8"]) == 1
 
     bad_status = {**eval_payload, "status": "running"}
     ep.write_text(json.dumps(bad_status))

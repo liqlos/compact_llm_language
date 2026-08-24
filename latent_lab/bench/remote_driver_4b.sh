@@ -1,41 +1,100 @@
 #!/usr/bin/env bash
-# Sealed remote behavioral gate for Qwen3.5-4B (same suite/sha as the 2B gate).
+# Sealed PREREGISTERED paid canary — Qwen/Qwen3.5-4B.
 #
 # Contract (fail closed):
-#   * NO package installs/upgrades: the image ships pinned deps; env is
-#     verified and any mismatch aborts the driver.
-#   * All runs serialize under an exclusive lock (dead-holder recovery).
-#   * Resume is NEVER based on bare file existence: a training directory or
-#     eval payload counts as done only when its digests/status/identity
-#     validate; anything else is quarantined (renamed *.invalid.<ts>) and
-#     recomputed.
+#   * Focused unit/integrity tests MUST pass BEFORE any GPU/model spend;
+#     any failure aborts the driver.
+#   * EXACT dependency identity (equality against pinned versions,
+#     including Python, torch, transformers, huggingface_hub AND the
+#     project uv.lock content hash): no ranges, NO installs/upgrades
+#     ("pip -U" is banned), NO ignored failures (set -euo pipefail).
+#   * ONE preregistered seed/recipe fixed BELOW, before any GPU second:
+#     nothing in this driver ever inspects validation results to choose
+#     a seed, an adapter or a recipe (no BEST/MEDIAN cherry-picking).
+#   * Paired causal arm: K>0 and K=0 are evaluated on the SAME trained
+#     adapter/seed/suite (only the eval-time K differs). Separate F
+#     adapters do NOT satisfy this contract and are not used.
+#   * Bounded by construction: exactly ONE training run + four paired
+#     evaluations. Any matrix expansion requires its own separate
+#     pre-spend authorization and is refused here.
+#   * Resume NEVER trusts bare existence: a directory/payload counts as
+#     done ONLY when it re-validates under the FULL expected contract;
+#     anything else is quarantined (*.invalid.<ts>) and recomputed.
 set -euo pipefail
 cd /root/rcc
 
-LOCK=results/.driver4b.lock
-mkdir -p runs results
+if [ -n "${DRIVER_MATRIX:-}" ]; then
+  echo "FATAL: DRIVER_MATRIX is set; matrix expansion is NOT part of this" \
+       "canary and requires separate pre-spend authorization." >&2
+  exit 5
+fi
 
-exec 9>"$LOCK"
+mkdir -p runs results
+exec 9>results/.driver4b.lock
 if ! flock -n 9; then
-  echo "FATAL: another driver holds $LOCK" >&2
+  echo "FATAL: another driver holds results/.driver4b.lock" >&2
   exit 3
 fi
 
+### --- preregistered experiment constants (fixed BEFORE any GPU work) ---
 MODEL=Qwen/Qwen3.5-4B
 REV=851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
-COMMON="--model $MODEL --revision $REV"
+SEED=0
+K_POS=4
+K_ZERO=0
+INTERVAL=mid
+STEPS=800
+LR=1e-4
+WARMUP=50
+CLIP=0.5
+OPTIMIZER=adamw
+WEIGHT_DECAY=0.01
+LR_SCHEDULE=constant
+LABEL=E4_k${K_POS}_s${SEED}
+RUN_DIR=runs/${LABEL}
 
-echo "=== sealed environment verification (no installs) ==="
-python - <<'PY'
-import torch, transformers
+echo "=== sealed environment verification (EXACT pins; no installs) ==="
+PIN_PYTHON="3.14.0"
+PIN_TORCH="2.13.0"
+PIN_TRANSFORMERS="5.15.1"
+PIN_HUGGINGFACE_HUB="1.28.0"
+PIN_UVLOCK_SHA256="62187a854931549a8cd927537a3cf393759fd56b79152c5f400447b9c3de035f"
+
+python - <<PY
+import sys
+import huggingface_hub
+import torch
+import transformers
+
+def require(actual, pinned, what):
+    assert actual == pinned, f"{what} {actual!r} != pinned {pinned!r}"
+
+require(sys.version.split()[0], "${PIN_PYTHON}", "python")
+require(torch.__version__, "${PIN_TORCH}", "torch")
+require(transformers.__version__, "${PIN_TRANSFORMERS}", "transformers")
+require(huggingface_hub.__version__, "${PIN_HUGGINGFACE_HUB}",
+        "huggingface_hub")
 assert torch.cuda.is_available(), "CUDA unavailable"
-def mm(v): return ".".join(v.split(".")[:2])
-assert mm(torch.__version__) == "2.13", f"torch {torch.__version__} != pinned 2.13.x"
-assert int(transformers.__version__.split(".")[0]) >= 5, \
-    f"transformers {transformers.__version__} too old"
-print("ENV_OK", torch.__version__, transformers.__version__,
+print("ENV_OK", sys.version.split()[0], torch.__version__,
+      transformers.__version__, huggingface_hub.__version__,
       torch.cuda.get_device_name(0))
 PY
+
+ACTUAL_LOCK_SHA=$(sha256sum uv.lock | cut -d ' ' -f1)
+if [ "$ACTUAL_LOCK_SHA" != "$PIN_UVLOCK_SHA256" ]; then
+  echo "FATAL: project lock drift: uv.lock sha256 $ACTUAL_LOCK_SHA != pinned $PIN_UVLOCK_SHA256" >&2
+  exit 2
+fi
+
+echo "=== pre-spend gate: focused checks MUST pass before ANY GPU work ==="
+python -m pytest -q \
+  tests/test_latent_runtime_integrity.py \
+  tests/test_latent_run.py \
+  tests/test_artifact_contracts.py \
+  tests/test_paid_driver_sealed.py
+
+SUITE_SHA=$(python -c "from latent_lab.bench.suite import build_suite; print(build_suite().manifest()['sha256'])")
+
 MODEL_IDENTITY_MODEL="$MODEL" MODEL_IDENTITY_REV="$REV" python - <<'PY'
 import os
 from huggingface_hub import HfApi
@@ -47,6 +106,8 @@ assert commit == expected, f"hub resolved {commit!r}, expected pinned {expected}
 print("MODEL_IDENTITY_OK", commit)
 PY
 
+COMMON=(--model "$MODEL" --revision "$REV")
+
 quarantine () {
   local P=$1
   if [ -e "$P" ]; then
@@ -54,86 +115,55 @@ quarantine () {
   fi
 }
 
-valid_run () { python3 -m latent_lab.bench.artifacts validate-run "$1"; }
-
-train () { L=$1; K=$2; IV=$3; ST=$4; SD=$5;
-  if valid_run "runs/$L" >/dev/null 2>&1; then
-    echo "RESUME runs/$L (generation verified)"
-    return
-  fi
-  quarantine "runs/$L"
-  python -m latent_lab.bench.latent_run train --k $K --interval $IV \
-    --steps $ST --lr 1e-4 --seed $SD --warmup 50 --clip 0.5 \
-    --eval-every 100 --val-examples 28 \
-    --device cuda $COMMON --out runs/$L
+expect_run=(--expect-model "$MODEL" --expect-rev "$REV"
+            --expect-seed "$SEED" --expect-label "$LABEL"
+            --expect-k "$K_POS" --expect-steps "$STEPS")
+valid_run () {
+  python3 -m latent_lab.bench.artifacts validate-run "$1" "${expect_run[@]}"
 }
-train E4_k4_s0 4 mid 800 0
-train F4_k0_s0 0 mid 800 0
-train E4_k4_s1 4 mid 800 1
-train F4_k0_s1 0 mid 800 1
-train E4_k4_s2 4 mid 800 2
-train F4_k0_s2 0 mid 800 2
-train E4_k1_s0 1 mid 400 0
-train E4_k8_s0 8 mid 400 0
 
-echo "=== select best/median E seeds ==="
-read BEST MEDIAN <<< "$(python - <<'PY'
-import json, glob, subprocess, sys
-rows = []
-for p in sorted(glob.glob("runs/E4_k4_s*/train_report.json")):
-    d = p.rsplit("/", 1)[0]
-    r = subprocess.run([sys.executable, "-m",
-                        "latent_lab.bench.artifacts", "validate-run", d])
-    if r.returncode != 0:
-        raise SystemExit(f"unverified run dir: {d}")
-    rows.append((json.load(open(p))["best_val_acc"], d))
-if len(rows) < 2:
-    raise SystemExit("need >=2 verified E runs for best/median selection")
-rows.sort()
-strip = lambda s: s.replace("E4_k4_", "").replace("s", "")
-print(strip(rows[-1][1]), strip(rows[len(rows)//2][1]))
-PY
-)"
-echo "BEST=$BEST MEDIAN=$MEDIAN"
+echo "=== single preregistered training run: label=$LABEL seed=$SEED k=$K_POS ==="
+if valid_run "$RUN_DIR" >/dev/null 2>&1; then
+  echo "RESUME $RUN_DIR (generation verified under expected contract)"
+else
+  quarantine "$RUN_DIR"
+  python -m latent_lab.bench.latent_run train --k "$K_POS" --interval "$INTERVAL" \
+    --steps "$STEPS" --lr "$LR" --seed "$SEED" --warmup "$WARMUP" --clip "$CLIP" \
+    --optimizer "$OPTIMIZER" --weight-decay "$WEIGHT_DECAY" \
+    --lr-schedule "$LR_SCHEDULE" \
+    --eval-every 100 --val-examples 28 \
+    --label "$LABEL" --device cuda "${COMMON[@]}" --out "$RUN_DIR"
+  valid_run "$RUN_DIR" \
+    || { echo "FATAL: freshly written $RUN_DIR failed validation" >&2; exit 4; }
+fi
 
-echo "=== evals ==="
-ev () { AD=$1; SP=$2; AB=${3:-clean}
-  F=results/ev4b_${AD}_${SP}_${AB}.json
-  if python3 -m latent_lab.bench.artifacts validate-eval "$F" >/dev/null 2>&1; then
-    echo "RESUME $F (payload verified)"
+ADAPTER_DIGEST=$(python3 -c "import json; print(json.load(open('$RUN_DIR/run_manifest.json'))['checkpoint_content_digest'])")
+
+echo "=== paired SAME-adapter evals: only eval-time K differs ==="
+ev () { AD=$1; SP=$2; K=$3;
+  F=results/ev4b_${AD}_${SP}_K${K}.json
+  if python3 -m latent_lab.bench.artifacts validate-eval "$F" \
+      --expect-model "$MODEL" --expect-rev "$REV" --expect-suite "$SUITE_SHA" \
+      --expect-digest "$ADAPTER_DIGEST" --expect-split "$SP" \
+      --expect-ablation clean --expect-k "$K" --expect-seed "$SEED" \
+      >/dev/null 2>&1; then
+    echo "RESUME $F (payload verified under expected contract)"
     return
   fi
   quarantine "$F"
-  if [ "$AB" = "clean" ]; then ABFLAG=""; else ABFLAG="--ablate $AB"; fi
-  python -m latent_lab.bench.latent_run eval --adapter runs/$AD \
-    --split $SP $ABFLAG --device cuda --out $F
-  python3 -m latent_lab.bench.artifacts validate-eval "$F" >/dev/null \
+  python -m latent_lab.bench.latent_run eval --adapter "runs/$AD" \
+    --split "$SP" --k "$K" --seed "$SEED" --device cuda --out "$F"
+  python3 -m latent_lab.bench.artifacts validate-eval "$F" \
+      --expect-model "$MODEL" --expect-rev "$REV" --expect-suite "$SUITE_SHA" \
+      --expect-digest "$ADAPTER_DIGEST" --expect-split "$SP" \
+      --expect-ablation clean --expect-k "$K" --expect-seed "$SEED" >/dev/null \
     || { echo "FATAL: freshly written $F failed validation" >&2; exit 4; }
-  python -c "import json;d=json.load(open('$F'));r=d['results'][list(d['results'])[-1]];print('EVAL $AD $SP $AB acc', r['accuracy'], 'n', r['n'])"
+  python3 -c "import json;d=json.load(open('$F'));r=d['results'][list(d['results'])[-1]];print('EVAL $AD $SP K=$K acc', r['accuracy'], 'n', r['n'])"
 }
-for S in 0 1 2; do
-  ev "E4_k4_s$S" test_id clean ""
-  ev "E4_k4_s$S" test_ood clean ""
-  ev "F4_k0_s$S" test_id clean ""
-  ev "F4_k0_s$S" test_ood clean ""
-done
-ev E4_k1_s0 test_id clean ""; ev E4_k1_s0 test_ood clean ""
-ev E4_k8_s0 test_id clean ""; ev E4_k8_s0 test_ood clean ""
-for S in $BEST $MEDIAN; do
-  for AB in zero_state bypass_interval clocks_off reverse_clocks truncate_half swap_state noise_state; do
-    ev "E4_k4_s$S" test_id $AB
-  done
-done
-for KK in 1 2 8 16; do
-  F=results/ev4b_E4_k4_s${BEST}_test_id_cleanK${KK}.json
-  if python3 -m latent_lab.bench.artifacts validate-eval "$F" >/dev/null 2>&1; then
-    echo "RESUME $F (payload verified)"
-  else
-    quarantine "$F"
-    python -m latent_lab.bench.latent_run eval --adapter runs/E4_k4_s$BEST \
-      --split test_id --k $KK --device cuda --out $F
-    python3 -m latent_lab.bench.artifacts validate-eval "$F" >/dev/null \
-      || { echo "FATAL: freshly written $F failed validation" >&2; exit 4; }
-  fi
-done
+
+ev "$LABEL" test_id "$K_POS"
+ev "$LABEL" test_id "$K_ZERO"
+ev "$LABEL" test_ood "$K_POS"
+ev "$LABEL" test_ood "$K_ZERO"
+
 echo ALL_DONE_4B

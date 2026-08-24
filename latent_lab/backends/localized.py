@@ -587,38 +587,58 @@ class LocalizedRecurrence:
 
     # -- identity-bound bundles ------------------------------------------------
 
-    def adapter_recipe(self, *, suite_sha256: str,
-                       mode: str | None = None) -> dict:
-        """The exact recipe this runtime binds into exported bundles."""
+    def adapter_recipe(self, *, config: dict) -> dict:
+        """The canonical recipe this runtime binds into exported bundles.
+
+        The recipe is derived from the caller's FULL training config via
+        the strict canonical builder; runtime state (interval/max_k/rank/
+        alpha/mode) must agree with it exactly or identity fails closed —
+        a runtime configured differently from its claimed config can
+        never mint an adapter bundle.
+        """
+        from ..train.checkpointing import (
+            AdapterBundleIdentityError, recipe_from_config)
+        recipe = recipe_from_config(config,
+                                    suite_sha256=config["suite_sha256"])
         lo, hi = self.interval
-        if mode is None:
-            mode = ("D-full" if (lo, hi) == (0, self.n_layers)
-                    else "E-localized")
-        return {
-            "interval": [lo, hi],
-            "max_k": int(self.max_k),
-            "lora_r": int(self.injected[0].lora_A.shape[0]),
-            "lora_alpha": float(self.injected[0].scaling
-                                * self.injected[0].lora_A.shape[0]),
-            "mode": mode,
-            "suite_sha256": suite_sha256,
-        }
+        runtime_alpha = float(self.injected[0].scaling
+                              * self.injected[0].lora_A.shape[0])
+        drift = []
+        if list(recipe["interval"]) != [lo, hi]:
+            drift.append(f"interval {recipe['interval']} != runtime "
+                         f"{[lo, hi]}")
+        if int(recipe["max_k"]) != int(self.max_k):
+            drift.append(f"max_k {recipe['max_k']} != runtime "
+                         f"{int(self.max_k)}")
+        if int(recipe["lora_r"]) != int(self.injected[0].lora_A.shape[0]):
+            drift.append(f"lora_r {recipe['lora_r']} != runtime "
+                         f"{self.injected[0].lora_A.shape[0]}")
+        if float(recipe["lora_alpha"]) != runtime_alpha:
+            drift.append(f"lora_alpha {recipe['lora_alpha']} != runtime "
+                         f"{runtime_alpha}")
+        if drift:
+            raise AdapterBundleIdentityError(
+                "training config disagrees with live runtime: "
+                + "; ".join(drift))
+        return recipe
 
     def export_adapter_bundle(self, path, *, model_id, revision,
-                              suite_sha256, mode=None, metrics=None) -> dict:
-        """Persist this adapter as an identity-bound best_params.pt bundle."""
+                              config, metrics=None) -> dict:
+        """Persist this adapter as an identity-bound best_params.pt bundle.
+
+        ``config`` is the FULL training config (including mode and
+        suite_sha256); every training-semantic field is canonically bound.
+        """
         from ..train.checkpointing import save_adapter_bundle
         return save_adapter_bundle(
             path, self.adapter_state_dict(), model_id=model_id,
             revision=revision,
-            recipe=self.adapter_recipe(suite_sha256=suite_sha256, mode=mode),
+            recipe=self.adapter_recipe(config=config),
             metrics=metrics)
 
-    def load_adapter_bundle(self, path, *, model_id, revision,
-                            suite_sha256, mode=None):
+    def load_adapter_bundle(self, path, *, model_id, revision, config):
         """Load an identity-bound bundle; recipe/identity fully prevalidated."""
         from ..train.checkpointing import load_adapter_bundle
         state = load_adapter_bundle(path, model_id=model_id, revision=revision,
-                                    recipe=self.adapter_recipe(
-                                        suite_sha256=suite_sha256, mode=mode))
+                                    recipe=self.adapter_recipe(config=config))
         self.load_adapter_state(state)
