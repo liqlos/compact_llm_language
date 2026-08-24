@@ -2053,6 +2053,296 @@ def test_unique_storage_byte_budget_enforced_before_mutation():
         "default-budget step unexpectedly refused"
 
 
+class _BadCloneParam(torch.Tensor):
+    """Hostile parameter subclass whose clone() detonates — the exact
+    bef4b39 repro shape: a parameter-snapshot failure raised AFTER
+    clip_grad_norm_ leaked clipped gradients with no real step."""
+
+    @staticmethod
+    def __new__(cls, data):
+        return torch.Tensor._make_subclass(cls, data, True)
+
+    def clone(self, *args, **kwargs):
+        raise RuntimeError("param clone failed")
+
+
+def test_param_snapshot_failure_rejected_before_clipping_no_mutation():
+    """Negative regression for bef4b39: a Parameter whose exact snapshot
+    fails must be rejected BEFORE gradient clipping; gradients stay
+    bit-exact and nothing mutates anywhere in the transaction."""
+    from latent_lab.train.checkpointing import OptimizerStateSnapshotError
+
+    torch.manual_seed(97)
+    m = torch.nn.Linear(4, 4)
+    x = torch.randn(6, 4)
+    ps = list(m.parameters())
+    bad = torch.nn.Parameter(_BadCloneParam(torch.tensor([1.0])))
+    opt = torch.optim.SGD(ps, lr=0.1, momentum=0.9)
+
+    def fresh_grads():
+        m.zero_grad(set_to_none=True)
+        (m(x) ** 2).mean().backward()
+        with torch.no_grad():
+            for p in ps:
+                p.grad.fill_(10.0)          # norm >> clip: detect clipping
+
+    fresh_grads()
+    guarded_optimizer_step(opt, (m(x) ** 2).mean(), ps, 1.0)  # real state
+    # introduce the hostile parameter through the live group topology
+    opt.param_groups[0]["params"].append(bad)
+    fresh_grads()
+    bad.grad = torch.tensor([10.0])
+
+    param_snap = _snapshot(ps)
+    grad_snap = [p.grad.detach().clone() for p in ps]
+    state_snap = _deep_opt_state(opt)
+    groups_snap = _param_groups_snapshot(opt)
+    ids_before = _param_group_param_ids(opt)
+    orig_map = opt.state
+
+    with pytest.raises(OptimizerStateSnapshotError,
+                       match="subclass.*fail-closed"):
+        guarded_optimizer_step(opt, (m(x) ** 2).mean(), ps + [bad], 1.0)
+
+    # gradients were NOT clipped: bit-identical to the huge pre-step ones
+    for p, g0 in zip(ps, grad_snap):
+        assert p.grad is not None and bool(torch.equal(p.grad, g0)), \
+            "gradients leaked past a failed parameter snapshot"
+    assert float(torch.linalg.vector_norm(ps[0].grad)) > 35.0, \
+        "clipping ran before the parameter snapshot completed"
+    assert _unchanged(ps, param_snap), "parameters mutated"
+    assert bool(torch.equal(bad.grad, torch.tensor([10.0]))), \
+        "unsupported parameter's gradient mutated"
+    assert _opt_state_unchanged(opt, state_snap), "state mutated"
+    assert opt.state is orig_map, "mapping identity changed"
+    assert _param_groups_unchanged(opt, groups_snap), "groups mutated"
+    assert _param_group_param_ids(opt) == ids_before, "topology mutated"
+
+    # optimizer stays usable once the unsupported parameter is gone
+    grp = opt.param_groups[0]["params"]
+    grp[:] = [q for q in grp if q is not bad]   # identity-based removal
+    guarded_optimizer_step(opt, (m(x) ** 2).mean(), ps, 1.0)
+    assert not _unchanged(ps, param_snap), \
+        "post-rejection recovery step did not run"
+
+
+def test_shared_and_cyclic_state_containers_rejected_before_clipping():
+    """Shared (non-cyclic) container aliases and cyclic containers inside
+    optimizer.state are fail-closed rejected BEFORE clipping instead of
+    being silently duplicated on restore; nothing mutates on rejection."""
+    from latent_lab.train.checkpointing import OptimizerStateSnapshotError
+
+    big = torch.full((64,), 10.0)
+
+    def build():
+        torch.manual_seed(99)
+        m = torch.nn.Linear(4, 4)
+        x = torch.randn(6, 4)
+        ps = list(m.parameters())
+        opt = torch.optim.SGD(ps, lr=0.1, momentum=0.9)
+        (m(x) ** 2).mean().backward()
+        guarded_optimizer_step(opt, (m(x) ** 2).mean(), ps, 1.0)
+        m.zero_grad(set_to_none=True)
+        (m(x) ** 2).mean().backward()
+        with torch.no_grad():
+            for p in ps:
+                p.grad.copy_(big[:p.grad.numel()].view_as(p))
+        return m, x, ps, opt
+
+    def assert_clean_rejection(m, x, ps, opt):
+        param_snap = _snapshot(ps)
+        grad_snap = [p.grad.detach().clone() for p in ps]
+        state_snap = _deep_opt_state(opt)
+        orig_map = opt.state
+        with pytest.raises(OptimizerStateSnapshotError,
+                           match="shared or cyclic"):
+            guarded_optimizer_step(opt, (m(x) ** 2).mean(), ps, 1.0)
+        for p, g0 in zip(ps, grad_snap):
+            assert p.grad is not None and bool(torch.equal(p.grad, g0)), \
+                "gradients moved before the rejection"
+        assert float(torch.linalg.vector_norm(ps[0].grad)) > 35.0, \
+            "clipping ran before the shared/cyclic rejection"
+        assert _unchanged(ps, param_snap), "parameters mutated"
+        assert _opt_state_unchanged(opt, state_snap), "state mutated"
+        assert opt.state is orig_map, "mapping identity changed"
+
+    # cyclic dict reachable through itself
+    m, x, ps, opt = build()
+    loop = {"k": torch.zeros(1)}
+    loop["self"] = loop
+    opt.state[ps[0]]["cycle_probe"] = loop
+    assert_clean_rejection(m, x, ps, opt)
+    del opt.state[ps[0]]["cycle_probe"]
+
+    # non-cyclic SHARED list alias under two different state entries
+    m2, x2, ps2, opt2 = build()
+    shared = [{"v": torch.zeros(2)}]
+    st = opt2.state[ps2[0]]
+    st["alias_a"] = shared
+    st["alias_b"] = shared          # same object, no cycle
+    assert_clean_rejection(m2, x2, ps2, opt2)
+    del st["alias_b"], st["alias_a"]
+
+    # both optimizers step cleanly again after probe removal
+    guarded_optimizer_step(opt, (m(x) ** 2).mean(), ps, 1.0)
+    guarded_optimizer_step(opt2, (m2(x2) ** 2).mean(), ps2, 1.0)
+
+
+def test_partial_clip_failure_restores_gradients(monkeypatch):
+    """If clip_grad_norm_ itself dies midway, the already-clipped
+    gradients are restored to their exact pre-clip bytes before the
+    original clip exception propagates."""
+    import latent_lab.train.checkpointing as ckpt_mod
+
+    def half_clip(parameters, max_norm, *a, **kw):
+        first = list(parameters)[0]
+        with torch.no_grad():
+            first.grad.mul_(0.5)          # partial mutation ...
+        raise RuntimeError("clip detonated midway")   # ... then failure
+
+    torch.manual_seed(103)
+    m = torch.nn.Linear(4, 4)
+    x = torch.randn(6, 4)
+    ps = list(m.parameters())
+    opt = torch.optim.SGD(ps, lr=0.1, momentum=0.9)
+    (m(x) ** 2).mean().backward()
+    guarded_optimizer_step(opt, (m(x) ** 2).mean(), ps, 1.0)  # warm-up
+    m.zero_grad(set_to_none=True)
+    (m(x) ** 2).mean().backward()
+    with torch.no_grad():
+        for p in ps:
+            p.grad.fill_(10.0)
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", half_clip)
+    grad_snap = [p.grad.detach().clone() for p in ps]
+    param_snap = _snapshot(ps)
+    state_snap = _deep_opt_state(opt)
+
+    with pytest.raises(RuntimeError, match="clip detonated midway"):
+        guarded_optimizer_step(opt, (m(x) ** 2).mean(), ps, 1.0)
+
+    for p, g0 in zip(ps, grad_snap):          # exactly the PRE-CLIP bytes
+        assert bool(torch.equal(p.grad, g0)), \
+            "partially clipped gradients were not restored"
+    assert _unchanged(ps, param_snap), "parameters mutated by failed clip"
+    assert _opt_state_unchanged(opt, state_snap), "state mutated"
+
+    monkeypatch.undo()
+    guarded_optimizer_step(opt, (m(x) ** 2).mean(), ps, 1.0)  # still usable
+    assert not _unchanged(ps, param_snap), "recovery step did not run"
+
+
+class _SharedStoragePoisonSGD(torch.optim.SGD):
+    """Real update, then poisons bytes of ONE backing storage shared by
+    two Parameters, flips a requires_grad flag and raises."""
+
+    def __init__(self, params, lr):
+        super().__init__(params, lr=lr)
+        self.armed = False
+
+    def step(self, closure=None):
+        super().step(closure)
+        if not self.armed:
+            return
+        p1, p2 = self.param_groups[0]["params"]
+        with torch.no_grad():
+            p1.add_(float("inf"))         # poisons storage shared with p2
+            p2.requires_grad_(False)      # hostile flag flip
+        raise RuntimeError("shared-storage-adversarial failure")
+
+
+def test_overlapping_parameter_storages_and_flags_roll_back_exactly():
+    """Two live Parameters over overlapping views of ONE storage (plus a
+    hidden untouched tail) roll back to the exact full backing bytes with
+    identities, strides/offsets and requires_grad flags intact."""
+    torch.manual_seed(101)
+    base = torch.zeros(8)
+    p1 = torch.nn.Parameter(base[:4])              # elements 0..3
+    p2 = torch.nn.Parameter(base[2:6].view(2, 2))  # overlaps at 2..3
+    ps = [p1, p2]
+    opt = _SharedStoragePoisonSGD(ps, lr=0.1)
+
+    with torch.no_grad():
+        p1.grad = torch.randn(4) * 0.01
+        p2.grad = torch.randn(2, 2) * 0.01
+    guarded_optimizer_step(opt, torch.tensor(0.5), ps, 1.0)  # seed state
+
+    with torch.no_grad():                          # distinct, huge grads
+        p1.grad.copy_(torch.tensor([10.0, 20.0, 30.0, 40.0]))
+        p2.grad.copy_(torch.tensor([[50.0, 60.0], [70.0, 80.0]]))
+    base_snap = base.detach().clone()              # FULL backing bytes
+    ids_before = [id(p) for p in ps]
+    meta2 = (tuple(p2.shape), p2.stride(), p2.storage_offset())
+    orig_map = opt.state
+
+    opt.armed = True
+    with pytest.raises(RuntimeError,
+                       match="shared-storage-adversarial failure"):
+        guarded_optimizer_step(opt, torch.tensor(0.5), ps, 1.0)
+
+    assert bool(torch.equal(base, base_snap)), \
+        "full backing storage was not restored byte-exactly"
+    assert (tuple(p2.shape), p2.stride(), p2.storage_offset()) == meta2, \
+        "parameter view metadata drifted across rollback"
+    assert [id(p) for p in opt.param_groups[0]["params"]] == ids_before, \
+        "Parameter identities were not preserved"
+    assert bool(p2.requires_grad), \
+        "hostilely flipped requires_grad flag was not restored"
+    assert opt.state is orig_map, "mapping identity changed"
+
+    # disarmed retry of the same update commits cleanly
+    opt.armed = False
+    with torch.no_grad():
+        p1.grad.copy_(torch.tensor([10.0, 20.0, 30.0, 40.0]))
+        p2.grad.copy_(torch.tensor([[50.0, 60.0], [70.0, 80.0]]))
+    guarded_optimizer_step(opt, torch.tensor(0.5), ps, 1.0)
+    assert not bool(torch.equal(base, base_snap)), "retry did not commit"
+
+
+def test_poststep_validator_crash_enters_rollback(monkeypatch):
+    """A post-step validator that CRASHES (e.g. on hostile mid-step state
+    injections) must still enter rollback: the real update is undone even
+    though no finiteness verdict was ever reached."""
+    import latent_lab.train.checkpointing as ckpt_mod
+
+    def exploding_validator(obj):
+        raise RuntimeError("validator detonated")
+
+    class _RealUpdateSGD(torch.optim.SGD):
+        def step(self, closure=None):
+            super().step(closure)
+            with torch.no_grad():
+                self.param_groups[0]["params"][0].add_(7.0)  # REAL mutation
+
+    torch.manual_seed(107)
+    m = torch.nn.Linear(4, 4)
+    x = torch.randn(6, 4)
+    ps = list(m.parameters())
+    opt = _RealUpdateSGD(ps, lr=0.05, momentum=0.9)
+    (m(x) ** 2).mean().backward()
+    guarded_optimizer_step(opt, (m(x) ** 2).mean(), ps, 1.0)  # warm-up
+    m.zero_grad(set_to_none=True)
+    (m(x) ** 2).mean().backward()
+
+    monkeypatch.setattr(ckpt_mod, "_tree_is_finite", exploding_validator)
+    param_snap = _snapshot(ps)
+    state_snap = _deep_opt_state(opt)
+    orig_map = opt.state
+
+    with pytest.raises(RuntimeError, match="validator detonated"):
+        guarded_optimizer_step(opt, (m(x) ** 2).mean(), ps, 1.0)
+
+    assert _unchanged(ps, param_snap), \
+        "validator crash left the real step committed"
+    assert _opt_state_unchanged(opt, state_snap), \
+        "optimizer state not rolled back after the validator crash"
+    assert opt.state is orig_map, "mapping identity changed"
+
+    monkeypatch.undo()
+    guarded_optimizer_step(opt, (m(x) ** 2).mean(), ps, 1.0)  # still usable
+    assert not _unchanged(ps, param_snap), "recovery step did not run"
+
+
 def test_rollback_failure_chains_as_cause_of_original_exception(monkeypatch):
     """When rollback itself detonates, the ORIGINAL step exception is
     re-raised with the rollback failure chained as __cause__ (never
