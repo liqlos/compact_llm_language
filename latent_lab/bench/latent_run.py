@@ -118,6 +118,24 @@ class SuiteTensors:
         return len(self.examples)
 
 
+def derive_gold_index(candidates, answer, *, ex_id="") -> int:
+    """Derive the UNIQUE gold candidate position from contents alone.
+
+    Gold identity comes from the answer/candidate strings, never from a
+    trusted supplied index: an answer absent from the candidate set
+    (missing) or present more than once (ambiguous/duplicated) fails
+    closed instead of scoring against a guessable position.
+    """
+    occurrences = [i for i, c in enumerate(candidates) if c == answer]
+    if len(occurrences) != 1:
+        state = "missing from" if not occurrences else "duplicated in"
+        raise ValueError(
+            f"{ex_id}: gold answer {answer!r} {state} candidates "
+            f"{list(candidates)!r}; gold identity is ambiguous — "
+            "refusing to score")
+    return occurrences[0]
+
+
 def build_eval_record(ex, order, scores) -> dict:
     """One lossless eval record: raw scores/order + gold/candidate identity.
 
@@ -135,7 +153,7 @@ def build_eval_record(ex, order, scores) -> dict:
            or s != s or s in (float("inf"), float("-inf"))]
     if bad:
         raise ValueError(f"{ex.ex_id}: non-finite raw scores at {bad}")
-    gold_idx = ex.candidates.index(ex.answer)
+    gold_idx = derive_gold_index(ex.candidates, ex.answer, ex_id=ex.ex_id)
     pred_rank = order.index(gold_idx) if gold_idx in order else -1
     return {
         "ex_id": ex.ex_id, "family": ex.family, "depth": ex.depth,
@@ -152,20 +170,37 @@ def build_eval_record(ex, order, scores) -> dict:
 def rescore_records(records) -> float:
     """Independently recompute accuracy from RAW record fields alone.
 
-    Verifies that derived rank/correct agree with a fresh computation from
-    scores_raw/score_order/gold_candidate_index, so any future scorer fix
-    can be re-applied to persisted evidence without re-running the model.
+    Gold identity is RE-DERIVED from answer/candidates and the persisted
+    gold_candidate_index is accepted only when it names that same unique
+    position: a missing, duplicated/ambiguous or substituted gold fails
+    closed instead of being scored from a trusted supplied index. Also
+    verifies that derived rank/correct agree with a fresh computation
+    from scores_raw/score_order, so any future scorer fix can be
+    re-applied to persisted evidence without re-running the model.
     """
     correct = 0
     for r in records:
         scores = r["scores_raw"]
+        candidates = r["candidates"]
+        if len(candidates) != len(scores):
+            raise ValueError(
+                f"{r.get('ex_id')}: candidates vs scores length mismatch")
         order = sorted(range(len(scores)), key=lambda i: -scores[i])
         if list(order) != list(r["score_order"]):
             raise ValueError(
                 f"{r.get('ex_id')}: score_order disagrees with scores_raw; "
                 "evidence inconsistent")
-        gold = r["gold_candidate_index"]
-        rank = order.index(gold) if gold in order else -1
+        gold = derive_gold_index(candidates, r.get("answer"),
+                                 ex_id=r.get("ex_id"))
+        claimed = r.get("gold_candidate_index")
+        if isinstance(claimed, bool) or not isinstance(claimed, int) \
+                or claimed != gold:
+            raise ValueError(
+                f"{r.get('ex_id')}: gold_candidate_index {claimed!r} does "
+                f"not identify the answer {r.get('answer')!r} in "
+                f"candidates (unique position {gold}); missing/substituted"
+                " gold identity rejected")
+        rank = order.index(gold)
         if rank != r["rank_of_gold"] or \
                 (1.0 if rank == 0 else 0.0) != r["correct"]:
             raise ValueError(
@@ -499,11 +534,27 @@ def _train_inner(args, out: Path, device: str, revision: str):
           f"@step {tracker.best_step} -> {out}")
 
 
-def parse_ablation_cli(name, k_steps):
-    """Strict CLI ablation parser: unknown modes are REJECTED, never run
-    silently clean. Returns the latent_steps ablation dict."""
-    if name is None:
+CLEAN_ABLATION = "clean"
+
+# The canonical no-ablation marker persisted in eval payloads.
+_CLEAN_SPECS = (None, CLEAN_ABLATION)
+
+
+def normalize_ablation(name, k_steps=None):
+    """ONE shared whitelist/normalizer for ablation names.
+
+    Used verbatim by the CLI parser (parse_ablation_cli) and by the
+    artifact validator (validate_eval) so an unknown mode such as
+    'bogus' is rejected identically everywhere — never silently run
+    clean or accepted as evidence. Returns the ablate spec dict, or
+    None for the canonical clean run (name None or 'clean').
+    """
+    if name in _CLEAN_SPECS:
         return None
+    if not isinstance(name, str):
+        raise ValueError(f"unknown ablation {name!r}; supported: "
+                         f"{sorted(EVAL_ABLATIONS)} "
+                         "or 'shuffle_clocks:i,j,...'")
     if name == "clocks_off":
         return {"clocks": "off"}
     if name == "reverse_clocks":
@@ -518,6 +569,12 @@ def parse_ablation_cli(name, k_steps):
     raise ValueError(
         f"unknown ablation {name!r}; supported: {sorted(EVAL_ABLATIONS)} "
         "or 'shuffle_clocks:i,j,...'")
+
+
+def parse_ablation_cli(name, k_steps):
+    """Strict CLI ablation parser: unknown modes are REJECTED, never run
+    silently clean. Returns the latent_steps ablation dict."""
+    return normalize_ablation(name, k_steps)
 
 
 def cmd_eval(args):

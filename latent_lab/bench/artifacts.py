@@ -346,6 +346,20 @@ def _validate_eval_result(where: str, name: str, res) -> None:
             raise ValueError(
                 f"{where}: record {r.get('ex_id')!r}: score_order is not "
                 "a permutation of the candidate set")
+        # gold identity is derived from answer/candidates CONTENTS: a
+        # missing, duplicated/ambiguous or substituted gold index can
+        # never pass as evidence
+        from latent_lab.bench.latent_run import derive_gold_index
+        gold = derive_gold_index(cands, r.get("answer"),
+                                 ex_id=r.get("ex_id"))
+        claimed = r.get("gold_candidate_index")
+        if isinstance(claimed, bool) or not isinstance(claimed, int) \
+                or claimed != gold:
+            raise ValueError(
+                f"{where}: results[{name!r}] record {r.get('ex_id')!r}: "
+                f"gold_candidate_index {claimed!r} does not satisfy "
+                f"candidates[gold] == answer (unique position {gold}); "
+                "substituted gold identity rejected")
     # independently recomputable corrected scoring, right now
     from latent_lab.bench.latent_run import rescore_records
     recomputed = rescore_records(records)
@@ -508,6 +522,15 @@ def validate_eval(eval_path, *, expected: dict | None = None) -> dict:
         raise ValueError(f"{where}: identity.seed must be an int")
     split = ident["split"]
     ablation = ident["ablation"]
+
+    # the persisted ablation must come from the SAME shared whitelist the
+    # CLI enforces: unknown modes such as 'bogus' are rejected exactly as
+    # by parse_ablation_cli, never accepted as evidence
+    from latent_lab.bench.latent_run import normalize_ablation
+    try:
+        normalize_ablation(ablation, k_steps)
+    except ValueError as e:
+        raise ValueError(f"{where}: identity.ablation rejected: {e}") from e
 
     # optional extended identity fields, when present, must be well-formed
     interval = ident.get("interval")

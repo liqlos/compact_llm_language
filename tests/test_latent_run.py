@@ -145,3 +145,65 @@ def test_rescore_rejects_tampered_derived_fields():
     tampered_order = {**rec, "score_order": [1, 0, 2, 3]}
     with pytest.raises(ValueError):
         rescore_records([tampered_order])
+
+
+# ---------------------------------------------------------------------------
+# gold identity is re-derived from answer/candidates — a supplied index is
+# never trusted (missing / duplicated / substituted gold fails closed)
+# ---------------------------------------------------------------------------
+
+def _gold_pos2_record():
+    ex = _ex(gold_pos=2)
+    return dict(evaluate(_StubRec([[0, 3, 2, 1]]), _data([ex]), k_steps=1,
+                         indices=[0], tag="t")["records"][0])
+
+
+def test_rescore_rejects_substituted_gold_index_even_when_self_consistent():
+    """Stealthy substitution: the persisted index names a DIFFERENT
+    candidate while rank_of_gold/correct/accuracy are rewritten to match
+    it — index-trusting scoring would accept this; deriving gold from
+    answer/candidates must not."""
+    import pytest
+
+    from latent_lab.bench.latent_run import rescore_records
+
+    rec = _gold_pos2_record()          # candidates c0..c3, answer c2
+    assert rec["answer"] == "c2"
+    rec["gold_candidate_index"] = 0    # substitute the top-scored rival
+    rec["rank_of_gold"] = 0            # ... and stay internally consistent
+    rec["correct"] = 1.0
+    with pytest.raises(ValueError, match="gold_candidate_index"):
+        rescore_records([rec])
+
+
+def test_rescore_rejects_missing_and_duplicated_gold():
+    import pytest
+
+    from latent_lab.bench.latent_run import rescore_records
+
+    rec = _gold_pos2_record()
+    missing = {**rec, "answer": "nope"}
+    with pytest.raises(ValueError, match="missing from"):
+        rescore_records([missing])
+
+    dup = {**_gold_pos2_record(),
+           "candidates": ["c0", "c1", "c2", "c2"],
+           "scores_raw": [4.0, 1.0, 3.0, 2.0],
+           "score_order": [0, 2, 3, 1]}
+    with pytest.raises(ValueError, match="duplicated"):
+        rescore_records([dup])
+
+
+def test_rescore_rejects_missing_answer_field_and_bad_index_types():
+    import pytest
+
+    from latent_lab.bench.latent_run import rescore_records
+
+    rec = _gold_pos2_record()
+    no_answer = {k: v for k, v in rec.items() if k != "answer"}
+    with pytest.raises(ValueError, match="missing from"):
+        rescore_records([no_answer])
+
+    bad_idx = {**rec, "gold_candidate_index": "2"}
+    with pytest.raises(ValueError, match="gold_candidate_index"):
+        rescore_records([bad_idx])
