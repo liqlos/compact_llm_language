@@ -166,6 +166,9 @@ class _CountingVastAI:
     def show_instances(self):
         return "[]"
 
+    def show_volumes(self):
+        return "[]"
+
     def search_offers(self, **kw):
         return "[]"
 
