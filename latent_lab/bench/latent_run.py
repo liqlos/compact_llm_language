@@ -72,10 +72,13 @@ def load_model(device="mps", model_id=None, revision=None):
     import transformers
 
     from latent_lab.backends.gdn_patch import install
+    from latent_lab.train.checkpointing import require_pinned_revision
     install()
 
     model_id = model_id or DEFAULT_MODEL_ID
-    revision = revision or DEFAULT_REVISION
+    # fail closed BEFORE any Hugging Face contact: only pinned immutable
+    # commit revisions are accepted
+    revision = require_pinned_revision(revision or DEFAULT_REVISION)
     tok = transformers.AutoTokenizer.from_pretrained(model_id,
                                                      revision=revision)
     model = transformers.AutoModelForCausalLM.from_pretrained(
@@ -154,11 +157,13 @@ def cmd_train(args):
     from latent_lab.backends.localized import LocalizedRecurrence
     from latent_lab.bench.suite import build_suite
     from latent_lab.train.checkpointing import (
-        BestCheckpointTracker, guarded_optimizer_step)
+        BestCheckpointTracker, guarded_optimizer_step, require_pinned_revision)
 
     torch.manual_seed(args.seed)
     device = args.device
-    model, tok = load_model(device, args.model, args.revision)
+    # fail closed BEFORE loading/training/saving on a mutable revision
+    revision = require_pinned_revision(args.revision)
+    model, tok = load_model(device, args.model, revision)
     interval = interval_from_spec(
         args.interval, model.config.num_hidden_layers)
     rec = LocalizedRecurrence(model, None, interval=interval, max_k=args.max_k,
@@ -224,19 +229,19 @@ def cmd_train(args):
     out.mkdir(parents=True, exist_ok=True)
     rec.load_adapter_state(tracker.best_state())
     tracker.save(out / "best_params.pt", model_id=args.model,
-                 revision=args.revision)
+                 revision=revision)
     report = {
         "config": {
             "mode": ("D-full" if args.interval == "full" else
                      "F-control" if args.k == 0 else "E-localized"),
-            "model": args.model, "revision": args.revision,
+            "model": args.model, "revision": revision,
             "interval": list(interval), "k": args.k,
             "lora_r": args.lora_r, "lr": args.lr, "steps": args.steps,
             "seed": args.seed, "max_k": args.max_k,
             "detach_z0": args.detach_z0, "device": device,
             "train_examples": len(train), "grad_checkpoint": True,
         },
-        "model": args.model, "revision": args.revision,
+        "model": args.model, "revision": revision,
         "suite_sha256": suite.manifest()["sha256"],
         "best_val_acc": tracker.best_score, "best_step": tracker.best_step,
         "val_history": history,
@@ -264,18 +269,25 @@ def cmd_eval(args):
 
     from latent_lab.backends.localized import LocalizedRecurrence
     from latent_lab.bench.suite import build_suite
+    from latent_lab.train.checkpointing import (
+        AdapterBundleIdentityError, require_pinned_revision)
 
     torch.manual_seed(args.seed)
     device = args.device
     cfg = json.load(open(Path(args.adapter) / "train_report.json")
                     )["config"]
     model_id = cfg.get("model")
-    revision = cfg.get("revision")
-    if not isinstance(model_id, str) or not model_id \
-            or not isinstance(revision, str) or not revision:
+    if not isinstance(model_id, str) or not model_id:
         raise ValueError(
-            f"adapter {args.adapter} carries no immutable model/revision "
-            "identity; refusing to evaluate")
+            f"adapter {args.adapter} carries no immutable model identity; "
+            "refusing to evaluate")
+    try:
+        # fail closed BEFORE any model load on a mutable/missing revision
+        revision = require_pinned_revision(cfg.get("revision"))
+    except AdapterBundleIdentityError as e:
+        raise ValueError(
+            f"adapter {args.adapter} carries no immutable pinned model "
+            "revision; refusing to evaluate") from e
     model, tok = load_model(device, model_id, revision)
     interval = tuple(cfg["interval"])
     rec = LocalizedRecurrence(model, None, interval=interval,

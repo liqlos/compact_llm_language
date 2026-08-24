@@ -6,6 +6,7 @@ Three responsibilities live here:
     best state; it never falls back to the final training state.
   * Identity-bound adapter bundles — the on-disk best_params.pt carries the
     (model_id, revision) it was trained against plus per-tensor metadata;
+    revisions must be pinned immutable 40-hex commit ids (no network);
     loads prevalidate every key, tensor type, shape, dtype and finiteness
     before any tensor is copied, so failed loads are atomic.
   * guarded_optimizer_step — transactional fail-closed stepping: no
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from pathlib import Path
 
 try:
@@ -161,9 +163,32 @@ class BestCheckpointTracker:
 # ---------------------------------------------------------------------------
 
 def _require_identity(value, name: str) -> str:
-    if not isinstance(value, str) or not value:
+    if not isinstance(value, str) or not value.strip():
         raise AdapterBundleIdentityError(f"{name} must be a non-empty string")
-    return value
+    normalized = value.strip()
+    if name == "revision":
+        return require_pinned_revision(normalized, name=name)
+    return normalized
+
+
+_PINNED_REVISION_RE = re.compile(r"\A[0-9a-f]{40}\Z")
+
+
+def require_pinned_revision(value, *, name: str = "revision") -> str:
+    """Require an immutable, pinned commit-style revision (40 hex chars).
+
+    Mutable refs — branches (``main``), tags, ``latest``, short shas and
+    any other unpinned string — are rejected WITHOUT any network access,
+    before loading/training/saving. The accepted value is normalized
+    consistently (trimmed, lowercased) so reports and adapter metadata
+    store and compare exactly that pinned revision.
+    """
+    normalized = value.strip().lower() if isinstance(value, str) else ""
+    if not _PINNED_REVISION_RE.fullmatch(normalized):
+        raise AdapterBundleIdentityError(
+            f"{name} must be a pinned immutable 40-hex commit revision; "
+            f"got mutable/unpinned {value!r}")
+    return normalized
 
 
 def build_adapter_bundle(state, *, model_id, revision, metrics=None) -> dict:

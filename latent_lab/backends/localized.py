@@ -459,13 +459,18 @@ class LocalizedRecurrence:
         return targets
 
     def load_adapter_state(self, sd):
-        """Prevalidate every key/tensor/shape/dtype/finiteness, then copy.
+        """Prevalidate, pre-stage, then mutate targets transactionally.
 
-        Nothing is copied until ALL entries validate, so a failed load leaves
-        the live adapter bit-for-bit unchanged (atomic).
+        Every incoming tensor is converted to the exact target
+        device/dtype BEFORE the first mutation and every target is
+        snapshotted; if any copy raises unexpectedly (even after earlier
+        targets were already copied), every target is restored bit-exactly
+        from the pre-mutation snapshot and AdapterBundleError is raised
+        with the original cause attached. The rollback reads only its own
+        snapshots — never the staged/incoming tensors.
         """
         from ..train.checkpointing import (
-            AdapterBundleSchemaError, NonFiniteStateError)
+            AdapterBundleError, AdapterBundleSchemaError, NonFiniteStateError)
         targets = self._expected_adapter_targets()
         if not isinstance(sd, dict):
             raise AdapterBundleSchemaError("adapter state must be a dict")
@@ -489,10 +494,20 @@ class LocalizedRecurrence:
                     f"{key}: dtype {t.dtype} != expected {target.dtype}")
             if t.is_floating_point() and not bool(torch.isfinite(t).all()):
                 raise NonFiniteStateError(f"{key}: contains non-finite values")
-            staged[key] = t.to(target.device)
-        with torch.no_grad():
-            for key, target in targets.items():
-                target.copy_(staged[key])
+            staged[key] = t.to(device=target.device, dtype=target.dtype)
+        snapshots = {key: target.detach().clone()
+                     for key, target in targets.items()}
+        try:
+            with torch.no_grad():
+                for key, target in targets.items():
+                    target.copy_(staged[key])
+        except BaseException as e:
+            with torch.no_grad():
+                for key, target in targets.items():
+                    target.copy_(snapshots[key])
+            raise AdapterBundleError(
+                "adapter load failed mid-copy; all targets rolled back "
+                f"bit-exactly ({e})") from e
 
     def export_adapter_bundle(self, path, *, model_id, revision, metrics=None):
         """Persist this adapter as an identity-bound best_params.pt bundle."""

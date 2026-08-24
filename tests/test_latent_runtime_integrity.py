@@ -32,6 +32,7 @@ from latent_lab.train.checkpointing import (
     NonFiniteTrainingStateError,
     guarded_optimizer_step,
     load_adapter_bundle,
+    require_pinned_revision,
     save_adapter_bundle,
 )
 
@@ -39,6 +40,12 @@ from latent_lab.train.checkpointing import (
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+# Pinned immutable commit-style revisions (40 hex chars). Every bundle
+# identity flow must use one of these; mutable refs such as "main",
+# "latest", branch names or tags must be rejected fail-closed.
+REV_A = "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b"
+REV_B = "0f9e8d7c6b5a49382715040302010ffedcba9876"
 
 def _state(value: float, key: str = "w") -> dict:
     return {key: torch.full((3, 3), value)}
@@ -160,8 +167,8 @@ def test_best_checkpoint_selection_reload_before_report_and_save(tmp_path):
     assert bool(torch.equal(applied[0]["w"], torch.full((3, 3), 2.0)))
 
     path = tmp_path / "best_params.pt"
-    tr.save(path, model_id="m", revision="r")
-    loaded = load_adapter_bundle(path, model_id="m", revision="r")
+    tr.save(path, model_id="m", revision=REV_A)
+    loaded = load_adapter_bundle(path, model_id="m", revision=REV_A)
     assert bool(torch.equal(loaded["w"], torch.full((3, 3), 2.0)))
 
     empty = BestCheckpointTracker()
@@ -170,7 +177,7 @@ def test_best_checkpoint_selection_reload_before_report_and_save(tmp_path):
     with pytest.raises(EmptyCheckpointError):
         empty.apply_best(lambda st: st)
     with pytest.raises(EmptyCheckpointError):
-        empty.save(tmp_path / "never.pt", model_id="m", revision="r")
+        empty.save(tmp_path / "never.pt", model_id="m", revision=REV_A)
     assert not (tmp_path / "never.pt").exists()
 
 
@@ -452,14 +459,54 @@ def test_recurrence_clock_is_fp32_regardless_of_default_dtype():
 def test_bundle_identity_mismatch_rejected(tmp_path):
     sd = _state(1.0, "lora.0.A")
     path = tmp_path / "best_params.pt"
-    save_adapter_bundle(path, sd, model_id="model-a", revision="rev-1")
+    save_adapter_bundle(path, sd, model_id="model-a", revision=REV_A)
 
-    loaded = load_adapter_bundle(path, model_id="model-a", revision="rev-1")
+    loaded = load_adapter_bundle(path, model_id="model-a", revision=REV_A)
     assert bool(torch.equal(loaded["lora.0.A"], sd["lora.0.A"]))
     with pytest.raises(AdapterBundleIdentityError):
-        load_adapter_bundle(path, model_id="model-a", revision="rev-2")
+        load_adapter_bundle(path, model_id="model-a", revision=REV_B)
     with pytest.raises(AdapterBundleIdentityError):
-        load_adapter_bundle(path, model_id="model-b", revision="rev-1")
+        load_adapter_bundle(path, model_id="model-b", revision=REV_A)
+    with pytest.raises(AdapterBundleIdentityError):
+        load_adapter_bundle(path, model_id="model-a", revision="main")
+
+
+def test_pinned_revision_acceptance_normalization_and_rejection(tmp_path):
+    sd = _state(1.0, "lora.0.A")
+
+    # accepted: pinned commits, normalized consistently (trim + lowercase)
+    variants = (REV_A, REV_A.upper(), f"  {REV_A.upper()} ")
+    for i, variant in enumerate(variants):
+        assert require_pinned_revision(variant) == REV_A
+        path = tmp_path / f"pin_{i}.pt"
+        bundle = save_adapter_bundle(path, sd, model_id="m",
+                                     revision=variant)
+        assert bundle["revision"] == REV_A  # stored exactly as pinned
+        loaded = load_adapter_bundle(path, model_id="m", revision=variant)
+        assert bool(torch.equal(loaded["lora.0.A"], sd["lora.0.A"]))
+
+    mutable = [
+        "main", "latest", "HEAD", "develop", "main@{yesterday}",
+        "release-1.0", "v1.2.3",                       # tags/branches
+        "abcdef0",                                     # short sha
+        "f" * 39, "f" * 41,                            # wrong length
+        "g" * 40, REV_A[:-1] + "g",                    # non-hex
+        "", "   ", None, 12345, ("a" * 40,),           # junk types
+    ]
+    for i, value in enumerate(mutable):
+        p = tmp_path / f"reject_{i}.pt"
+        with pytest.raises(AdapterBundleIdentityError):
+            save_adapter_bundle(p, sd, model_id="m", revision=value)
+        assert not p.exists(), "mutable revision was persisted"
+        # fail closed BEFORE any file read on load, too
+        with pytest.raises(AdapterBundleIdentityError):
+            load_adapter_bundle(p, model_id="m", revision=value)
+
+    tr = BestCheckpointTracker()
+    tr.update(0.5, sd, step=1)
+    with pytest.raises(AdapterBundleIdentityError):
+        tr.save(tmp_path / "best_params.pt", model_id="m", revision="main")
+    assert not (tmp_path / "best_params.pt").exists()
 
 
 def test_exact_save_load_roundtrip_and_persisted_metrics(tmp_path):
@@ -470,28 +517,28 @@ def test_exact_save_load_roundtrip_and_persisted_metrics(tmp_path):
         "clock.weight": torch.randn(5, 5),
     }
     path = tmp_path / "best_params.pt"
-    bundle = save_adapter_bundle(path, sd, model_id="M", revision="R",
+    bundle = save_adapter_bundle(path, sd, model_id="M", revision=REV_A,
                                  metrics={"acc": 0.5, "loss": -1.25})
     assert not (tmp_path / "best_params.pt.tmp").exists(), "tmp file leaked"
-    assert bundle["model_id"] == "M" and bundle["revision"] == "R"
+    assert bundle["model_id"] == "M" and bundle["revision"] == REV_A
     assert bundle["metrics"] == {"acc": 0.5, "loss": -1.25}
     assert bundle["tensors"]["lora.0.A"]["shape"] == [3, 5]
     assert bundle["tensors"]["lora.0.A"]["dtype"] == "torch.float32"
 
-    loaded = load_adapter_bundle(path, model_id="M", revision="R")
+    loaded = load_adapter_bundle(path, model_id="M", revision=REV_A)
     assert set(loaded) == set(sd)
     for k, v in sd.items():
         assert torch.equal(loaded[k], v), f"{k} not bit-exact"
 
     with pytest.raises(NonFiniteMetricError):
         save_adapter_bundle(tmp_path / "b2.pt", sd, model_id="M",
-                            revision="R", metrics={"acc": float("nan")})
+                            revision=REV_A, metrics={"acc": float("nan")})
 
     tampered = {**bundle, "metrics": {"acc": float("inf")}}
     p2 = tmp_path / "tampered_metric.pt"
     torch.save(tampered, p2)
     with pytest.raises(NonFiniteMetricError):
-        load_adapter_bundle(p2, model_id="M", revision="R")
+        load_adapter_bundle(p2, model_id="M", revision=REV_A)
 
     tensors = dict(bundle["tensors"])
     tensors["clock.weight"] = {
@@ -501,7 +548,7 @@ def test_exact_save_load_roundtrip_and_persisted_metrics(tmp_path):
     p3 = tmp_path / "tampered_tensor.pt"
     torch.save({**bundle, "tensors": tensors}, p3)
     with pytest.raises(NonFiniteStateError):
-        load_adapter_bundle(p3, model_id="M", revision="R")
+        load_adapter_bundle(p3, model_id="M", revision=REV_A)
 
 
 def test_failed_load_is_atomic():
@@ -546,7 +593,50 @@ def test_failed_load_is_atomic():
     corrupt = Path(__import__("tempfile").gettempdir()) / "corrupt_bundle.pt"
     corrupt.write_bytes(b"this is not a checkpoint")
     with pytest.raises(AdapterBundleError):
-        load_adapter_bundle(corrupt, model_id="m", revision="r")
+        load_adapter_bundle(corrupt, model_id="m", revision=REV_A)
+
+
+def test_load_adapter_state_rolls_back_bit_exact_on_late_copy_failure(
+        monkeypatch):
+    """A copy that raises AFTER earlier targets were already mutated must
+    leave every target bit-exactly unchanged (full rollback), and the
+    raised AdapterBundleError must preserve the original cause."""
+    rec = _fake_rec()
+    torch.manual_seed(9)
+    good = {
+        "lora.0.A": torch.randn(2, 4) * 0.1,
+        "lora.0.B": torch.randn(4, 2) * 0.1,
+        "clock.weight": torch.randn(3, 4) * 0.1,
+    }
+    targets = lambda r: [r.injected[0].lora_A, r.injected[0].lora_B,
+                         r.clock.weight]  # noqa: E731
+
+    LocalizedRecurrence.load_adapter_state(rec, {k: v.clone()
+                                                 for k, v in good.items()})
+    baseline = _snapshot(targets(rec))
+
+    incoming = {k: v + 1.234 for k, v in good.items()}  # all differ
+    # inject the failure on the LAST target ("clock.weight") so that
+    # "lora.0.A" and "lora.0.B" have already been copied when it fires
+    late_src = incoming["clock.weight"]
+    real_copy = torch.Tensor.copy_
+
+    def failing_copy(self, src, *a, **kw):
+        if src is late_src:
+            raise RuntimeError("injected late-copy failure")
+        return real_copy(self, src, *a, **kw)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", failing_copy)
+    with pytest.raises(AdapterBundleError) as excinfo:
+        LocalizedRecurrence.load_adapter_state(rec, incoming)
+    assert isinstance(excinfo.value.__cause__, RuntimeError), \
+        "original cause was not preserved"
+    assert "injected late-copy failure" in str(excinfo.value.__cause__)
+    monkeypatch.undo()  # rollback itself never hits the failing path
+
+    assert _unchanged(targets(rec), baseline), (
+        "late copy failure left partially-copied adapter state; "
+        "rollback did not restore every target bit-exactly")
 
 
 def _assert_cache_and_positions_consumed(rec, ids, k):
@@ -610,7 +700,7 @@ def test_cached_localized_full_equivalence_across_fp32_roundtrip(
 
     path = tmp_path / f"best_params_{interval[0]}_{interval[1]}.pt"
     rec1.export_adapter_bundle(path, model_id="tiny-qwen35",
-                               revision="rev0", metrics={"val_acc": 0.75})
+                               revision=REV_A, metrics={"val_acc": 0.75})
     assert not (tmp_path / (path.name + ".tmp")).exists(), "tmp file leaked"
 
     rec2 = LocalizedRecurrence(_tiny_qwen35(11, layers), None,
@@ -618,8 +708,8 @@ def test_cached_localized_full_equivalence_across_fp32_roundtrip(
                                lora_alpha=8, grad_checkpoint=False)
     with pytest.raises(AdapterBundleIdentityError):
         rec2.load_adapter_bundle(path, model_id="tiny-qwen35",
-                                 revision="rev-WRONG")
-    rec2.load_adapter_bundle(path, model_id="tiny-qwen35", revision="rev0")
+                                 revision=REV_B)
+    rec2.load_adapter_bundle(path, model_id="tiny-qwen35", revision=REV_A)
     assert all(p.dtype == torch.float32
                for p in rec2.trainable_parameters())
 
