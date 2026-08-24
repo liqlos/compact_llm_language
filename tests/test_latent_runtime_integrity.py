@@ -5,6 +5,7 @@ retained checkpoint (HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE are forced below;
 the hybrid model is built locally from a config with a fixed seed).
 """
 
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -80,6 +81,40 @@ def _opt_state_unchanged(opt, snap) -> bool:
             if not torch.is_tensor(v) and lv is not v:
                 return False
     return True
+
+
+def _param_groups_snapshot(opt) -> list:
+    return [{k: (v.detach().clone() if torch.is_tensor(v)
+                 else _copy_value(v))
+             for k, v in g.items() if k != "params"}
+            for g in opt.param_groups]
+
+
+def _copy_value(v):
+    import copy as _copy
+    return _copy.deepcopy(v)
+
+
+def _param_groups_unchanged(opt, snap) -> bool:
+    if len(opt.param_groups) != len(snap):
+        return False
+    for g, sg in zip(opt.param_groups, snap):
+        if set(g.keys()) - {"params"} != set(sg.keys()):
+            return False
+        for k, v in sg.items():
+            lv = g[k]
+            if torch.is_tensor(v) != torch.is_tensor(lv):
+                return False
+            if torch.is_tensor(v):
+                if not bool(torch.equal(lv, v)):
+                    return False
+            elif lv != v or type(lv) is not type(v):
+                return False
+    return True
+
+
+def _param_group_param_ids(opt) -> list:
+    return [[id(p) for p in g["params"]] for g in opt.param_groups]
 
 
 class _FakeLora:
@@ -380,12 +415,22 @@ def test_poststep_poisoned_parameter_rolls_back_params_and_state():
     opt.armed = True
     m.zero_grad(set_to_none=True)
     (m(x) ** 2).mean().backward()
+    grad_snap = [p.grad.detach().clone() for p in params]
+    groups_snap = _param_groups_snapshot(opt)
+    ids_before = _param_group_param_ids(opt)
     with pytest.raises(NonFiniteTrainingStateError):
         guarded_optimizer_step(opt, (m(x) ** 2).mean(), params, 1.0)
     assert _unchanged(params, param_snap), \
         "post-step poisoned parameter survived the rollback"
     assert _opt_state_unchanged(opt, state_snap), \
         "nested optimizer state differs after rollback"
+    for p, g0 in zip(params, grad_snap):
+        assert p.grad is not None and bool(torch.equal(p.grad, g0)), \
+            "pre-clip gradients were not restored bit-exactly"
+    assert _param_groups_unchanged(opt, groups_snap), \
+        "param_groups fields differ after rollback"
+    assert _param_group_param_ids(opt) == ids_before, \
+        "rollback replaced the live Parameter objects in param_groups"
 
 
 def test_poststep_poisoned_optimizer_state_rolls_back_exactly():
@@ -403,11 +448,142 @@ def test_poststep_poisoned_optimizer_state_rolls_back_exactly():
     poisoned.armed = True                   # now the step poisons its state
     m.zero_grad(set_to_none=True)
     (m(x) ** 2).mean().backward()
+    grad_snap = [p.grad.detach().clone() for p in params]
+    groups_snap = _param_groups_snapshot(poisoned)
+    ids_before = _param_group_param_ids(poisoned)
     with pytest.raises(NonFiniteTrainingStateError):
         guarded_optimizer_step(poisoned, (m(x) ** 2).mean(), params, 1.0)
     assert _unchanged(params, param_snap)
     assert _opt_state_unchanged(poisoned, state_snap), \
         "nested optimizer state is not byte-exact after rollback"
+    for p, g0 in zip(params, grad_snap):
+        assert p.grad is not None and bool(torch.equal(p.grad, g0)), \
+            "pre-clip gradients were not restored bit-exactly"
+    assert _param_groups_unchanged(poisoned, groups_snap), \
+        "param_groups fields differ after rollback"
+    assert _param_group_param_ids(poisoned) == ids_before, \
+        "rollback replaced the live Parameter objects in param_groups"
+
+
+class _AdversarialSGD(torch.optim.SGD):
+    """Performs a REAL update, then corrupts parameters, tensor and
+    non-tensor optimizer state and ``param_groups`` (LR + injected
+    metadata), and finally raises — the worst-case mid-step failure."""
+
+    def __init__(self, params, lr):
+        super().__init__(params, lr=lr, momentum=0.9)
+        self.armed = False
+
+    def step(self, closure=None):
+        super().step(closure)
+        if not self.armed:
+            return
+        with torch.no_grad():
+            for group in self.param_groups:
+                group["lr"] = 123.0
+                group["injected_meta"] = {"evil": [1, 2, 3]}
+            for state in self.state.values():
+                if "momentum_buffer" in state:
+                    state["momentum_buffer"].add_(11.0)
+                    state["poison_flag"] = "corrupted"
+            self.param_groups[0]["params"][0].add_(7.0)
+        raise RuntimeError("adversarial failure after full corruption")
+
+
+def _adversarial_pair(seed):
+    """Two identically-initialized model/optimizer pairs: candidate under
+    test and an independent control that receives the same initial state."""
+    torch.manual_seed(seed)
+    m_adv = torch.nn.Linear(4, 4)
+    m_ctl = torch.nn.Linear(4, 4)
+    m_ctl.load_state_dict(m_adv.state_dict())
+    x = torch.randn(8, 4)
+
+    def fresh_grads(m):
+        m.zero_grad(set_to_none=True)
+        loss = (m(x) ** 2).mean()
+        loss.backward()
+        return loss
+
+    ps_adv = list(m_adv.parameters())
+    ps_ctl = list(m_ctl.parameters())
+    opt_adv = _AdversarialSGD(ps_adv, lr=0.05)
+    opt_ctl = torch.optim.SGD(ps_ctl, lr=0.05, momentum=0.9)
+    # one clean step on both sides -> identical non-empty momentum state
+    loss_a = fresh_grads(m_adv)
+    guarded_optimizer_step(opt_adv, loss_a.detach(), ps_adv, 1.0)
+    fresh_grads(m_ctl)
+    opt_ctl.step()
+    assert bool(torch.equal(m_adv.weight.detach(), m_ctl.weight.detach()))
+    assert all(
+        torch.equal(opt_adv.state[a]["momentum_buffer"],
+                    opt_ctl.state[b]["momentum_buffer"])
+        for a, b in zip(ps_adv, ps_ctl)), \
+        "pairs did not start from identical optimizer state"
+    return m_adv, m_ctl, x, ps_adv, ps_ctl, opt_adv, opt_ctl, fresh_grads
+
+
+def test_adversarial_step_rolls_back_everything_then_matches_control():
+    m_adv, m_ctl, x, ps_adv, ps_ctl, opt_adv, opt_ctl, fresh_grads = \
+        _adversarial_pair(21)
+
+    # -- armed failure after a real, corrupting update ----------------------
+    opt_adv.armed = True
+    fresh_grads(m_adv)
+    with torch.no_grad():
+        m_adv.bias.grad = None              # None-vs-tensor grad pattern
+    pre_params = _snapshot(ps_adv)
+    pre_grads = {id(p): (None if p.grad is None else p.grad.detach().clone())
+                 for p in ps_adv}
+    pre_state = _deep_opt_state(opt_adv)
+    pre_groups = _param_groups_snapshot(opt_adv)
+    pre_ids = _param_group_param_ids(opt_adv)
+
+    with pytest.raises(RuntimeError, match="adversarial failure"):
+        guarded_optimizer_step(opt_adv, torch.tensor(0.5), ps_adv, 1.0)
+
+    # full rollback: bit-exact everything, injected fields gone
+    assert _unchanged(ps_adv, pre_params), "param corruption survived"
+    for p in ps_adv:
+        saved = pre_grads[id(p)]
+        if saved is None:
+            assert p.grad is None, "None gradient became a tensor"
+        else:
+            assert p.grad is not None and bool(torch.equal(p.grad, saved))
+    assert _opt_state_unchanged(opt_adv, pre_state), \
+        "tensor/non-tensor optimizer state not restored bit-exactly"
+    assert all("poison_flag" not in st for st in opt_adv.state.values()), \
+        "injected optimizer-state field survived rollback"
+    assert _param_groups_unchanged(opt_adv, pre_groups), \
+        "param_groups metadata not equality-identical after rollback"
+    assert all("injected_meta" not in g for g in opt_adv.param_groups), \
+        "injected param-group field survived rollback"
+    assert any(g["lr"] == 0.05 for g in opt_adv.param_groups), \
+        "mutated LR was not rolled back"
+    assert _param_group_param_ids(opt_adv) == pre_ids, \
+        "live Parameter identity/order broken by rollback"
+
+    # -- disarmed retry of the SAME update vs independent control ----------
+    opt_adv.armed = False
+    fresh_grads(m_adv)
+    with torch.no_grad():
+        m_adv.bias.grad = None              # control mirrors this pattern
+    guarded_optimizer_step(opt_adv, (m_adv(x) ** 2).mean(), ps_adv, 1.0)
+    fresh_grads(m_ctl)
+    with torch.no_grad():
+        m_ctl.bias.grad = None
+    opt_ctl.step()
+
+    assert bool(torch.equal(m_adv.weight.detach(), m_ctl.weight.detach())), \
+        "post-retry trajectory diverges from the clean control"
+    assert bool(torch.equal(m_adv.bias.detach(), m_ctl.bias.detach()))
+    assert all(
+        torch.equal(opt_adv.state[a]["momentum_buffer"],
+                    opt_ctl.state[b]["momentum_buffer"])
+        for a, b in zip(ps_adv, ps_ctl)), \
+        "optimizer state diverges from the clean control after retry"
+    assert all(g["lr"] == 0.05 and "injected_meta" not in g
+               for g in opt_adv.param_groups)
 
 
 # ---------------------------------------------------------------------------
@@ -598,9 +774,12 @@ def test_failed_load_is_atomic():
 
 def test_load_adapter_state_rolls_back_bit_exact_on_late_copy_failure(
         monkeypatch):
-    """A copy that raises AFTER earlier targets were already mutated must
-    leave every target bit-exactly unchanged (full rollback), and the
-    raised AdapterBundleError must preserve the original cause."""
+    """A copy that raises on the SECOND staged target — after an earlier
+    target was already mutated — must still leave every target bit-exactly
+    unchanged. The failing copy implementation stays active THROUGHOUT the
+    rollback (which must therefore not route through Tensor.copy_), live
+    Parameter identities survive, a later normal load succeeds, and the
+    raised AdapterBundleError preserves the original cause."""
     rec = _fake_rec()
     torch.manual_seed(9)
     good = {
@@ -610,21 +789,25 @@ def test_load_adapter_state_rolls_back_bit_exact_on_late_copy_failure(
     }
     targets = lambda r: [r.injected[0].lora_A, r.injected[0].lora_B,
                          r.clock.weight]  # noqa: E731
+    target_ids = [id(t) for t in targets(rec)]
 
     LocalizedRecurrence.load_adapter_state(rec, {k: v.clone()
                                                  for k, v in good.items()})
     baseline = _snapshot(targets(rec))
 
     incoming = {k: v + 1.234 for k, v in good.items()}  # all differ
-    # inject the failure on the LAST target ("clock.weight") so that
-    # "lora.0.A" and "lora.0.B" have already been copied when it fires
-    late_src = incoming["clock.weight"]
+    # inject the failure on the SECOND staged target ("lora.0.B") so that
+    # "lora.0.A" has already been copied (mutated) when it fires
+    late_src = incoming["lora.0.B"]
     real_copy = torch.Tensor.copy_
+    mutated_evidence = {}
 
     def failing_copy(self, src, *a, **kw):
         if src is late_src:
             raise RuntimeError("injected late-copy failure")
-        return real_copy(self, src, *a, **kw)
+        result = real_copy(self, src, *a, **kw)
+        mutated_evidence[id(self)] = self.detach().clone()
+        return result
 
     monkeypatch.setattr(torch.Tensor, "copy_", failing_copy)
     with pytest.raises(AdapterBundleError) as excinfo:
@@ -632,11 +815,28 @@ def test_load_adapter_state_rolls_back_bit_exact_on_late_copy_failure(
     assert isinstance(excinfo.value.__cause__, RuntimeError), \
         "original cause was not preserved"
     assert "injected late-copy failure" in str(excinfo.value.__cause__)
-    monkeypatch.undo()  # rollback itself never hits the failing path
+
+    # the failure was STILL ACTIVE here — no monkeypatch.undo() yet — so the
+    # rollback provably never used the failing copy path; and the recorded
+    # post-copy value proves lora.0.A really was mutated before the failure
+    id_a = id(rec.injected[0].lora_A)
+    assert id_a in mutated_evidence, "no earlier target was copied first"
+    assert not bool(torch.equal(mutated_evidence[id_a],
+                                baseline[id_a])), \
+        "earlier target was not actually mutated before the failure"
+    monkeypatch.undo()
 
     assert _unchanged(targets(rec), baseline), (
         "late copy failure left partially-copied adapter state; "
         "rollback did not restore every target bit-exactly")
+    assert [id(t) for t in targets(rec)] == target_ids, \
+        "rollback replaced live Parameter objects"
+
+    # and a subsequent NORMAL adapter load succeeds end-to-end
+    LocalizedRecurrence.load_adapter_state(rec, {k: v.clone()
+                                                 for k, v in good.items()})
+    for t, v in zip(targets(rec), good.values()):
+        assert bool(torch.equal(t, v)), "normal reload after rollback failed"
 
 
 def _assert_cache_and_positions_consumed(rec, ids, k):
@@ -718,3 +918,83 @@ def test_cached_localized_full_equivalence_across_fp32_roundtrip(
     assert order1 == order2
     assert torch.equal(torch.tensor(scores1), torch.tensor(scores2)), \
         "scores changed across the bundle roundtrip"
+
+
+# ---------------------------------------------------------------------------
+# fail-closed ordering: falsey revisions + eval-time bundle identity first
+# ---------------------------------------------------------------------------
+
+def test_load_model_falsey_revision_rejected_before_any_hf_loader(monkeypatch):
+    """Only ``revision=None`` selects the pinned default; falsey values
+    ("", False, 0) and mutable refs must reach require_pinned_revision and
+    be rejected BEFORE AutoTokenizer/AutoModel are ever contacted."""
+    pytest.importorskip("transformers")
+    import transformers
+
+    from latent_lab.bench.latent_run import DEFAULT_MODEL_ID, load_model
+
+    calls = []
+
+    def _forbid(kind):
+        def _boom(*a, **kw):
+            calls.append(kind)
+            raise AssertionError(f"{kind} loader was called")
+        return _boom
+
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained",
+                        _forbid("tokenizer"))
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained",
+                        _forbid("model"))
+
+    for bad in ["", "   ", False, 0, "main", "latest", "abcdef0"]:
+        with pytest.raises(AdapterBundleIdentityError):
+            load_model("cpu", DEFAULT_MODEL_ID, bad)
+    assert calls == [], \
+        "transformers loaders were reached despite an invalid revision"
+
+
+def test_cmd_eval_identity_mismatch_aborts_before_load_model(
+        tmp_path, monkeypatch):
+    """A tampered train_report.json with a VALID 40-hex revision must be
+    rejected via the on-disk bundle identity check BEFORE load_model can
+    fetch anything."""
+    from latent_lab.bench import latent_run
+
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    save_adapter_bundle(adapter_dir / "best_params.pt",
+                        {"lora.0.A": torch.randn(2, 4) * 0.1},
+                        model_id="M", revision=REV_B)
+
+    def write_report(rev):
+        (adapter_dir / "train_report.json").write_text(json.dumps({"config": {
+            "mode": "E-localized", "model": "M", "revision": rev,
+            "interval": [0, 1], "k": 1, "max_k": 2, "lora_r": 2}}))
+
+    def _forbid_load_model(*a, **kw):
+        raise AssertionError("load_model ran before bundle identity check")
+
+    monkeypatch.setattr(latent_run, "load_model", _forbid_load_model)
+    args = SimpleNamespace(adapter=str(adapter_dir), split="test_id",
+                           k=None, ablate=None, seed=0, limit=None,
+                           device="cpu", out=None)
+
+    # valid-but-mismatched pinned revision in the report: bundle identity
+    # fails first, load_model never runs
+    write_report(REV_A)
+    with pytest.raises(AdapterBundleIdentityError):
+        latent_run.cmd_eval(args)
+
+    # ordering sanity: with MATCHING identities load_model is reached
+    # (aborted immediately after by this stub) instead of the bundle error
+    write_report(REV_B)
+
+    def _recording_load_model(device, mid, rev):
+        reached.append((mid, rev))
+        raise RuntimeError("stop-right-after-load-model")
+
+    reached = []
+    monkeypatch.setattr(latent_run, "load_model", _recording_load_model)
+    with pytest.raises(RuntimeError, match="stop-right-after-load-model"):
+        latent_run.cmd_eval(args)
+    assert reached == [("M", REV_B)]

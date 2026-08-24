@@ -18,6 +18,7 @@ Three responsibilities live here:
 
 from __future__ import annotations
 
+import copy
 import math
 import os
 import re
@@ -364,6 +365,31 @@ def _restore_optimizer_state(optimizer, snap) -> None:
                 live_entry[name] = _deep_clone_tree(val)
 
 
+def _snapshot_param_groups(optimizer) -> list:
+    """Deep-copy every ``param_groups`` field except the live params list."""
+    return [
+        {k: (v.detach().clone() if torch.is_tensor(v) else copy.deepcopy(v))
+         for k, v in group.items() if k != "params"}
+        for group in optimizer.param_groups
+    ]
+
+
+def _restore_param_groups(optimizer, snap) -> None:
+    """Restore param-group values IN PLACE: the group dicts and the
+    identity/order of their live Parameter objects are never replaced;
+    fields injected after the snapshot are removed."""
+    if len(optimizer.param_groups) != len(snap):
+        raise RuntimeError(
+            "optimizer.param_groups changed size mid-step; cannot roll back")
+    for group, snap_group in zip(optimizer.param_groups, snap):
+        for key in list(group.keys()):
+            if key != "params" and key not in snap_group:
+                del group[key]
+        for key, val in snap_group.items():
+            group[key] = (val.detach().clone() if torch.is_tensor(val)
+                          else copy.deepcopy(val))
+
+
 def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
     """Step only when everything is finite; roll back completely otherwise.
 
@@ -373,11 +399,15 @@ def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
         norm. Any rejection here performs no step and mutates nothing.
       * Gradients are rechecked after clipping; a post-clip rejection also
         restores the pre-clip gradients.
-      * Every trainable parameter and a deep exact copy of the optimizer
-        state are snapshotted before ``optimizer.step()``. If the step
-        raises, or any post-step parameter or optimizer-state tensor is
-        non-finite, parameters and the complete optimizer state are
-        restored exactly, then the error is raised.
+      * Every trainable parameter, every pre-clip gradient (including the
+        ``None`` versus tensor distinction and exact bytes), a deep exact
+        copy of the optimizer state and every ``param_groups`` field are
+        snapshotted before ``optimizer.step()``. If the step raises, or any
+        post-step parameter or optimizer-state tensor is non-finite, all of
+        it — parameters, gradients, complete optimizer state including
+        injected fields, and param-group values — is restored exactly while
+        keeping the live Parameter identities, then the error is raised.
+        The optimizer remains usable after rollback.
     """
     _require_torch()
     # -- pre-step validation: nothing has been mutated yet -------------------
@@ -407,13 +437,18 @@ def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
             "refusing optimizer.step: non-finite gradient norm "
             "(clip would silently zero it)")
 
-    grad_snap = {id(p): g.detach().clone() for p, g in pairs}
+    grad_snap = {id(p): (None if p.grad is None else p.grad.detach().clone())
+                 for p in params}
 
     def restore_grads() -> None:
         with torch.no_grad():
-            for p, _g in pairs:
+            for p in params:
                 saved = grad_snap[id(p)]
-                if p.grad is not None:
+                if saved is None:
+                    p.grad = None
+                elif p.grad is None:
+                    p.grad = saved.clone()
+                else:
                     p.grad.copy_(saved)
 
     torch.nn.utils.clip_grad_norm_(params, clip)
@@ -426,12 +461,18 @@ def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
     # -- transaction: snapshot everything the step may corrupt ---------------
     param_snap = [p.detach().clone() for p in params]
     state_snap = _deep_clone_tree(optimizer.state)
+    groups_snap = _snapshot_param_groups(optimizer)
 
-    def rollback() -> None:
+    def restore_params() -> None:
         with torch.no_grad():
             for p, saved in zip(params, param_snap):
                 p.copy_(saved)
+
+    def rollback() -> None:
+        restore_params()
         _restore_optimizer_state(optimizer, state_snap)
+        _restore_param_groups(optimizer, groups_snap)
+        restore_grads()
 
     try:
         optimizer.step()

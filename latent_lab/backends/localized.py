@@ -467,7 +467,11 @@ class LocalizedRecurrence:
         targets were already copied), every target is restored bit-exactly
         from the pre-mutation snapshot and AdapterBundleError is raised
         with the original cause attached. The rollback reads only its own
-        snapshots — never the staged/incoming tensors.
+        snapshots — never the staged/incoming tensors — and restores them
+        through an independent mechanism (data rebinding, NOT
+        ``Tensor.copy_``), so it stays correct even when the copy
+        implementation itself keeps failing. Live ``Parameter`` identity is
+        preserved throughout.
         """
         from ..train.checkpointing import (
             AdapterBundleError, AdapterBundleSchemaError, NonFiniteStateError)
@@ -502,9 +506,13 @@ class LocalizedRecurrence:
                 for key, target in targets.items():
                     target.copy_(staged[key])
         except BaseException as e:
+            # Rollback must not depend on the (possibly still failing)
+            # Tensor.copy_ path: rebind each live Parameter's storage to its
+            # pre-mutation snapshot instead. Same object identity, bit-exact
+            # values, no copy_ call.
             with torch.no_grad():
                 for key, target in targets.items():
-                    target.copy_(snapshots[key])
+                    target.data = snapshots[key]
             raise AdapterBundleError(
                 "adapter load failed mid-copy; all targets rolled back "
                 f"bit-exactly ({e})") from e

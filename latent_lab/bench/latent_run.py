@@ -77,8 +77,11 @@ def load_model(device="mps", model_id=None, revision=None):
 
     model_id = model_id or DEFAULT_MODEL_ID
     # fail closed BEFORE any Hugging Face contact: only pinned immutable
-    # commit revisions are accepted
-    revision = require_pinned_revision(revision or DEFAULT_REVISION)
+    # commit revisions are accepted. Only None falls back to the default;
+    # falsey values such as "", False or 0 are validated and rejected
+    # as-is instead of being silently replaced by the default SHA.
+    revision = require_pinned_revision(
+        DEFAULT_REVISION if revision is None else revision)
     tok = transformers.AutoTokenizer.from_pretrained(model_id,
                                                      revision=revision)
     model = transformers.AutoModelForCausalLM.from_pretrained(
@@ -288,13 +291,16 @@ def cmd_eval(args):
         raise ValueError(
             f"adapter {args.adapter} carries no immutable pinned model "
             "revision; refusing to evaluate") from e
+    # Identity-validate the on-disk bundle BEFORE any model/tokenizer load:
+    # a tampered report carrying a valid pinned revision must never trigger
+    # an arbitrary model fetch prior to rejection.
+    state = load_adapter_bundle(args.adapter, model_id=model_id,
+                                revision=revision)
     model, tok = load_model(device, model_id, revision)
     interval = tuple(cfg["interval"])
     rec = LocalizedRecurrence(model, None, interval=interval,
                               max_k=cfg["max_k"], lora_r=cfg["lora_r"],
                               grad_checkpoint=False)
-    state = load_adapter_bundle(args.adapter, model_id=model_id,
-                                revision=revision)
     rec.load_adapter_state(state)
 
     suite = build_suite()
