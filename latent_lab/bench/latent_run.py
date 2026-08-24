@@ -153,6 +153,8 @@ def cmd_train(args):
 
     from latent_lab.backends.localized import LocalizedRecurrence
     from latent_lab.bench.suite import build_suite
+    from latent_lab.train.checkpointing import (
+        BestCheckpointTracker, guarded_optimizer_step)
 
     torch.manual_seed(args.seed)
     device = args.device

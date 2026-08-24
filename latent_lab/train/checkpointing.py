@@ -8,9 +8,11 @@ Three responsibilities live here:
     (model_id, revision) it was trained against plus per-tensor metadata;
     loads prevalidate every key, tensor type, shape, dtype and finiteness
     before any tensor is copied, so failed loads are atomic.
-  * guarded_optimizer_step — fail-closed stepping: no optimizer.step()
-    unless loss, gradients, parameters and the clip norm are finite, with
-    rechecks after clipping and after the update.
+  * guarded_optimizer_step — transactional fail-closed stepping: no
+    optimizer.step() unless loss, the clip configuration, parameters,
+    gradients and the clip norm are all finite, with rechecks after
+    clipping and after the update; any post-step corruption rolls the
+    parameters and the complete optimizer state back bit-exactly.
 """
 
 from __future__ import annotations
@@ -290,28 +292,88 @@ def load_adapter_bundle(path, *, model_id, revision) -> dict:
 # fail-closed optimizer stepping
 # ---------------------------------------------------------------------------
 
-def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
-    """Step only when loss, gradients, params and clip norm are all finite.
+def _deep_clone_tree(obj):
+    """Exact deep copy of a tensor tree (optimizer state shapes)."""
+    if torch.is_tensor(obj):
+        return obj.detach().clone()
+    if isinstance(obj, dict):
+        return {k: _deep_clone_tree(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_deep_clone_tree(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_deep_clone_tree(v) for v in obj)
+    return obj
 
-    Checks run BEFORE any mutation: non-finite loss/gradients/norm raise
-    without calling optimizer.step(), so a bad batch can never silently clip
-    garbage to zero or corrupt weights. Gradients are rechecked after
-    clipping and parameters after the update.
+
+def _tree_is_finite(obj) -> bool:
+    if torch.is_tensor(obj):
+        return not obj.is_floating_point() or bool(torch.isfinite(obj).all())
+    if isinstance(obj, dict):
+        return all(_tree_is_finite(v) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return all(_tree_is_finite(v) for v in obj)
+    return True
+
+
+def _restore_optimizer_state(optimizer, snap) -> None:
+    """Roll optimizer.state back to the snapshot bit-exactly, in place."""
+    state = optimizer.state
+    for key in list(state.keys()):
+        if key not in snap:
+            del state[key]
+    for key, snap_entry in snap.items():
+        live_entry = state.get(key) if hasattr(state, "get") else None
+        if not isinstance(live_entry, dict) or \
+                not isinstance(snap_entry, dict):
+            state[key] = _deep_clone_tree(snap_entry)
+            continue
+        for name in list(live_entry.keys()):
+            if name not in snap_entry:
+                del live_entry[name]
+        for name, val in snap_entry.items():
+            live_val = live_entry.get(name)
+            if torch.is_tensor(live_val) and torch.is_tensor(val):
+                with torch.no_grad():
+                    live_val.copy_(val)
+            else:
+                live_entry[name] = _deep_clone_tree(val)
+
+
+def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
+    """Step only when everything is finite; roll back completely otherwise.
+
+    Transactional contract:
+      * PRE-STEP (before any mutation): finite loss, positive finite clip,
+        finite parameters, finite gradients and a finite total gradient
+        norm. Any rejection here performs no step and mutates nothing.
+      * Gradients are rechecked after clipping; a post-clip rejection also
+        restores the pre-clip gradients.
+      * Every trainable parameter and a deep exact copy of the optimizer
+        state are snapshotted before ``optimizer.step()``. If the step
+        raises, or any post-step parameter or optimizer-state tensor is
+        non-finite, parameters and the complete optimizer state are
+        restored exactly, then the error is raised.
     """
     _require_torch()
+    # -- pre-step validation: nothing has been mutated yet -------------------
     if loss is None or not torch.is_tensor(loss) \
             or not bool(torch.isfinite(loss.detach()).all()):
         raise NonFiniteTrainingStateError(
             "refusing optimizer.step: non-finite loss")
+    clip = float(clip_norm)
+    if not math.isfinite(clip) or clip <= 0.0:
+        raise NonFiniteTrainingStateError(
+            f"refusing optimizer.step: invalid clip norm {clip_norm!r}")
+    params = list(params)
+    for p in params:
+        if not bool(torch.isfinite(p.detach()).all()):
+            raise NonFiniteTrainingStateError(
+                "refusing optimizer.step: non-finite parameter")
     pairs = [(p, p.grad) for p in params if p.grad is not None]
     for _, g in pairs:
         if not bool(torch.isfinite(g).all()):
             raise NonFiniteTrainingStateError(
                 "refusing optimizer.step: non-finite gradient")
-    clip = float(clip_norm)
-    if not math.isfinite(clip) or clip <= 0.0:
-        raise NonFiniteTrainingStateError(
-            f"refusing optimizer.step: invalid clip norm {clip_norm!r}")
     total_sq = torch.zeros((), dtype=torch.float32)
     for _, g in pairs:
         total_sq = total_sq + g.detach().float().pow(2).sum()
@@ -319,13 +381,44 @@ def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
         raise NonFiniteTrainingStateError(
             "refusing optimizer.step: non-finite gradient norm "
             "(clip would silently zero it)")
-    torch.nn.utils.clip_grad_norm_([p for p in params], clip)
+
+    grad_snap = {id(p): g.detach().clone() for p, g in pairs}
+
+    def restore_grads() -> None:
+        with torch.no_grad():
+            for p, _g in pairs:
+                saved = grad_snap[id(p)]
+                if p.grad is not None:
+                    p.grad.copy_(saved)
+
+    torch.nn.utils.clip_grad_norm_(params, clip)
     for p, _ in pairs:  # recheck after clipping
         if not bool(torch.isfinite(p.grad).all()):
+            restore_grads()
             raise NonFiniteTrainingStateError(
                 "gradients became non-finite after clipping")
-    optimizer.step()
+
+    # -- transaction: snapshot everything the step may corrupt ---------------
+    param_snap = [p.detach().clone() for p in params]
+    state_snap = _deep_clone_tree(optimizer.state)
+
+    def rollback() -> None:
+        with torch.no_grad():
+            for p, saved in zip(params, param_snap):
+                p.copy_(saved)
+        _restore_optimizer_state(optimizer, state_snap)
+
+    try:
+        optimizer.step()
+    except BaseException:
+        rollback()
+        raise
     for p in params:  # recheck after update
         if not bool(torch.isfinite(p.detach()).all()):
+            rollback()
             raise NonFiniteTrainingStateError(
                 "parameters became non-finite after optimizer.step")
+    if not _tree_is_finite(optimizer.state):
+        rollback()
+        raise NonFiniteTrainingStateError(
+            "optimizer state became non-finite after optimizer.step")

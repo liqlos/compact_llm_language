@@ -52,6 +52,29 @@ def _unchanged(params, snap) -> bool:
     return all(bool(torch.equal(p.detach(), snap[id(p)])) for p in params)
 
 
+def _deep_opt_state(opt) -> dict:
+    return {p: {k: (v.detach().clone() if torch.is_tensor(v) else v)
+                for k, v in st.items()} for p, st in opt.state.items()}
+
+
+def _opt_state_unchanged(opt, snap) -> bool:
+    if set(opt.state.keys()) != set(snap.keys()):
+        return False
+    for p, entry in snap.items():
+        live = opt.state[p]
+        if set(live.keys()) != set(entry.keys()):
+            return False
+        for k, v in entry.items():
+            lv = live[k]
+            if torch.is_tensor(v) != torch.is_tensor(lv):
+                return False
+            if torch.is_tensor(v) and not bool(torch.equal(lv, v)):
+                return False
+            if not torch.is_tensor(v) and lv is not v:
+                return False
+    return True
+
+
 class _FakeLora:
     def __init__(self, r, fin, fout):
         self.lora_A = torch.nn.Parameter(torch.zeros(r, fin))
@@ -86,9 +109,11 @@ def _tiny_qwen35(seed: int = 11, layers: int = 6):
     return AutoModelForCausalLM.from_config(cfg).eval()
 
 
-def _nonzero_adapted_rec(model, seed: int = 5):
+def _nonzero_adapted_rec(model, seed: int = 5, interval=None):
+    if interval is None:
+        interval = (0, model.config.num_hidden_layers)
     rec = LocalizedRecurrence(
-        model, None, interval=(0, model.config.num_hidden_layers),
+        model, None, interval=interval,
         max_k=4, lora_r=4, lora_alpha=8, grad_checkpoint=False)
     g = torch.Generator().manual_seed(seed)
     with torch.no_grad():
@@ -231,7 +256,8 @@ def test_optimizer_step_fail_closed():
     fresh_grads()
     with pytest.raises(NonFiniteTrainingStateError):
         guarded_optimizer_step(poisoned, loss_fn(), params, 1.0)
-    assert bool(torch.isinf(m.weight).any()), "post-update recheck missed"
+    assert _unchanged(params, snap), \
+        "post-update poisoning was not rolled back bit-exactly"
 
     m2 = torch.nn.Linear(4, 4)
     opt2 = torch.optim.SGD(m2.parameters(), lr=0.1)
@@ -241,6 +267,140 @@ def test_optimizer_step_fail_closed():
                            list(m2.parameters()), 1.0)
     assert not bool(torch.equal(m2.weight.detach(), before)), \
         "happy-path step did not run"
+
+
+class _PoisonParamAdam(torch.optim.Adam):
+    """Adam that corrupts a parameter after its own update once armed."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.armed = False
+
+    def step(self, closure=None):
+        super().step(closure)
+        if self.armed:
+            with torch.no_grad():
+                self.param_groups[0]["params"][0].add_(float("inf"))
+
+
+class _PoisonStateAdam(torch.optim.Adam):
+    """Adam that corrupts its own state after a real update once armed."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.armed = False
+
+    def step(self, closure=None):
+        super().step(closure)
+        if self.armed:
+            with torch.no_grad():
+                self.state[self.param_groups[0]["params"][0]][
+                    "exp_avg"].fill_(float("nan"))
+
+
+def _adam_with_nonempty_state():
+    m = torch.nn.Linear(4, 4)
+    x = torch.randn(6, 4)
+    params = list(m.parameters())
+    opt = torch.optim.Adam(params, lr=0.1)
+    (m(x) ** 2).mean().backward()
+    guarded_optimizer_step(opt, (m(x) ** 2).mean(), params, 1.0)
+    assert opt.state, "optimizer state must be non-empty for this test"
+    return m, x, params, opt
+
+
+def test_prepoisoned_parameter_rejected_without_mutation():
+    m, x, params, opt = _adam_with_nonempty_state()
+
+    with torch.no_grad():
+        m.bias.fill_(float("inf"))          # poison the parameter itself
+    m.zero_grad(set_to_none=True)
+    with torch.no_grad():                   # grads stay finite on purpose
+        for p in params:
+            p.grad = torch.randn_like(p) * 0.01
+    param_snap = _snapshot(params)          # baseline = the poisoned state
+    state_snap = _deep_opt_state(opt)
+    finite_loss = torch.tensor(0.5)         # reported loss stays finite
+    with pytest.raises(NonFiniteTrainingStateError):
+        guarded_optimizer_step(opt, finite_loss, params, 1.0)
+    assert _unchanged(params, param_snap), "poisoned parameter was stepped"
+    assert _opt_state_unchanged(opt, state_snap), \
+        "rejected step mutated nested optimizer state"
+    assert all(p.grad is not None and bool(torch.isfinite(p.grad).all())
+               for p in params), "gradients were disturbed by rejection"
+
+    # recovery: after unpoisoning, the same optimizer steps cleanly
+    with torch.no_grad():
+        m.bias.zero_()
+        for p in params:
+            p.grad.fill_(0.01)
+    guarded_optimizer_step(opt, finite_loss, params, 1.0)
+    assert not _unchanged(params, param_snap), "recovery step did not run"
+
+
+@pytest.mark.parametrize("bad_clip", [float("nan"), float("inf"),
+                                      0.0, -1.0])
+def test_nan_and_zero_clip_rejected_without_step_or_mutation(bad_clip):
+    m = torch.nn.Linear(4, 4)
+    x = torch.randn(6, 4)
+    params = list(m.parameters())
+    opt = torch.optim.SGD(params, lr=0.1)
+    (m(x) ** 2).mean().backward()
+    param_snap = _snapshot(params)
+    state_snap = _deep_opt_state(opt)
+    grads_before = [p.grad.clone() for p in params]
+
+    with pytest.raises(NonFiniteTrainingStateError):
+        guarded_optimizer_step(opt, (m(x) ** 2).mean(), params, bad_clip)
+    assert _unchanged(params, param_snap), "stepped on invalid clip config"
+    assert _opt_state_unchanged(opt, state_snap)
+    for p, g0 in zip(params, grads_before):
+        assert torch.equal(p.grad, g0), "clipping ran before clip validation"
+
+
+def test_poststep_poisoned_parameter_rolls_back_params_and_state():
+    m = torch.nn.Linear(4, 4)
+    x = torch.randn(6, 4)
+    params = list(m.parameters())
+    opt = _PoisonParamAdam(params, lr=0.1)
+
+    (m(x) ** 2).mean().backward()           # disarmed: builds real state
+    guarded_optimizer_step(opt, (m(x) ** 2).mean(), params, 1.0)
+    assert opt.state, "optimizer state must be non-empty before arming"
+
+    param_snap = _snapshot(params)
+    state_snap = _deep_opt_state(opt)
+    opt.armed = True
+    m.zero_grad(set_to_none=True)
+    (m(x) ** 2).mean().backward()
+    with pytest.raises(NonFiniteTrainingStateError):
+        guarded_optimizer_step(opt, (m(x) ** 2).mean(), params, 1.0)
+    assert _unchanged(params, param_snap), \
+        "post-step poisoned parameter survived the rollback"
+    assert _opt_state_unchanged(opt, state_snap), \
+        "nested optimizer state differs after rollback"
+
+
+def test_poststep_poisoned_optimizer_state_rolls_back_exactly():
+    m = torch.nn.Linear(4, 4)
+    x = torch.randn(6, 4)
+    params = list(m.parameters())
+    poisoned = _PoisonStateAdam(params, lr=0.1)
+
+    (m(x) ** 2).mean().backward()           # first: create non-empty state
+    guarded_optimizer_step(poisoned, (m(x) ** 2).mean(), params, 1.0)
+    state_snap = _deep_opt_state(poisoned)
+    assert any("exp_avg" in st for st in state_snap.values())
+    param_snap = _snapshot(params)
+
+    poisoned.armed = True                   # now the step poisons its state
+    m.zero_grad(set_to_none=True)
+    (m(x) ** 2).mean().backward()
+    with pytest.raises(NonFiniteTrainingStateError):
+        guarded_optimizer_step(poisoned, (m(x) ** 2).mean(), params, 1.0)
+    assert _unchanged(params, param_snap)
+    assert _opt_state_unchanged(poisoned, state_snap), \
+        "nested optimizer state is not byte-exact after rollback"
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +426,23 @@ def test_lora_and_clock_trainables_are_fp32_over_bf16_backbone():
     clock = make_step_clock(8, 4)
     assert clock.weight.dtype == torch.float32
     assert float(clock.weight.abs().sum().detach()) == 0.0
+
+
+def test_recurrence_clock_is_fp32_regardless_of_default_dtype():
+    model = _tiny_qwen35(13, 4)
+    old = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        rec = LocalizedRecurrence(model, None, interval=(0, 4), max_k=4,
+                                  lora_r=4, lora_alpha=8,
+                                  grad_checkpoint=False)
+        assert rec.clock.weight.dtype == torch.float32, \
+            "clock dtype followed the global default"
+        assert rec.clock.weight.requires_grad
+    finally:
+        torch.set_default_dtype(old)     # restore safely even on failure
+    assert torch.get_default_dtype() == old
+    assert all(p.dtype == torch.float32 for p in rec.trainable_parameters())
 
 
 # ---------------------------------------------------------------------------
@@ -372,30 +549,72 @@ def test_failed_load_is_atomic():
         load_adapter_bundle(corrupt, model_id="m", revision="r")
 
 
+def _assert_cache_and_positions_consumed(rec, ids, k):
+    """Prove the latent loop genuinely consumes the DynamicCache and the
+    positions: storage grows exactly where it must, positions advance, and
+    sabotaging either changes the result (test fails if cache arguments
+    were ignored)."""
+    t = ids.shape[1]
+    with torch.no_grad():
+        cache_a, z0_a = rec._encode(ids)
+        cache_b, z0_b = rec._encode(ids)
+        cache_c, _ = rec._encode(ids)
+        assert torch.equal(z0_a, z0_b)
+        for lyr in cache_c.layers:       # corrupt every stored state; if
+            for attr in ("conv_states", "recurrent_states",  # the loop read
+                         "keys", "values"):  # the cache, output must move
+                v = getattr(lyr, attr, None)
+                if torch.is_tensor(v):
+                    v.mul_(100.0)
+        z_a, pos_a = rec.latent_steps(z0_a, cache_a, t, k)
+        z_b, pos_b = rec.latent_steps(z0_b, cache_b, t + 3, k)  # shifted pos
+        z_c, pos_c = rec.latent_steps(z0_a, cache_c, t, k)
+    assert pos_a == t + k and pos_b == t + 3 + k and pos_c == t + k
+    assert not torch.equal(z_a, z_b), "loop ignored position arguments"
+    assert not torch.equal(z_a, z_c), "loop ignored cache contents"
+    lo, hi = rec.interval
+    for i in range(rec.n_layers):        # kv layout: [b, kv_heads, seq, dim]
+        ks = getattr(cache_a.layers[i], "keys", None)
+        if ks is None:
+            continue
+        expected = t + (k if lo <= i < hi else 0)
+        assert ks.shape[2] == expected, \
+            f"layer {i} kv length {ks.shape[2]} != expected {expected}"
+
+
 # ---------------------------------------------------------------------------
 # cached localized/full equivalence across an adapter roundtrip
 # ---------------------------------------------------------------------------
 
 @pytest.mark.filterwarnings("ignore")
-def test_cached_localized_full_equivalence_across_fp32_roundtrip(tmp_path):
+@pytest.mark.parametrize("interval", [(0, 6), (2, 4)])   # full + localized
+def test_cached_localized_full_equivalence_across_fp32_roundtrip(
+        tmp_path, interval):
     pytest.importorskip("transformers")
     layers = 6
 
-    rec1 = _nonzero_adapted_rec(_tiny_qwen35(11, layers))
+    rec1 = _nonzero_adapted_rec(_tiny_qwen35(11, layers), interval=interval)
     trainables = rec1.trainable_parameters()
     assert all(p.dtype == torch.float32 for p in trainables), "fp32 contract"
     assert all(bool(torch.isfinite(p).all()) for p in trainables)
     assert sum(float(p.abs().sum()) for p in trainables) > 0.0, \
         "adapter must be nonzero for this test"
 
-    order1, scores1 = _cached_matches_full(rec1)
+    _assert_cache_and_positions_consumed(rec1, _IDS, 2)
 
-    path = tmp_path / "best_params.pt"
+    order1, scores1 = _cached_matches_full(rec1)
+    order1b, scores1b = _cached_matches_full(rec1)
+    assert order1 == order1b and torch.equal(torch.tensor(scores1),
+                                             torch.tensor(scores1b)), \
+        "cached scoring is not deterministic"
+
+    path = tmp_path / f"best_params_{interval[0]}_{interval[1]}.pt"
     rec1.export_adapter_bundle(path, model_id="tiny-qwen35",
                                revision="rev0", metrics={"val_acc": 0.75})
+    assert not (tmp_path / (path.name + ".tmp")).exists(), "tmp file leaked"
 
     rec2 = LocalizedRecurrence(_tiny_qwen35(11, layers), None,
-                               interval=(0, layers), max_k=4, lora_r=4,
+                               interval=interval, max_k=4, lora_r=4,
                                lora_alpha=8, grad_checkpoint=False)
     with pytest.raises(AdapterBundleIdentityError):
         rec2.load_adapter_bundle(path, model_id="tiny-qwen35",
@@ -404,6 +623,7 @@ def test_cached_localized_full_equivalence_across_fp32_roundtrip(tmp_path):
     assert all(p.dtype == torch.float32
                for p in rec2.trainable_parameters())
 
+    _assert_cache_and_positions_consumed(rec2, _IDS, 2)
     order2, scores2 = _cached_matches_full(rec2)
     assert order1 == order2
     assert torch.equal(torch.tensor(scores1), torch.tensor(scores2)), \

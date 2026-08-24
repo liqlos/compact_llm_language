@@ -215,7 +215,9 @@ class LocalizedRecurrence:
         self.guard = VocabGuard(model, tokenizer)
 
         dev = next(model.parameters()).device
-        self.clock = torch.nn.Embedding(max_k + 1, hidden, device=dev)
+        # clock trainables are explicitly fp32; never the global default dtype
+        self.clock = torch.nn.Embedding(max_k + 1, hidden, device=dev,
+                                        dtype=torch.float32)
         torch.nn.init.zeros_(self.clock.weight)
 
         self.injected = inject_lora(
