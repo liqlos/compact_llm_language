@@ -153,10 +153,16 @@ def cmd_train(args):
 
     from latent_lab.backends.localized import LocalizedRecurrence
     from latent_lab.bench.suite import build_suite
+    from latent_lab.train.checkpointing import (BestCheckpointTracker,
+                                                guarded_optimizer_step,
+                                                require_finite_metric,
+                                                save_adapter_bundle)
 
     torch.manual_seed(args.seed)
     device = args.device
-    model, tok = load_model(device, args.model, args.revision)
+    model_id = args.model or DEFAULT_MODEL_ID
+    revision = args.revision or DEFAULT_REVISION
+    model, tok = load_model(device, model_id, revision)
     interval = interval_from_spec(
         args.interval, model.config.num_hidden_layers)
     rec = LocalizedRecurrence(model, None, interval=interval, max_k=args.max_k,
@@ -173,7 +179,7 @@ def cmd_train(args):
 
     order = list(range(len(train)))
     history = []
-    best = {"acc": -1.0, "state": None, "step": -1}
+    tracker = BestCheckpointTracker(mode="max")
     t0 = time.perf_counter()
     base_lr = args.lr
 
@@ -187,7 +193,7 @@ def cmd_train(args):
         return base_lr
 
     perm = None
-    final_loss = float("nan")
+    final_loss = None
     for step in range(args.steps):
         if step % len(order) == 0 or perm is None:
             perm = torch.randperm(len(order)).tolist()
@@ -199,8 +205,8 @@ def cmd_train(args):
                                    args.k, detach_z0=args.detach_z0)
         opt.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(params, args.clip)
-        opt.step()
+        # fail closed: step only when loss/grads/params/clip-norm are finite
+        guarded_optimizer_step(loss, opt, params, max_norm=args.clip)
         final_loss = float(loss.detach())
         if step % 50 == 0 or step == args.steps - 1:
             print(f"step {step} loss {final_loss:.4f} lr {lr_at(step):.2e} "
@@ -210,17 +216,25 @@ def cmd_train(args):
                           limit=n_val_eval)
             ev["step"] = step + 1
             ev.pop("records")
+            require_finite_metric(f"val accuracy @step {step + 1}",
+                                  ev["accuracy"])
             history.append(ev)
             print(f"  val acc {ev['accuracy']} @step {step+1}", flush=True)
-            if ev["accuracy"] > best["acc"]:
-                best = {
-                    "acc": ev["accuracy"], "step": step + 1,
-                    "state": rec.adapter_state_dict(),
-                }
+            tracker.update(ev["accuracy"], rec.adapter_state_dict(),
+                           step=step + 1)
 
+    if final_loss is None:
+        raise RuntimeError(
+            "no optimizer step completed; refusing to write a report")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    torch.save(best["state"], out / "best_params.pt")
+    # reload the selected best state BEFORE reporting/saving; never fall
+    # back to the final state
+    best_state = tracker.require_state()
+    rec.load_adapter_state(best_state)
+    save_adapter_bundle(out, best_state, model_id=model_id, revision=revision)
+    require_finite_metric("best_val_acc", tracker.best_metric)
+    require_finite_metric("final_train_loss", final_loss)
     report = {
         "config": {
             "mode": ("D-full" if args.interval == "full" else
@@ -230,10 +244,11 @@ def cmd_train(args):
             "seed": args.seed, "max_k": args.max_k,
             "detach_z0": args.detach_z0, "device": device,
             "train_examples": len(train), "grad_checkpoint": True,
+            "model_id": model_id, "revision": revision,
         },
-        "model": args.model, "revision": args.revision,
+        "model": model_id, "model_id": model_id, "revision": revision,
         "suite_sha256": suite.manifest()["sha256"],
-        "best_val_acc": best["acc"], "best_step": best["step"],
+        "best_val_acc": tracker.best_metric, "best_step": tracker.best_step,
         "val_history": history,
         "final_train_loss": final_loss,
         "gpu_mem": _gpu_mem_report(device),
@@ -243,14 +258,8 @@ def cmd_train(args):
     }
     with open(out / "train_report.json", "w") as fh:
         json.dump(report, fh, indent=1)
-    print(f"[train done] best_val={best['acc']} @step {best['step']} "
-          f"-> {out}")
-
-
-def load_adapter_state(path):
-    import torch
-
-    return torch.load(Path(path) / "best_params.pt", map_location="cpu")
+    print(f"[train done] best_val={tracker.best_metric} @step "
+          f"{tracker.best_step} -> {out}")
 
 
 def cmd_eval(args):
@@ -258,18 +267,23 @@ def cmd_eval(args):
 
     from latent_lab.backends.localized import LocalizedRecurrence
     from latent_lab.bench.suite import build_suite
+    from latent_lab.train.checkpointing import load_adapter_bundle
 
     torch.manual_seed(args.seed)
     device = args.device
     cfg = json.load(open(Path(args.adapter) / "train_report.json")
                     )["config"]
-    model, tok = load_model(device, cfg.get("model"), cfg.get("revision"))
+    model_id = cfg.get("model_id") or cfg.get("model") or DEFAULT_MODEL_ID
+    revision = cfg.get("revision") or DEFAULT_REVISION
+    model, tok = load_model(device, model_id, revision)
     interval = tuple(cfg["interval"])
     rec = LocalizedRecurrence(model, None, interval=interval,
                               max_k=cfg["max_k"], lora_r=cfg["lora_r"],
                               grad_checkpoint=False)
-    state = load_adapter_state(args.adapter)
-    rec.load_adapter_state(state)
+    tensors = load_adapter_bundle(
+        args.adapter, model_id=model_id, revision=revision,
+        expected=rec.adapter_spec())
+    rec.load_adapter_state(tensors)
 
     suite = build_suite()
     split_name = args.split
@@ -306,7 +320,7 @@ def cmd_eval(args):
         payload = {
             "adapter": args.adapter, "split": split_name,
             "config": cfg, "model": cfg.get("model"),
-            "revision": cfg.get("revision"),
+            "model_id": model_id, "revision": revision,
             "suite_sha256": suite.manifest()["sha256"],
             "device": device, "seed": args.seed,
             "results": results,

@@ -20,6 +20,7 @@ is adapted, so K>0 vs K=0 differences isolate the recurrence itself.
 from __future__ import annotations
 
 import contextlib
+import math
 from dataclasses import dataclass, field
 
 try:
@@ -110,15 +111,15 @@ class LoRALinear(_Base):
         for p in self.base.parameters():
             p.requires_grad_(False)
         self.scaling = alpha / r
-        dev, dt = next(base.parameters()).device, next(base.parameters()).dtype
-        self.lora_A = torch.nn.Parameter(torch.zeros(r, base.in_features,
-                                                     dtype=dt, device=dev))
-        self.lora_B = torch.nn.Parameter(torch.zeros(base.out_features, r,
-                                                     dtype=dt, device=dev))
+        dev = next(base.parameters()).device
+        # master LoRA weights stay fp32 even over a bf16/fp16 base layer
+        self.lora_A = torch.nn.Parameter(torch.zeros(
+            r, base.in_features, dtype=torch.float32, device=dev))
+        self.lora_B = torch.nn.Parameter(torch.zeros(
+            base.out_features, r, dtype=torch.float32, device=dev))
         torch.nn.init.kaiming_uniform_(self.lora_A, a=5 ** 0.5)
 
     def forward(self, x):
-        # master LoRA weights stay fp32 even over a bf16 base layer
         delta = ((x.to(self.lora_A.dtype) @ self.lora_A.transpose(0, 1))
                  @ self.lora_B.transpose(0, 1)) * self.scaling
         return self.base(x) + delta.to(x.dtype)
@@ -199,7 +200,9 @@ class LocalizedRecurrence:
         self.guard = VocabGuard(model, tokenizer)
 
         dev = next(model.parameters()).device
-        self.clock = torch.nn.Embedding(max_k + 1, hidden, device=dev)
+        # clock trainables are fp32 over the (possibly lower-precision) backbone
+        self.clock = torch.nn.Embedding(max_k + 1, hidden, device=dev,
+                                        dtype=torch.float32)
         torch.nn.init.zeros_(self.clock.weight)
 
         self.injected = inject_lora(
@@ -365,6 +368,11 @@ class LocalizedRecurrence:
             lp = sum(float(logp[0, j, tid]) for j, tid in enumerate(cand))
             scores.append(lp)
         t3 = time.perf_counter()
+        bad = [i for i, s in enumerate(scores) if not math.isfinite(s)]
+        if bad:
+            raise RuntimeError(
+                f"non-finite candidate score(s) at index {bad}; "
+                "refusing to rank")
         order = sorted(range(len(scores)), key=lambda i: -scores[i])
         rep = RecurrenceReport(
             k_steps=k_steps, interval=self.interval,
@@ -426,11 +434,49 @@ class LocalizedRecurrence:
             sd["clock.weight"] = self.clock.weight.detach().to("cpu").clone()
         return sd
 
+    def adapter_spec(self):
+        """key -> (shape, dtype) contract for bundle prevalidation."""
+        return {k: (tuple(v.shape), v.dtype)
+                for k, v in self.adapter_state_dict().items()}
+
+    def _adapter_targets(self):
+        targets = {}
+        for i, l in enumerate(self.injected):
+            targets[f"lora.{i}.A"] = l.lora_A
+            targets[f"lora.{i}.B"] = l.lora_B
+        if self.use_clock:
+            targets["clock.weight"] = self.clock.weight
+        return targets
+
     def load_adapter_state(self, sd):
+        from latent_lab.train.checkpointing import (AdapterBundleError,
+                                                    NonFiniteStateError)
+
+        targets = self._adapter_targets()
+        unknown = set(sd) - set(targets)
+        if unknown:
+            raise AdapterBundleError(
+                f"adapter state has unknown keys: {sorted(unknown)}")
+        missing = set(targets) - set(sd)
+        if self.use_clock:
+            missing.discard("clock.weight")  # legacy states may omit it
+        if missing:
+            raise AdapterBundleError(
+                f"adapter state is missing keys: {sorted(missing)}")
+        # prevalidate EVERY entry against the live runtime before any copy
+        for key, t in sd.items():
+            target = targets[key]
+            if not torch.is_tensor(t):
+                raise TypeError(f"{key!r}: expected torch.Tensor")
+            if tuple(t.shape) != tuple(target.shape):
+                raise AdapterBundleError(
+                    f"{key!r}: shape {tuple(t.shape)} != expected "
+                    f"{tuple(target.shape)}")
+            if t.dtype != target.dtype:
+                raise AdapterBundleError(
+                    f"{key!r}: dtype {t.dtype} != expected {target.dtype}")
+            if t.is_floating_point() and not bool(torch.isfinite(t).all()):
+                raise NonFiniteStateError(f"{key!r} has non-finite values")
         with torch.no_grad():
-            for i, l in enumerate(self.injected):
-                l.lora_A.copy_(sd[f"lora.{i}.A"].to(l.lora_A.device))
-                l.lora_B.copy_(sd[f"lora.{i}.B"].to(l.lora_B.device))
-            if self.use_clock and "clock.weight" in sd:
-                self.clock.weight.copy_(
-                    sd["clock.weight"].to(self.clock.weight.device))
+            for key, t in sd.items():
+                targets[key].copy_(t.to(targets[key].device))
