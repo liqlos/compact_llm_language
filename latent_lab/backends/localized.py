@@ -20,6 +20,7 @@ is adapted, so K>0 vs K=0 differences isolate the recurrence itself.
 from __future__ import annotations
 
 import contextlib
+import math
 from dataclasses import dataclass, field
 
 try:
@@ -30,6 +31,10 @@ except ImportError:  # pragma: no cover - import-safety without lab group
 
 class LatentLoopViolation(RuntimeError):
     """Forbidden vocabulary/tokenizer operation inside the latent loop."""
+
+
+class NonFiniteCandidateScores(RuntimeError):
+    """A candidate score was non-finite; ranking is refused."""
 
 
 class VocabGuard:
@@ -110,11 +115,14 @@ class LoRALinear(_Base):
         for p in self.base.parameters():
             p.requires_grad_(False)
         self.scaling = alpha / r
-        dev, dt = next(base.parameters()).device, next(base.parameters()).dtype
+        # master LoRA weights stay fp32 even over a lower-precision backbone
+        dev = next(base.parameters()).device
         self.lora_A = torch.nn.Parameter(torch.zeros(r, base.in_features,
-                                                     dtype=dt, device=dev))
+                                                     dtype=torch.float32,
+                                                     device=dev))
         self.lora_B = torch.nn.Parameter(torch.zeros(base.out_features, r,
-                                                     dtype=dt, device=dev))
+                                                     dtype=torch.float32,
+                                                     device=dev))
         torch.nn.init.kaiming_uniform_(self.lora_A, a=5 ** 0.5)
 
     def forward(self, x):
@@ -150,6 +158,81 @@ def lora_parameters(injected) -> list:
     for lora in injected:
         ps += [lora.lora_A, lora.lora_B]
     return ps
+
+
+def make_step_clock(hidden: int, max_k: int, device=None):
+    """Zero-initialized per-step clock embeddings; always fp32."""
+    clock = torch.nn.Embedding(max_k + 1, hidden, device=device,
+                               dtype=torch.float32)
+    torch.nn.init.zeros_(clock.weight)
+    return clock
+
+
+# ---------------------------------------------------------------------------
+# ablation parsing (strict; fail-closed)
+# ---------------------------------------------------------------------------
+
+CLOCK_MODES = ("identity", "off", "reverse")
+KNOWN_ABLATION_KEYS = ("zero_state", "noise_state", "noise_seed", "clocks",
+                       "bypass_interval", "truncate_k", "swap_state")
+
+
+def parse_clock_mode(mode, k_steps: int):
+    """Parse the 'clocks' ablation value; return the concrete step index list.
+
+    Accepts:
+      "identity" -> [0..k)
+      "off"      -> [] (no step embeddings applied)
+      "reverse"  -> [k-1..0]
+      "shuffle_perm:i,j,..." -> an EXPLICIT full unique permutation of
+          range(k_steps). Anything else (wrong length, repeats, omissions,
+          out-of-range, non-integer) is rejected. A full permutation with
+          k_steps entries keeps compute matched to the clean run.
+    Unknown modes raise ValueError — silently running clean is forbidden.
+    """
+    if not isinstance(mode, str):
+        raise ValueError(f"unknown clocks mode {mode!r}")
+    if mode in CLOCK_MODES:
+        idxs = list(range(k_steps))
+        return list(reversed(idxs)) if mode == "reverse" else idxs
+    if mode.startswith("shuffle_perm:"):
+        raw = mode.split(":", 1)[1]
+        parts = raw.split(",") if raw else []
+        try:
+            perm = [int(x) for x in parts]
+        except ValueError as e:
+            raise ValueError(
+                f"shuffle_perm entries must be integers: {mode!r}") from e
+        if sorted(perm) != list(range(k_steps)):
+            raise ValueError(
+                f"shuffle_perm {perm!r} is not a full unique permutation of "
+                f"range({k_steps}); compute would not match the clean run")
+        return perm
+    raise ValueError(
+        f"unknown clocks mode {mode!r}; expected one of "
+        f"{CLOCK_MODES} or 'shuffle_perm:i,j,...' over range({k_steps})")
+
+
+def validate_ablation(ablate, k_steps: int) -> dict:
+    """Strictly validate an ablation spec against known keys/modes."""
+    ab = dict(ablate or {})
+    unknown = sorted(set(ab) - set(KNOWN_ABLATION_KEYS))
+    if unknown:
+        raise ValueError(
+            f"unknown ablation key(s) {unknown}; supported: "
+            f"{sorted(KNOWN_ABLATION_KEYS)}")
+    if "clocks" in ab and ab["clocks"] is not None:
+        parse_clock_mode(ab["clocks"], k_steps)
+    tk = ab.get("truncate_k")
+    if tk is not None and (isinstance(tk, bool) or not isinstance(tk, int)
+                           or not 0 <= tk <= k_steps):
+        raise ValueError(f"truncate_k must be an int in [0, {k_steps}]")
+    if "zero_state" in ab and not isinstance(ab["zero_state"], bool):
+        raise ValueError("zero_state must be a boolean")
+    if "bypass_interval" in ab \
+            and not isinstance(ab["bypass_interval"], bool):
+        raise ValueError("bypass_interval must be a boolean")
+    return ab
 
 
 # ---------------------------------------------------------------------------
@@ -199,8 +282,8 @@ class LocalizedRecurrence:
         self.guard = VocabGuard(model, tokenizer)
 
         dev = next(model.parameters()).device
-        self.clock = torch.nn.Embedding(max_k + 1, hidden, device=dev)
-        torch.nn.init.zeros_(self.clock.weight)
+        # clock trainables are explicitly fp32; never the global default dtype
+        self.clock = make_step_clock(hidden, max_k, device=dev)
 
         self.injected = inject_lora(
             [self.base.layers[i] for i in range(lo, hi)],
@@ -278,30 +361,33 @@ class LocalizedRecurrence:
                      grad=False, ablate=None):
         """Apply the interval K times; GUARDED: no vocab/tokenizer activity.
 
-        ablate keys:
-          zero_state         -> incoming z replaced by zeros
-          clocks             -> "identity"|"reverse"|"shuffle_perm:i,j,.."|"off"
+        ablate keys (strictly validated; unknown keys/modes are fatal):
+          zero_state         -> incoming z zeroed AND all prompt-derived
+                                cache state (conv/recurrent/KV) zeroed,
+                                so no prompt latent survives the reset
+          clocks             -> "identity"|"off"|"reverse"|
+                                "shuffle_perm:i,j,.." (full unique perm of
+                                range(k_steps); compute-matched)
           bypass_interval    -> interval layers replaced by identity
           truncate_k         -> effective step count reduced
           swap/noise         -> performed by caller replacing z beforehand
         """
-        ablate = dict(ablate or {})
-        if ablate.get("zero_state"):
+        ab = validate_ablation(ablate, k_steps)
+        if ab.get("zero_state"):
+            from ..backends.hf_qwen import cache_zero_prompt_state
             z = torch.zeros_like(z)
-        if ablate.get("noise_state"):
+            cache_zero_prompt_state(cache)  # erase ALL prompt-derived state
+        if ab.get("noise_state"):
             g = torch.Generator(device=z.device.type)
-            g.manual_seed(int(ablate.get("noise_seed", 1234)))
+            g.manual_seed(int(ab.get("noise_seed", 1234)))
             n = torch.randn(z.shape, generator=g, device=z.device,
                             dtype=torch.float32).to(z.dtype)
             n = n / (n.norm() + 1e-8) * (z.norm() + 1e-8)
             z = n
-        mode = ablate.get("clocks", "identity")
-        eff_k = min(int(ablate.get("truncate_k", k_steps)), k_steps)
-        idxs = list(range(eff_k))
-        if isinstance(mode, str) and mode.startswith("shuffle_perm:"):
-            idxs = [int(x) for x in mode.split(":", 1)[1].split(",")][:eff_k]
-        elif mode == "reverse":
-            idxs = list(reversed(idxs))
+        mode = ab.get("clocks", "identity")
+        eff_k = min(int(ab.get("truncate_k", k_steps)), k_steps)
+        # validated against the FULL requested loop; truncation is explicit
+        idxs = parse_clock_mode(mode, k_steps)[:eff_k]
 
         lo, hi = self.interval
         with self.guard.window():
@@ -311,7 +397,7 @@ class LocalizedRecurrence:
                 if self.use_clock and mode != "off":
                     tok = torch.tensor([ci + 1], device=z.device)
                     zz = zz + self.clock(tok).view(1, 1, -1).to(z.dtype)
-                if ablate.get("bypass_interval"):
+                if ab.get("bypass_interval"):
                     z = zz
                 else:
                     z = self._run_layers(range(lo, hi), zz, cache, pos,
@@ -347,7 +433,7 @@ class LocalizedRecurrence:
             loop_start = partner_input_ids.shape[1]
             cache, z0 = self._encode(partner_input_ids)
         t1 = time.perf_counter()
-        ab = dict(ablate or {})
+        ab = validate_ablation(ablate or {}, k_steps)
         if partner_input_ids is not None:
             ab["swap_state"] = True
         z, pos = self.latent_steps(z0, cache, loop_start, k_steps,
@@ -365,6 +451,11 @@ class LocalizedRecurrence:
             lp = sum(float(logp[0, j, tid]) for j, tid in enumerate(cand))
             scores.append(lp)
         t3 = time.perf_counter()
+        bad = [i for i, s in enumerate(scores) if not math.isfinite(s)]
+        if bad:
+            raise NonFiniteCandidateScores(
+                f"candidate scores at indices {bad} are not finite "
+                f"({[scores[i] for i in bad]}); refusing to rank")
         order = sorted(range(len(scores)), key=lambda i: -scores[i])
         rep = RecurrenceReport(
             k_steps=k_steps, interval=self.interval,
@@ -426,11 +517,108 @@ class LocalizedRecurrence:
             sd["clock.weight"] = self.clock.weight.detach().to("cpu").clone()
         return sd
 
+    def _expected_adapter_targets(self):
+        targets = {}
+        for i, l in enumerate(self.injected):
+            targets[f"lora.{i}.A"] = l.lora_A
+            targets[f"lora.{i}.B"] = l.lora_B
+        if self.use_clock:
+            targets["clock.weight"] = self.clock.weight
+        return targets
+
     def load_adapter_state(self, sd):
-        with torch.no_grad():
-            for i, l in enumerate(self.injected):
-                l.lora_A.copy_(sd[f"lora.{i}.A"].to(l.lora_A.device))
-                l.lora_B.copy_(sd[f"lora.{i}.B"].to(l.lora_B.device))
-            if self.use_clock and "clock.weight" in sd:
-                self.clock.weight.copy_(
-                    sd["clock.weight"].to(self.clock.weight.device))
+        """Prevalidate, pre-stage, then mutate targets in one safe commit.
+
+        Every incoming tensor is converted to the exact target
+        device/dtype BEFORE the first mutation (staged candidates); all
+        targets are snapshotted and, if any copy raises late, every target
+        is restored bit-exactly from its own pre-mutation snapshot before
+        AdapterBundleError propagates. Validation covers exact keys,
+        tensor type, shape, dtype and finiteness.
+        """
+        from ..train.checkpointing import (
+            AdapterBundleError, AdapterBundleSchemaError, NonFiniteStateError)
+        targets = self._expected_adapter_targets()
+        if not isinstance(sd, dict):
+            raise AdapterBundleSchemaError("adapter state must be a dict")
+        missing = sorted(set(targets) - set(sd))
+        extra = sorted(set(sd) - set(targets))
+        if missing or extra:
+            raise AdapterBundleSchemaError(
+                f"adapter state keys mismatch: missing={missing} "
+                f"unexpected={extra}")
+        staged = {}
+        for key, target in targets.items():
+            t = sd[key]
+            if not torch.is_tensor(t):
+                raise AdapterBundleSchemaError(f"{key}: value is not a Tensor")
+            if tuple(t.shape) != tuple(target.shape):
+                raise AdapterBundleSchemaError(
+                    f"{key}: shape {tuple(t.shape)} != expected "
+                    f"{tuple(target.shape)}")
+            if t.dtype != target.dtype:
+                raise AdapterBundleSchemaError(
+                    f"{key}: dtype {t.dtype} != expected {target.dtype}")
+            if t.is_floating_point() or t.is_complex():
+                if not bool(torch.isfinite(t).all()):
+                    raise NonFiniteStateError(
+                        f"{key}: contains non-finite values")
+            staged[key] = t.to(device=target.device, dtype=target.dtype)
+        snapshots = {key: target.detach().clone()
+                     for key, target in targets.items()}
+        try:
+            with torch.no_grad():
+                for key, target in targets.items():
+                    target.copy_(staged[key])
+        except BaseException as e:
+            with torch.no_grad():
+                for key, target in targets.items():
+                    try:
+                        target.copy_(snapshots[key])
+                    except BaseException:
+                        # a persistently failing copy implementation must
+                        # not corrupt already-restored targets: rebind the
+                        # pristine snapshot onto the live Parameter instead
+                        target.data = snapshots[key].data.to(
+                            device=target.device, dtype=target.dtype)
+            raise AdapterBundleError(
+                "adapter load failed mid-copy; all targets rolled back "
+                f"bit-exactly ({e})") from e
+
+    # -- identity-bound bundles ------------------------------------------------
+
+    def adapter_recipe(self, *, suite_sha256: str,
+                       mode: str | None = None) -> dict:
+        """The exact recipe this runtime binds into exported bundles."""
+        lo, hi = self.interval
+        if mode is None:
+            mode = ("D-full" if (lo, hi) == (0, self.n_layers)
+                    else "E-localized")
+        return {
+            "interval": [lo, hi],
+            "max_k": int(self.max_k),
+            "lora_r": int(self.injected[0].lora_A.shape[0]),
+            "lora_alpha": float(self.injected[0].scaling
+                                * self.injected[0].lora_A.shape[0]),
+            "mode": mode,
+            "suite_sha256": suite_sha256,
+        }
+
+    def export_adapter_bundle(self, path, *, model_id, revision,
+                              suite_sha256, mode=None, metrics=None) -> dict:
+        """Persist this adapter as an identity-bound best_params.pt bundle."""
+        from ..train.checkpointing import save_adapter_bundle
+        return save_adapter_bundle(
+            path, self.adapter_state_dict(), model_id=model_id,
+            revision=revision,
+            recipe=self.adapter_recipe(suite_sha256=suite_sha256, mode=mode),
+            metrics=metrics)
+
+    def load_adapter_bundle(self, path, *, model_id, revision,
+                            suite_sha256, mode=None):
+        """Load an identity-bound bundle; recipe/identity fully prevalidated."""
+        from ..train.checkpointing import load_adapter_bundle
+        state = load_adapter_bundle(path, model_id=model_id, revision=revision,
+                                    recipe=self.adapter_recipe(
+                                        suite_sha256=suite_sha256, mode=mode))
+        self.load_adapter_state(state)

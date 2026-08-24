@@ -121,6 +121,33 @@ def attach_layer_counters(model) -> tuple[CallCounter, list]:
     return cc, layers
 
 
+def cache_zero_prompt_state(cache) -> None:
+    """Erase ALL prompt-derived cache state in place (zero every tensor).
+
+    conv/recurrent/KV storage keeps its shapes/machinery but its contents
+    are zeroed, so no information derived from the encoded prompt survives.
+    Used by the zero_state ablation to make the claim exact: the latent
+    loop then runs from a genuinely cold state.
+    """
+    torch = require_torch()
+
+    def zero_tree(v):
+        if torch.is_tensor(v):
+            v.zero_()
+        elif isinstance(v, dict):
+            for x in v.values():
+                zero_tree(x)
+        elif isinstance(v, (list, tuple)):
+            for x in v:
+                zero_tree(x)
+
+    for layer in cache.layers:
+        for attr in ("conv_states", "recurrent_states", "keys", "values"):
+            v = getattr(layer, attr, None)
+            if v is not None:
+                zero_tree(v)
+
+
 def cache_snapshot(cache) -> dict:
     """Copy conv/recurrent/KV state tensors of a Qwen3_5DynamicCache.
 

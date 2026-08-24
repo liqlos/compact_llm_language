@@ -23,11 +23,16 @@ import argparse
 import json
 import platform
 import resource
+import sys
 import time
 from pathlib import Path
 
 DEFAULT_MODEL_ID = "Qwen/Qwen3.5-2B"
 DEFAULT_REVISION = "15852e8c16360a2fea060d615a32b45270f8a8fc"
+
+EVAL_ABLATIONS = ("zero_state", "bypass_interval", "clocks_off",
+                  "reverse_clocks", "truncate_half", "swap_state",
+                  "noise_state")
 
 
 def interval_from_spec(spec: str, n_layers: int) -> tuple[int, int]:
@@ -72,10 +77,15 @@ def load_model(device="mps", model_id=None, revision=None):
     import transformers
 
     from latent_lab.backends.gdn_patch import install
+    from latent_lab.train.checkpointing import require_pinned_revision
     install()
 
     model_id = model_id or DEFAULT_MODEL_ID
-    revision = revision or DEFAULT_REVISION
+    # Only revision=None selects the pinned default; falsey values such as
+    # "", False or 0 are validated and rejected as-is, BEFORE any Hugging
+    # Face contact: only immutable 40-hex commit revisions pass.
+    revision = require_pinned_revision(
+        DEFAULT_REVISION if revision is None else revision)
     tok = transformers.AutoTokenizer.from_pretrained(model_id,
                                                      revision=revision)
     model = transformers.AutoModelForCausalLM.from_pretrained(
@@ -107,6 +117,63 @@ class SuiteTensors:
         return len(self.examples)
 
 
+def build_eval_record(ex, order, scores) -> dict:
+    """One lossless eval record: raw scores/order + gold/candidate identity.
+
+    Derived fields (rank_of_gold/correct) are convenience only — the raw
+    finite candidate scores in SCORED order, the model's ordering, the full
+    candidate set, the answer and its candidate index are all retained so
+    corrected scoring can be independently recomputed later.
+    """
+    if len(scores) != len(ex.candidates):
+        raise ValueError(
+            f"{ex.ex_id}: {len(scores)} scores for "
+            f"{len(ex.candidates)} candidates")
+    bad = [i for i, s in enumerate(scores)
+           if s is None or not isinstance(s, (int, float))
+           or s != s or s in (float("inf"), float("-inf"))]
+    if bad:
+        raise ValueError(f"{ex.ex_id}: non-finite raw scores at {bad}")
+    gold_idx = ex.candidates.index(ex.answer)
+    pred_rank = order.index(gold_idx) if gold_idx in order else -1
+    return {
+        "ex_id": ex.ex_id, "family": ex.family, "depth": ex.depth,
+        "candidates": list(ex.candidates), "answer": ex.answer,
+        "gold_candidate_index": gold_idx,
+        "scores_raw": [float(s) for s in scores],
+        "score_order": list(order),
+        "rank_of_gold": pred_rank,
+        "correct": 1.0 if pred_rank == 0 else 0.0,
+        "n_candidates": len(order),
+    }
+
+
+def rescore_records(records) -> float:
+    """Independently recompute accuracy from RAW record fields alone.
+
+    Verifies that derived rank/correct agree with a fresh computation from
+    scores_raw/score_order/gold_candidate_index, so any future scorer fix
+    can be re-applied to persisted evidence without re-running the model.
+    """
+    correct = 0
+    for r in records:
+        scores = r["scores_raw"]
+        order = sorted(range(len(scores)), key=lambda i: -scores[i])
+        if list(order) != list(r["score_order"]):
+            raise ValueError(
+                f"{r.get('ex_id')}: score_order disagrees with scores_raw; "
+                "evidence inconsistent")
+        gold = r["gold_candidate_index"]
+        rank = order.index(gold) if gold in order else -1
+        if rank != r["rank_of_gold"] or \
+                (1.0 if rank == 0 else 0.0) != r["correct"]:
+            raise ValueError(
+                f"{r.get('ex_id')}: derived fields disagree with raw "
+                "scores; evidence inconsistent")
+        correct += 1 if rank == 0 else 0
+    return correct / max(1, len(records))
+
+
 def evaluate(rec, data: SuiteTensors, k_steps, indices, *, ablate=None,
              tag="", limit=None):
     """Ranking accuracy over selected examples; per-example records."""
@@ -122,13 +189,7 @@ def evaluate(rec, data: SuiteTensors, k_steps, indices, *, ablate=None,
         order, scores, rep = rec.rank_candidates(
             data.prompt_ids[i].to(device), data.cand_ids[i], k_steps,
             ablate=ablate, partner_input_ids=partner)
-        gold_idx = ex.candidates.index(ex.answer)
-        pred_rank = order.index(gold_idx) if gold_idx in order else -1
-        records.append({
-            "ex_id": ex.ex_id, "family": ex.family, "depth": ex.depth,
-            "correct": 1.0 if pred_rank == 0 else 0.0,
-            "rank_of_gold": pred_rank, "n_candidates": len(order),
-        })
+        records.append(build_eval_record(ex, order, scores))
     acc = sum(r["correct"] for r in records) / max(1, len(records))
     by_depth = {}
     for r in records:
@@ -148,19 +209,74 @@ def evaluate(rec, data: SuiteTensors, k_steps, indices, *, ablate=None,
     }
 
 
+def _dependency_versions() -> dict:
+    import torch
+
+    out = {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "platform": platform.platform(),
+    }
+    try:
+        import transformers
+        out["transformers"] = transformers.__version__
+    except ImportError:  # pragma: no cover
+        pass
+    return out
+
+
+def recipe_from_config(cfg: dict, suite_sha256: str) -> dict:
+    """The exact recurrence/training recipe a config implies (validated)."""
+    from latent_lab.train.checkpointing import validate_recipe
+    return validate_recipe({
+        "interval": list(cfg["interval"]),
+        "max_k": int(cfg["max_k"]),
+        "lora_r": int(cfg["lora_r"]),
+        "lora_alpha": float(cfg.get("lora_alpha", 16.0)),
+        "mode": str(cfg["mode"]),
+        "suite_sha256": suite_sha256,
+    })
+
+
 def cmd_train(args):
+    from latent_lab.train.checkpointing import (
+        FatalRunInvalidError, require_pinned_revision, write_run_status)
+
+    # fail closed BEFORE loading/training/saving on a mutable revision
+    revision = require_pinned_revision(args.revision)
+    device = args.device
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    write_run_status(out, "running",
+                     command=" ".join(sys.argv),
+                     model=args.model, revision=revision, seed=args.seed)
+    try:
+        _train_inner(args, out, device, revision)
+    except FatalRunInvalidError as e:
+        # explicit fatal status; NO success artifact may exist afterwards
+        write_run_status(out, "fatal",
+                         command=" ".join(sys.argv),
+                         error_type=type(e).__name__, error=str(e))
+        raise
+    write_run_status(out, "complete",
+                     command=" ".join(sys.argv))
+
+
+def _train_inner(args, out: Path, device: str, revision: str):
     import torch
 
     from latent_lab.backends.localized import LocalizedRecurrence
     from latent_lab.bench.suite import build_suite
+    from latent_lab.train.checkpointing import (
+        BestCheckpointTracker, guarded_optimizer_step, sha256_file,
+        write_train_generation)
 
-    torch.manual_seed(args.seed)
-    device = args.device
-    model, tok = load_model(device, args.model, args.revision)
+    model, tok = load_model(device, args.model, revision)
     interval = interval_from_spec(
         args.interval, model.config.num_hidden_layers)
     rec = LocalizedRecurrence(model, None, interval=interval, max_k=args.max_k,
-                              lora_r=args.lora_r, grad_checkpoint=True)
+                              lora_r=args.lora_r, lora_alpha=args.lora_alpha,
+                              grad_checkpoint=True)
     rec.clock.to(device)
     params = [p for p in rec.trainable_parameters()]
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.01)
@@ -173,7 +289,7 @@ def cmd_train(args):
 
     order = list(range(len(train)))
     history = []
-    best = {"acc": -1.0, "state": None, "step": -1}
+    tracker = BestCheckpointTracker()
     t0 = time.perf_counter()
     base_lr = args.lr
 
@@ -199,8 +315,9 @@ def cmd_train(args):
                                    args.k, detach_z0=args.detach_z0)
         opt.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(params, args.clip)
-        opt.step()
+        # fail-stop: any fault here raises FatalRunInvalidError and kills
+        # the run — never retried against the mutated optimizer
+        guarded_optimizer_step(opt, loss.detach(), params, args.clip)
         final_loss = float(loss.detach())
         if step % 50 == 0 or step == args.steps - 1:
             print(f"step {step} loss {final_loss:.4f} lr {lr_at(step):.2e} "
@@ -212,28 +329,53 @@ def cmd_train(args):
             ev.pop("records")
             history.append(ev)
             print(f"  val acc {ev['accuracy']} @step {step+1}", flush=True)
-            if ev["accuracy"] > best["acc"]:
-                best = {
-                    "acc": ev["accuracy"], "step": step + 1,
-                    "state": rec.adapter_state_dict(),
-                }
+            if tracker.update(ev["accuracy"], rec.adapter_state_dict(),
+                              step=step + 1):
+                print(f"  new best {ev['accuracy']} @step {step+1}",
+                      flush=True)
 
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
-    torch.save(best["state"], out / "best_params.pt")
+    if not tracker.has_best():
+        from latent_lab.train.checkpointing import EmptyCheckpointError
+        raise EmptyCheckpointError(
+            "no finite validation checkpoint was accepted; refusing to "
+            "report or save final state")
+
+    mode = ("D-full" if args.interval == "full"
+            else "F-control" if args.k == 0 else "E-localized")
+    cfg = {
+        "mode": mode,
+        "model": args.model, "revision": revision,
+        "interval": list(interval), "k": args.k,
+        "lora_r": args.lora_r, "lora_alpha": args.lora_alpha,
+        "lr": args.lr, "steps": args.steps,
+        "seed": args.seed, "max_k": args.max_k,
+        "detach_z0": args.detach_z0, "device": device,
+        "train_examples": len(train), "grad_checkpoint": True,
+    }
+    suite_sha = suite.manifest()["sha256"]
+    recipe = recipe_from_config(cfg, suite_sha)
+
+    # reload the SELECTED BEST before reporting/saving — final state is
+    # never silently used as evidence
+    rec.load_adapter_state(tracker.best_state())
+    bundle_path = out / "best_params.pt"
+    bundle = rec.export_adapter_bundle(
+        bundle_path, model_id=args.model, revision=revision,
+        suite_sha256=suite_sha, mode=mode,
+        metrics={"best_val_acc": tracker.best_score})
     report = {
-        "config": {
-            "mode": ("D-full" if args.interval == "full" else
-                     "F-control" if args.k == 0 else "E-localized"),
-            "interval": list(interval), "k": args.k,
-            "lora_r": args.lora_r, "lr": args.lr, "steps": args.steps,
-            "seed": args.seed, "max_k": args.max_k,
-            "detach_z0": args.detach_z0, "device": device,
-            "train_examples": len(train), "grad_checkpoint": True,
+        "config": cfg,
+        "model": args.model, "revision": revision,
+        "suite_sha256": suite_sha,
+        "recipe": recipe,
+        "checkpoint_content_digest": bundle["content_digest"],
+        "checkpoint_sha256": sha256_file(bundle_path),
+        "precision": {
+            "backbone_dtype": str(next(model.parameters()).dtype),
+            "trainables_dtype": "torch.float32",
         },
-        "model": args.model, "revision": args.revision,
-        "suite_sha256": suite.manifest()["sha256"],
-        "best_val_acc": best["acc"], "best_step": best["step"],
+        "best_val_acc": tracker.best_score,
+        "best_step": tracker.best_step,
         "val_history": history,
         "final_train_loss": final_loss,
         "gpu_mem": _gpu_mem_report(device),
@@ -241,16 +383,47 @@ def cmd_train(args):
         "peak_rss_mib": round(peak_rss_mib(), 1),
         "platform": platform.platform(),
     }
-    with open(out / "train_report.json", "w") as fh:
-        json.dump(report, fh, indent=1)
-    print(f"[train done] best_val={best['acc']} @step {best['step']} "
-          f"-> {out}")
+    # report + manifest promoted as ONE coherent generation; the manifest
+    # (written last, atomically) carries the digests of both files and is
+    # the commit marker any reader must verify
+    manifest = {
+        "kind": "latent_lab.train_generation", "status": "complete",
+        "argv": list(sys.argv),
+        "command": " ".join(sys.argv),
+        "dependencies": _dependency_versions(),
+        "precision": report["precision"],
+        "seed": args.seed,
+        "identity": {"model_id": args.model, "revision": revision},
+        "recipe": recipe,
+        "suite_sha256": suite_sha,
+        "checkpoint_content_digest": bundle["content_digest"],
+        "checkpoint_sha256": sha256_file(bundle_path),
+        "wall_seconds": report["wall_seconds"],
+    }
+    write_train_generation(out, manifest=manifest, report=report)
+    print(f"[train done] best_val={tracker.best_score} "
+          f"@step {tracker.best_step} -> {out}")
 
 
-def load_adapter_state(path):
-    import torch
-
-    return torch.load(Path(path) / "best_params.pt", map_location="cpu")
+def parse_ablation_cli(name, k_steps):
+    """Strict CLI ablation parser: unknown modes are REJECTED, never run
+    silently clean. Returns the latent_steps ablation dict."""
+    if name is None:
+        return None
+    if name == "clocks_off":
+        return {"clocks": "off"}
+    if name == "reverse_clocks":
+        return {"clocks": "reverse"}
+    if name.startswith("shuffle_clocks:"):
+        perm = name.split(":", 1)[1]
+        return {"clocks": f"shuffle_perm:{perm}"}  # validated downstream
+    if name == "truncate_half":
+        return {"truncate_k": max(0, k_steps // 2)}
+    if name in ("zero_state", "bypass_interval", "swap_state", "noise_state"):
+        return {name: True}
+    raise ValueError(
+        f"unknown ablation {name!r}; supported: {sorted(EVAL_ABLATIONS)} "
+        "or 'shuffle_clocks:i,j,...'")
 
 
 def cmd_eval(args):
@@ -258,62 +431,89 @@ def cmd_eval(args):
 
     from latent_lab.backends.localized import LocalizedRecurrence
     from latent_lab.bench.suite import build_suite
+    from latent_lab.train.checkpointing import (
+        AdapterBundleError,
+        atomic_write_json,
+        load_adapter_bundle,
+        require_pinned_revision,
+    )
 
     torch.manual_seed(args.seed)
     device = args.device
-    cfg = json.load(open(Path(args.adapter) / "train_report.json")
-                    )["config"]
-    model, tok = load_model(device, cfg.get("model"), cfg.get("revision"))
+    report = json.loads(
+        (Path(args.adapter) / "train_report.json").read_text())
+    cfg = report["config"]
+    model_id = cfg.get("model")
+    if not isinstance(model_id, str) or not model_id:
+        raise ValueError(
+            f"adapter {args.adapter} carries no immutable model identity; "
+            "refusing to evaluate")
+    try:
+        # fail closed BEFORE any model load on a mutable/missing revision
+        revision = require_pinned_revision(cfg.get("revision"))
+    except AdapterBundleError as e:
+        raise ValueError(
+            f"adapter {args.adapter} carries no immutable pinned model "
+            "revision; refusing to evaluate") from e
+
+    suite = build_suite()
+    suite_sha = suite.manifest()["sha256"]
+
+    # Identity-validate + digest-verify the on-disk generation and bundle
+    # BEFORE any model/tokenizer load: a tampered adapter must never
+    # trigger an arbitrary model fetch prior to rejection.
+    verify_generation(args.adapter)
+    recipe = recipe_from_config(cfg, suite_sha)
+    state = load_adapter_bundle(Path(args.adapter) / "best_params.pt",
+                                model_id=model_id, revision=revision,
+                                recipe=recipe)
+
+    model, tok = load_model(device, model_id, revision)
     interval = tuple(cfg["interval"])
     rec = LocalizedRecurrence(model, None, interval=interval,
                               max_k=cfg["max_k"], lora_r=cfg["lora_r"],
+                              lora_alpha=float(cfg.get("lora_alpha", 16.0)),
                               grad_checkpoint=False)
-    state = load_adapter_state(args.adapter)
     rec.load_adapter_state(state)
 
-    suite = build_suite()
     split_name = args.split
     data = SuiteTensors(tok, list(getattr(suite, split_name)))
     idx = list(range(len(data.examples)))
     k = args.k if args.k is not None else cfg["k"]
 
-    results = {}
-    ablation = None
-    if args.ablate:
-        ablation = {args.ablate: {"zero_state": True, "bypass_interval": True,
-                                  "clocks_off": True}.get(args.ablate, True)}
-        if args.ablate == "clocks_off":
-            ablation = {"clocks": "off"}
-        elif args.ablate == "reverse_clocks":
-            ablation = {"clocks": "reverse"}
-        elif args.ablate.startswith("shuffle"):
-            perm = args.ablate.split(":", 1)[1]
-            ablation = {"clocks": f"shuffle_perm:{perm}"}
-        elif args.ablate == "truncate_half":
-            ablation = {"truncate_k": max(0, k // 2)}
-        elif args.ablate == "swap_state":
-            ablation = {"swap_state": True}
-        elif args.ablate == "noise_state":
-            ablation = {"noise_state": True}
+    ablation = parse_ablation_cli(args.ablate, k)
     res = evaluate(rec, data, k, idx, ablate=ablation,
                    tag=f"{cfg['mode']}|{split_name}|{args.ablate or 'clean'}|K={k}",
                    limit=args.limit)
-    results[args.ablate or "clean"] = res
+    results = {args.ablate or "clean": res}
+    # prove the persisted evidence is independently rescorable right now
+    rescore_records(res["records"])
     print(json.dumps({k2: v for k2, v in res.items() if k2 != "records"},
                      indent=1))
 
     if args.out:
         payload = {
+            "status": "complete",
             "adapter": args.adapter, "split": split_name,
             "config": cfg, "model": cfg.get("model"),
             "revision": cfg.get("revision"),
-            "suite_sha256": suite.manifest()["sha256"],
+            "identity": {
+                "model_id": model_id, "revision": revision,
+                "suite_sha256": suite_sha,
+                "tokenizer_class": type(tok).__name__,
+                "interval": list(interval), "max_k": cfg["max_k"],
+                "k_steps": k,
+                "ablation": args.ablate or "clean",
+                "checkpoint_content_digest":
+                    report.get("checkpoint_content_digest"),
+            },
+            "suite_sha256": suite_sha,
             "device": device, "seed": args.seed,
             "results": results,
             "peak_rss_mib": round(peak_rss_mib(), 1),
             "platform": platform.platform(),
         }
-        Path(args.out).write_text(json.dumps(payload, indent=1))
+        atomic_write_json(args.out, payload)
 
 
 def main():
@@ -326,6 +526,7 @@ def main():
     tr.add_argument("--steps", type=int, default=600)
     tr.add_argument("--lr", type=float, default=2e-4)
     tr.add_argument("--lora-r", type=int, default=8)
+    tr.add_argument("--lora-alpha", type=float, default=16.0)
     tr.add_argument("--max-k", type=int, default=16)
     tr.add_argument("--seed", type=int, default=0)
     tr.add_argument("--eval-every", type=int, default=100)
