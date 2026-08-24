@@ -82,6 +82,25 @@ uvx ruff check rcc bench tests    # lint (legacy files may carry minor warnings)
 uv run python -m bench.run_bench --exact --json .rcc_bench/results.json
 ```
 
+## No-spend integrity gate (latent evidence)
+
+Deterministic, hardware-free-capable gate over the retained 2B/4B artifacts:
+inventories + hashes every file, validates train-report pins, classifies
+checkpoints via safe/strict bundle loading, checks rescoring eligibility,
+verifies 4B NaN-batch quarantine, and emits one canonical verdict.
+
+```bash
+uv run python -m latent_lab.bench.no_spend_gate   # full mode (CPU-only; runs proof regressions)
+uv run python -m latent_lab.bench.no_spend_gate --dry-run   # hashes/metadata only
+```
+
+Exit codes: `0` READY · `1` NOT_READY · `2` execution error.
+Canonical outputs under `.rcc_work/no_spend_gate_20260824/` are byte-stable
+across reruns against unchanged inputs and contain no wall-clock value (the
+only timestamp lives in the separate `telemetry_timestamp.json`).
+Current verdict and blocker codes: see `.rcc_work/no_spend_gate_20260824/GATE_REPORT.md`
+(uncommitted evidence) and `docs/NO_SPEND_GATE.md`.
+
 Token-savings numbers below are **synthetic token estimates**, not model
 latency or task success. They justify nothing about end-to-end speed.
 
