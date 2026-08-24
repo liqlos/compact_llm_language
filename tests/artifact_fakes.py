@@ -42,6 +42,31 @@ def cfg(**over) -> dict:
     return {**BASE_CFG, **over}
 
 
+def run_contract(config: dict | None = None, **over) -> dict:
+    """The FULL canonical run expectation (every required key present).
+
+    Built from the same config the artifact claims; ``over`` lets a test
+    deliberately corrupt single fields (e.g. an unrelated config digest).
+    """
+    from latent_lab.bench.latent_run import recipe_from_config
+
+    c = dict(config if config is not None else BASE_CFG)
+    suite = c.get("suite_sha256", SUITE_SHA)
+    recipe = recipe_from_config(c, suite)
+    out = {
+        "model_id": c["model"],
+        "revision": c["revision"],
+        "suite_sha256": suite,
+        "seed": c["seed"],
+        "label": c.get("label"),
+        "k": c["k"],
+        "steps": c["steps"],
+        "config_sha256": recipe["config_sha256"],
+    }
+    out.update(over)
+    return out
+
+
 def _state() -> dict:
     g = torch.Generator().manual_seed(5)
     return {

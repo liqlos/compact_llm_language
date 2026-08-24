@@ -36,6 +36,11 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from latent_lab.train.checkpointing import (
+    assert_json_numbers_finite,
+    strict_json_loads,
+)
+
 _SHA256_HEX_LEN = 64
 _REV_HEX_LEN = 40
 
@@ -105,7 +110,29 @@ _EXPECT_FLAGS = {
     "split": "--expect-split",
     "ablation": "--expect-ablation",
     "checkpoint_content_digest": "--expect-digest",
+    "config_sha256": "--expect-config-sha256",
 }
+
+# The FULL canonical run contract: resume validation MUST bind every one
+# of these at once. The canonical config/recipe digest (config_sha256)
+# canonically covers ALL behavior-changing training fields (mode,
+# interval, k, max_k, LoRA rank/alpha, LR, steps, seed, optimizer,
+# weight decay, schedule, warmup, grad clip, detach policy, gradient
+# checkpointing, suite) — so a partial hand-written allowlist that could
+# silently omit a semantic field is structurally impossible here.
+_RUN_EXPECT_REQUIRED = frozenset((
+    "model_id", "revision", "suite_sha256", "seed", "label", "k",
+    "steps", "config_sha256",
+))
+
+# The exact config key set a training report may carry; anything else is
+# unexpected identity/config metadata and is rejected, never ignored.
+_TRAIN_CONFIG_KNOWN_KEYS = frozenset((
+    "mode", "interval", "k", "max_k", "lora_r", "lora_alpha", "lr",
+    "steps", "seed", "optimizer", "weight_decay", "lr_schedule",
+    "warmup", "clip", "detach_z0", "grad_checkpoint", "model",
+    "revision", "label", "device", "train_examples", "suite_sha256",
+))
 
 
 def _require_exact(actual, expected, field: str, where: str) -> None:
@@ -136,10 +163,12 @@ def _check_revision(value, where: str) -> None:
 def validate_run(run_dir, *, expected: dict | None = None) -> dict:
     """Return the verified manifest or raise; never trust bare existence.
 
-    ``expected`` is the driver's preregistered contract; every provided
-    key must match artifact CONTENTS exactly:
-      model_id, revision, suite_sha256, seed, label, k, steps,
-      checkpoint_content_digest.
+    ``expected`` is the driver's preregistered contract. When ANY
+    expectation is supplied it must be the COMPLETE canonical run
+    contract — model_id, revision, suite_sha256, seed, label, k, steps
+    AND the canonical config/recipe digest (config_sha256) that binds
+    every remaining behavior-changing field. Unknown expectation keys
+    are rejected; nothing is silently ignored.
     """
     from latent_lab.bench.latent_run import recipe_from_config
     from latent_lab.train.checkpointing import (
@@ -153,12 +182,24 @@ def validate_run(run_dir, *, expected: dict | None = None) -> dict:
 
     report_path = adapter_dir / TRAIN_REPORT_FILE
     try:
-        report = json.loads(report_path.read_text())
+        # strict reader: NaN/Infinity constants fail at parse time ...
+        report = strict_json_loads(report_path.read_text())
     except Exception as e:  # noqa: BLE001 - unreadable report fails closed
         raise ValueError(f"{where}: unreadable train report: {e}") from e
+    try:
+        # ... and decoded non-finite numbers fail closed as well
+        assert_json_numbers_finite(report, where=f"{where}: train report")
+    except Exception as e:
+        raise ValueError(f"{where}: train report is not finite evidence: "
+                         f"{e}") from e
     cfg = report.get("config")
     if not isinstance(cfg, dict):
         raise ValueError(f"{where}: train report has no config object")
+    unknown_cfg = sorted(set(cfg) - _TRAIN_CONFIG_KNOWN_KEYS)
+    if unknown_cfg:
+        raise ValueError(
+            f"{where}: unexpected config metadata {unknown_cfg}; "
+            "identity/config fields are never ignored")
 
     # canonical recipe rebuilt from the report's own config must equal
     # BOTH the report's bound recipe AND the manifest's bound recipe
@@ -213,19 +254,39 @@ def validate_run(run_dir, *, expected: dict | None = None) -> dict:
             "report checkpoint_content_digest")
 
     if expected:
-        _require_exact(model_id, expected.get("model_id"),
+        unknown = sorted(set(expected) - set(_EXPECT_FLAGS))
+        if unknown:
+            raise ValueError(
+                f"{where}: unexpected expectation keys {unknown}; the "
+                "preregistered contract must not carry unrecognized "
+                "identity metadata")
+        missing = sorted(_RUN_EXPECT_REQUIRED - set(expected))
+        if missing:
+            raise ValueError(
+                f"{where}: incomplete expected contract — missing {missing};"
+                " resume validation must bind the FULL canonical recipe: "
+                "model/revision/suite/seed/label/k/steps plus the exact "
+                "canonical config digest (config_sha256)")
+        _require_exact(model_id, expected["model_id"],
                        "identity.model_id", where)
-        _require_exact(revision, expected.get("revision"),
+        _require_exact(revision, expected["revision"],
                        "identity.revision", where)
-        _require_exact(suite_sha, expected.get("suite_sha256"),
+        _require_exact(suite_sha, expected["suite_sha256"],
                        "suite_sha256", where)
-        _require_exact(manifest.get("seed"), expected.get("seed"),
+        _require_exact(manifest.get("seed"), expected["seed"],
                        "seed", where)
-        _require_exact(manifest.get("label"), expected.get("label"),
+        _require_exact(manifest.get("label"), expected["label"],
                        "label", where)
-        _require_exact(cfg.get("k"), expected.get("k"), "config.k", where)
-        _require_exact(cfg.get("steps"), expected.get("steps"),
+        _require_exact(cfg.get("k"), expected["k"], "config.k", where)
+        _require_exact(cfg.get("steps"), expected["steps"],
                        "config.steps", where)
+        # the canonical digest over EVERY behavior-changing field — this
+        # single binding rejects wrong LR, interval, LoRA, optimizer,
+        # schedule, warmup, clip, detach/checkpoint policy, mode and
+        # max_k without any hand-maintained field list
+        _require_exact(recipe["config_sha256"], expected["config_sha256"],
+                       "recipe.config_sha256 (canonical training identity)",
+                       where)
         _require_exact(content_digest,
                        expected.get("checkpoint_content_digest"),
                        "checkpoint_content_digest", where)
@@ -294,6 +355,108 @@ def _validate_eval_result(where: str, name: str, res) -> None:
             f"independently recomputed accuracy {recomputed!r}")
 
 
+def _require_cond(field, actual, canonical, where: str) -> None:
+    """A duplicated field, when present, must equal the canonical value."""
+    if actual != canonical:
+        raise ValueError(
+            f"{where}: contradictory identity — {field} {actual!r} != "
+            f"canonical {canonical!r}")
+
+
+def _reconcile_eval_identity(where: str, d: dict, ident: dict) -> None:
+    """Every duplicated semantic field must agree with the canonical
+    identity block; contradictions and extra conflicting aliases are
+    rejected, never ignored."""
+    model = d.get("model")
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError(f"{where}: top-level 'model' missing/invalid")
+    _require_cond("top-level model", model, ident["model_id"], where)
+
+    top_rev = d.get("revision")
+    if not isinstance(top_rev, str):
+        raise ValueError(f"{where}: top-level 'revision' missing")
+    _check_revision(top_rev, where)
+    _require_cond("top-level revision", top_rev, ident["revision"], where)
+
+    top_suite = d.get("suite_sha256")
+    if not isinstance(top_suite, str):
+        raise ValueError(f"{where}: top-level 'suite_sha256' missing")
+    _check_sha(top_suite, "top-level suite_sha256", where)
+    _require_cond("top-level suite_sha256", top_suite,
+                  ident["suite_sha256"], where)
+
+    _require_cond("top-level split", d.get("split"), ident["split"], where)
+    seed_top = d.get("seed")
+    if isinstance(seed_top, bool) or not isinstance(seed_top, int) \
+            or seed_top != ident["seed"]:
+        raise ValueError(
+            f"{where}: contradictory identity — top-level seed "
+            f"{d.get('seed')!r} != canonical {ident['seed']!r}")
+
+    # config fields, when present, must agree with the identity
+    cfgp = d.get("config")
+    if cfgp is not None:
+        if not isinstance(cfgp, dict):
+            raise ValueError(f"{where}: config is not an object")
+        for ckey, ikey in (("model", "model_id"),
+                           ("revision", "revision"),
+                           ("suite_sha256", "suite_sha256"),
+                           ("seed", "seed"),
+                           ("k", "k_steps"),
+                           ("max_k", "max_k"),
+                           ("interval", "interval")):
+            if ckey not in cfgp:
+                continue
+            if ikey not in ident:
+                raise ValueError(
+                    f"{where}: contradictory identity — config.{ckey} "
+                    f"present but identity.{ikey} absent")
+            _require_cond(f"config.{ckey}", cfgp[ckey],
+                          ident[ikey], where)
+
+
+def _reconcile_selected_result(where: str, d: dict, ident: dict) -> None:
+    """Exactly ONE selected result may exist — keyed by the canonical
+    ablation — and its metadata/tag must encode the same K/split/
+    ablation as the identity."""
+    results = d["results"]
+    if set(results) != {ident["ablation"]}:
+        raise ValueError(
+            f"{where}: unexpected selected results {sorted(results)} for "
+            f"ablation {ident['ablation']!r}; extra conflicting aliases "
+            "fail closed")
+    res = results[ident["ablation"]]
+    k_steps = ident["k_steps"]
+    res_k = res.get("k_steps")
+    if isinstance(res_k, bool) or not isinstance(res_k, int) \
+            or res_k != k_steps:
+        raise ValueError(
+            f"{where}: contradictory identity — result k_steps {res_k!r} "
+            f"!= canonical {k_steps!r}")
+    ablate = res.get("ablate")
+    if ident["ablation"] == "clean":
+        if ablate not in (None, {}):
+            raise ValueError(
+                f"{where}: contradictory identity — clean eval carries "
+                f"ablate {ablate!r}")
+    elif not isinstance(ablate, dict) or not ablate:
+        raise ValueError(
+            f"{where}: contradictory identity — ablation "
+            f"{ident['ablation']!r} carries no ablate spec")
+    tag = res.get("tag")
+    if not isinstance(tag, str) or tag.count("|") != 3:
+        raise ValueError(
+            f"{where}: result tag {tag!r} is not the canonical "
+            "'<mode>|<split>|<ablation>|K=<k>' encoding")
+    tag_mode, tag_split, tag_abl, tag_k = tag.split("|")
+    if tag_split != ident["split"] or tag_abl != ident["ablation"] \
+            or tag_k != f"K={k_steps}" or not tag_mode.strip():
+        raise ValueError(
+            f"{where}: contradictory identity — result tag {tag!r} does "
+            f"not match split={ident['split']!r} ablation="
+            f"{ident['ablation']!r} k_steps={k_steps!r}")
+
+
 def validate_eval(eval_path, *, expected: dict | None = None) -> dict:
     """An eval payload is evidence only if complete + fully identity-bound.
 
@@ -301,15 +464,24 @@ def validate_eval(eval_path, *, expected: dict | None = None) -> dict:
     key must match payload CONTENTS exactly:
       model_id, revision, suite_sha256, checkpoint_content_digest, split,
       ablation, k, seed.
+    Unknown expectation keys are rejected; duplicated semantic fields are
+    reconciled against the canonical identity (contradictions fail).
     """
     p = Path(eval_path)
     where = str(p)
     try:
-        d = json.loads(p.read_text())
+        # strict reader: NaN/Infinity/-Infinity reject at parse time ...
+        d = strict_json_loads(p.read_text())
     except Exception as e:  # noqa: BLE001 - unreadable payload fails closed
         raise ValueError(f"{where}: unreadable eval payload: {e}") from e
     if not isinstance(d, dict):
         raise ValueError(f"{where}: payload is not a JSON object")
+    try:
+        # ... and any decoded non-finite number fails closed as well
+        assert_json_numbers_finite(d, where=f"{where}: payload")
+    except Exception as e:
+        raise ValueError(f"{where}: payload is not finite evidence: "
+                         f"{e}") from e
     if d.get("status") != "complete":
         raise ValueError(f"{where}: status={d.get('status')!r}, "
                          "not 'complete'")
@@ -320,6 +492,9 @@ def validate_eval(eval_path, *, expected: dict | None = None) -> dict:
         v = ident.get(key)
         if v is None or (isinstance(v, str) and not v.strip()):
             raise ValueError(f"{where}: identity.{key} missing")
+    for key in ("model_id", "split", "ablation"):
+        if not isinstance(ident[key], str):
+            raise ValueError(f"{where}: identity.{key} must be a string")
     rev = ident["revision"]
     _check_revision(rev, where)
     _check_sha(ident["suite_sha256"], "identity.suite_sha256", where)
@@ -333,6 +508,22 @@ def validate_eval(eval_path, *, expected: dict | None = None) -> dict:
         raise ValueError(f"{where}: identity.seed must be an int")
     split = ident["split"]
     ablation = ident["ablation"]
+
+    # optional extended identity fields, when present, must be well-formed
+    interval = ident.get("interval")
+    if interval is not None:
+        if (not isinstance(interval, list) or len(interval) != 2
+                or any(isinstance(x, bool) or not isinstance(x, int)
+                       for x in interval)):
+            raise ValueError(f"{where}: identity.interval must be [lo, hi]")
+    max_k = ident.get("max_k")
+    if max_k is not None and (isinstance(max_k, bool)
+                              or not isinstance(max_k, int) or max_k < 1):
+        raise ValueError(f"{where}: identity.max_k must be a positive int")
+
+    # EVERY duplicated semantic field must agree with this identity
+    _reconcile_eval_identity(where, d, ident)
+
     results = d.get("results")
     if not isinstance(results, dict) or not results:
         raise ValueError(f"{where}: no results block")
@@ -342,8 +533,15 @@ def validate_eval(eval_path, *, expected: dict | None = None) -> dict:
         raise ValueError(
             f"{where}: identity.ablation {ablation!r} has no matching "
             "results entry")
+    _reconcile_selected_result(where, d, ident)
 
     if expected:
+        unknown = sorted(set(expected) - set(_EXPECT_FLAGS))
+        if unknown:
+            raise ValueError(
+                f"{where}: unexpected expectation keys {unknown}; the "
+                "preregistered contract must not carry unrecognized "
+                "identity metadata")
         _require_exact(ident["model_id"], expected.get("model_id"),
                        "identity.model_id", where)
         _require_exact(rev, expected.get("revision"),
@@ -378,7 +576,7 @@ def _parse_expectations(argv: list) -> tuple[list, dict]:
         raise SystemExit(f"unknown expectation flags: {unknown}")
     expected = {k: getattr(known, k) for k in _EXPECT_FLAGS}
     expected = {k: v for k, v in expected.items() if v is not None}
-    for k in ("seed", "k"):
+    for k in ("seed", "k", "steps"):
         if k in expected:
             expected[k] = int(expected[k])
     return rest, expected

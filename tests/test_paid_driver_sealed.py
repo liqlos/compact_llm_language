@@ -8,12 +8,17 @@ statically prove the paid-driver contract:
   * paired same-adapter K>0 / K=0 evals; bounded (one train + 4 evals)
   * resume only through full-contract validators; no existence-only skip
   * no package installs/upgrades; no ignored failures
+The recipe-preregistration heredoc is additionally EXECUTED offline
+(no network, no GPU: layer count/suite sha are injected constants) to
+prove it reaches a real 64-hex canonical digest.
 """
 
 import hashlib
 import platform
 import re
+import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -44,6 +49,13 @@ def _pin(src: str, var: str) -> str:
     m = re.search(rf'^{var}="([^\"]+)"$', src, re.M)
     assert m, f"pin {var} missing from driver"
     return m.group(1)
+
+
+def _const(src: str, var: str) -> str:
+    """Shell constant value, quoted or bare (e.g. INTERVAL=mid)."""
+    m = re.search(rf'^{var}=("?)([^"\n]*)\1$', src, re.M)
+    assert m, f"constant {var} missing from driver"
+    return m.group(2)
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +106,19 @@ def test_no_installs_upgrades_or_ignored_failures():
     assert "uv sync" not in code and "uv pip" not in code
     assert "|| true" not in code, "driver ignores failures"
     assert "set -euo pipefail" in _src()
+
+
+def test_no_mutable_image_default_anywhere_in_launch_path():
+    """The known-incompatible mutable tag can never reappear as a launch
+    environment, and the driver has NO image default: an unsealed run
+    aborts instead."""
+    src = _src()
+    assert "pytorch/pytorch:" not in src
+    assert not re.search(r"^\s*IMAGE\s*=", src, re.M)
+    provisioner = (REPO / "latent_lab" / "bench" / "vast_provision.py"
+                   ).read_text()
+    assert "pytorch/pytorch:" not in provisioner
+    assert not re.search(r"^IMAGE\s*=", provisioner, re.M)
 
 
 # ---------------------------------------------------------------------------
@@ -154,15 +179,151 @@ def test_paired_k_arms_use_same_adapter_and_bounded_evals():
 
 
 # ---------------------------------------------------------------------------
+# preregistration heredoc: real Python booleans reach the digest helper
+# ---------------------------------------------------------------------------
+
+def _heredoc_body(src: str) -> str:
+    """The exact CONFIG_SHA256 recipe-preregistration Python code."""
+    marker = "CONFIG_SHA256=$(python - <<PY"
+    start = src.index(marker)
+    body_start = src.index("\n", start) + 1
+    end = src.index("\nPY\n", body_start)
+    return src[body_start:end]
+
+
+def _driver_py_bool(raw: str) -> str:
+    """Run the DRIVER'S OWN shell->Python boolean converter."""
+    m = re.search(r"^py_bool \(\) \{\n(?:.*\n)*?^\}$", _src(), re.M)
+    assert m, "driver lost its shell->Python boolean converter"
+    r = subprocess.run(
+        ["bash", "-c", m.group(0) + "\npy_bool " + shlex.quote(raw)],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    return r.stdout
+
+
+def _render_preregistration_python(**overrides) -> str:
+    """Interpolate the driver's preregistered constants into its own
+    heredoc exactly as bash would (booleans via the driver's py_bool)."""
+    src = _src()
+    subs = {
+        "INTERVAL": _const(src, "INTERVAL"),
+        "K_POS": _const(src, "K_POS"),
+        "N_LAYERS": "24",          # injected: mid -> [12, 18]; no network
+        "MAX_K": _const(src, "MAX_K"),
+        "LORA_R": _const(src, "LORA_R"),
+        "LORA_ALPHA": _const(src, "LORA_ALPHA"),
+        "LR": _const(src, "LR"),
+        "STEPS": _const(src, "STEPS"),
+        "SEED": _const(src, "SEED"),
+        "OPTIMIZER": _const(src, "OPTIMIZER"),
+        "WEIGHT_DECAY": _const(src, "WEIGHT_DECAY"),
+        "LR_SCHEDULE": _const(src, "LR_SCHEDULE"),
+        "WARMUP": _const(src, "WARMUP"),
+        "CLIP": _const(src, "CLIP"),
+        "SUITE_SHA": "ab" * 32,    # injected suite identity; no network
+        "PY_DETACH_Z0": _driver_py_bool(_const(src, "DETACH_Z0")),
+        "PY_GRAD_CHECKPOINT": _driver_py_bool(_const(src, "GRAD_CHECKPOINT")),
+    }
+    subs.update(overrides)
+    code = _heredoc_body(src)
+    for name, value in subs.items():
+        code = code.replace("${%s}" % name, value)
+    assert "${" not in code, "unresolved placeholder in rendered heredoc"
+    return code
+
+
+def test_recipe_preregistration_heredoc_executes_to_real_64hex_digest():
+    """Executes the driver's ACTUAL recipe-preregistration path offline
+    (no network/GPU): with real Python booleans it must run to completion
+    and print the canonical 64-hex digest that equals the trainer-side
+    helper's output for the same constants."""
+    from latent_lab.bench.latent_run import (
+        interval_from_spec, mode_from_spec, train_recipe_digest)
+
+    code = _render_preregistration_python()
+    r = subprocess.run([sys.executable, "-c", code], cwd=str(REPO),
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    digest = r.stdout.strip()
+    assert re.fullmatch(r"[0-9a-f]{64}", digest), \
+        f"preregistration did not produce a 64-hex digest: {r.stdout!r}"
+
+    # identical to the shared trainer-side computation of the SAME
+    # constants (the exact binding resume validation enforces); the
+    # injected layer count 24 makes 'mid' resolve to [12, 18]
+    s = _src()
+    n_layers = 24
+    k_pos = int(_const(s, "K_POS"))
+    expected = train_recipe_digest(
+        mode=mode_from_spec(_const(s, "INTERVAL"), k_pos),
+        interval=list(interval_from_spec("mid", n_layers)),
+        k=k_pos, max_k=int(_const(s, "MAX_K")),
+        lora_r=int(_const(s, "LORA_R")),
+        lora_alpha=float(_const(s, "LORA_ALPHA")),
+        lr=float(_const(s, "LR")), steps=int(_const(s, "STEPS")),
+        seed=int(_const(s, "SEED")), optimizer=_const(s, "OPTIMIZER"),
+        weight_decay=float(_const(s, "WEIGHT_DECAY")),
+        lr_schedule=_const(s, "LR_SCHEDULE"),
+        warmup=int(_const(s, "WARMUP")), clip=float(_const(s, "CLIP")),
+        detach_z0=False, grad_checkpoint=True,
+        suite_sha256="ab" * 32)
+    assert digest == expected, (
+        "driver-preregistered digest drifted from the canonical "
+        "trainer-side recipe")
+
+
+def test_recipe_heredoc_with_raw_shell_booleans_reproduces_nameerror():
+    """Negative control proving the harness above executes REAL code:
+    substituting the pre-fix raw lowercase shell values must blow up
+    with NameError — exactly the paid-run abort this fix eliminates."""
+    code = _render_preregistration_python(PY_DETACH_Z0="false",
+                                          PY_GRAD_CHECKPOINT="true")
+    r = subprocess.run([sys.executable, "-c", code], cwd=str(REPO),
+                       capture_output=True, text=True)
+    assert r.returncode != 0
+    assert "NameError" in r.stderr
+
+
+def test_driver_binds_digest_and_trainer_flags_to_one_boolean_source():
+    """Static drift guards: raw shell booleans can never re-enter a
+    Python heredoc; the digest input and the --detach-z0 flag binding
+    both derive from ONE validated constant; an impossible checkpointing
+    preregistration fails closed instead of desyncing the digest."""
+    src = _src()
+    body = _heredoc_body(src)
+    assert "${PY_DETACH_Z0}" in body and "${PY_GRAD_CHECKPOINT}" in body
+    assert "${DETACH_Z0}" not in body and "${GRAD_CHECKPOINT}" not in body, \
+        "raw shell boolean interpolated straight into Python again"
+    assert 'PY_DETACH_Z0=$(py_bool "$DETACH_Z0")' in src
+    assert 'PY_GRAD_CHECKPOINT=$(py_bool "$GRAD_CHECKPOINT")' in src
+    # trainer flag binding comes from the SAME validated source
+    assert '[ "$DETACH_Z0" = "true" ] && TRAIN_ARGS+=(--detach-z0)' in src
+    # the trainer pins grad-checkpointing ON; the driver refuses any
+    # preregistration the trainer could not honor (digest/behavior sync)
+    assert re.search(
+        r'\[ "\$GRAD_CHECKPOINT" = "true" \] \\\n'
+        r'\s*\|\| \{ echo "FATAL: GRAD_CHECKPOINT', src), \
+        "grad-checkpoint digest/trainer sync gate missing"
+    gate_start = src.index("[ \"$GRAD_CHECKPOINT\" = \"true\" ]")
+    assert "exit 5" in src[gate_start:gate_start + 400]
+
+
+# ---------------------------------------------------------------------------
 # sealed resume: full-contract validation, never existence
 # ---------------------------------------------------------------------------
 
 def test_resume_requires_full_expected_contract_validation():
     src = _src()
-    # run validation carries model/rev/seed/label/k/steps expectations
-    for flag in ("--expect-model", "--expect-rev", "--expect-seed",
-                 "--expect-label", "--expect-k", "--expect-steps"):
-        assert flag in src, f"run contract flag {flag} missing"
+    # run validation carries the FULL canonical contract: model/rev/
+    # suite/seed/label/k/steps + the canonical config-recipe digest
+    expect_run_start = src.index("expect_run=(")
+    expect_run_block = src[expect_run_start:src.index(")",
+                                                      expect_run_start)]
+    for flag in ("--expect-model", "--expect-rev", "--expect-suite",
+                 "--expect-seed", "--expect-label", "--expect-k",
+                 "--expect-steps", "--expect-config-sha256"):
+        assert flag in expect_run_block, f"run contract flag {flag} missing"
     # eval validation carries model/rev/suite/digest/split/ablation/k/seed
     for flag in ("--expect-suite", "--expect-digest", "--expect-split",
                  "--expect-ablation"):

@@ -41,6 +41,7 @@ import json
 import math
 import os
 import re
+import time
 from pathlib import Path
 
 try:
@@ -174,10 +175,45 @@ def atomic_write_bytes(path, data: bytes) -> None:
 
 
 def atomic_write_json(path, payload: dict) -> str:
-    """Atomically persist canonical JSON; returns the file sha256."""
-    data = json.dumps(payload, sort_keys=True, indent=1).encode()
+    """Atomically persist canonical JSON; returns the file sha256.
+
+    STRICT JSON: ``allow_nan=False`` — NaN/Infinity/-Infinity can never
+    be serialized into evidence (they would re-parse as non-finite
+    floats and poison validators downstream).
+    """
+    data = json.dumps(payload, sort_keys=True, indent=1,
+                      allow_nan=False).encode()
     atomic_write_bytes(path, data)
     return hashlib.sha256(data).hexdigest()
+
+
+def _reject_parse_constant(name: str) -> None:
+    raise ValueError(
+        f"non-standard JSON constant {name} is not permitted in evidence")
+
+
+def strict_json_loads(text):
+    """json.loads that REJECTS NaN/Infinity/-Infinity at parse time."""
+    return json.loads(text, parse_constant=_reject_parse_constant)
+
+
+def assert_json_numbers_finite(obj, *, where: str = "evidence") -> None:
+    """Recursively require every decoded float to be finite.
+
+    Defense in depth for values entering through already-decoded objects
+    or non-standard readers: NaN/±Inf anywhere in a dict/list tree is a
+    hard failure naming the offending path.
+    """
+    if isinstance(obj, float):
+        if not math.isfinite(obj):
+            raise CheckpointError(
+                f"{where}: non-finite number {obj!r} in evidence")
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            assert_json_numbers_finite(v, where=f"{where}[{k!r}]")
+    elif isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            assert_json_numbers_finite(v, where=f"{where}[{i}]")
 
 
 RUN_STATUS_FILE = "run_status.json"
@@ -199,12 +235,19 @@ def write_run_status(out_dir, status: str, **fields) -> dict:
 
 
 def read_run_status(out_dir) -> dict | None:
-    """Read the run status, or None when absent/unreadable."""
+    """Read the run status, or None when absent/unreadable/unsafe.
+
+    Parsing is strict (NaN/Infinity constants reject) and the decoded
+    payload is scanned for non-finite numbers; any such defect means the
+    status is unusable and None (no evidence) is returned.
+    """
     p = Path(out_dir) / RUN_STATUS_FILE
     if not p.exists():
         return None
     try:
-        return json.loads(p.read_text())
+        st = strict_json_loads(p.read_text())
+        assert_json_numbers_finite(st, where=f"{p}: run status")
+        return st
     except Exception:  # noqa: BLE001 - unreadable status means unusable run
         return None
 
@@ -225,6 +268,56 @@ def require_complete_run(out_dir) -> dict:
 TRAIN_REPORT_FILE = "train_report.json"
 CHECKPOINT_FILE = "best_params.pt"
 RUN_MANIFEST_FILE = "run_manifest.json"
+
+
+class EvidenceLifecycleError(FatalRunInvalidError):
+    """Fail-stop publication hygiene could not guarantee a clean root.
+
+    Raised when, after a failed success publication, quarantining the
+    fixed-name success artifacts or publishing the fatal status itself
+    also fails. The ORIGINAL run exception is preserved as ``__cause__``;
+    this error is a fail-closed escalation, never a replacement.
+    """
+
+
+# Fixed-name success artifacts at the evidence root. Quarantine order
+# matters: the COMPLETE-status mark dies FIRST so that even a partial
+# cleanup can never leave a generation a validator would accept as
+# complete (manifest/report/checkpoint are worthless without it).
+SUCCESS_ARTIFACT_FILES = (RUN_STATUS_FILE, RUN_MANIFEST_FILE,
+                          TRAIN_REPORT_FILE, CHECKPOINT_FILE)
+
+
+def quarantine_success_artifacts(out_dir) -> list:
+    """Invalidate every fixed-name success artifact in the active root.
+
+    Each artifact is atomically renamed aside to
+    ``<name>.invalid.<nanos>`` (preserved for forensics); if renaming is
+    impossible the file is unlinked. The FIRST failure propagates — the
+    caller must then fail closed (see cmd_train / EvidenceLifecycleError).
+    Returns the quarantine targets actually created.
+    """
+    out = Path(out_dir)
+    moved = []
+    for name in SUCCESS_ARTIFACT_FILES:
+        p = out / name
+        if not p.exists() and not p.is_symlink():
+            continue
+        target = None
+        for attempt in range(1000):
+            cand = p.with_name(
+                f"{p.name}.invalid.{time.time_ns()}.{attempt}")
+            if not cand.exists():
+                target = cand
+                break
+        if target is None:  # pragma: no cover - absurd collision loop
+            raise OSError(f"cannot derive quarantine name for {p}")
+        try:
+            os.replace(p, target)
+        except OSError:
+            p.unlink()  # last resort; any failure here propagates
+        moved.append(str(target))
+    return moved
 
 
 def write_train_generation(out_dir, *, manifest: dict,
@@ -264,9 +357,16 @@ def _read_json_file(path) -> tuple[dict, str]:
         raise CheckpointError(f"{p}: unreadable artifact: {e}") from e
     digest = hashlib.sha256(raw).hexdigest()
     try:
-        return json.loads(raw), digest
+        # strict parse: NaN/Infinity constants are rejected outright ...
+        data = strict_json_loads(raw.decode())
     except Exception as e:  # noqa: BLE001 - unreadable JSON fails closed
         raise CheckpointError(f"{p}: invalid JSON: {e}") from e
+    try:
+        # ... and any decoded non-finite number fails closed as well
+        assert_json_numbers_finite(data, where=f"{p}")
+    except CheckpointError as e:
+        raise CheckpointError(f"{p}: invalid JSON evidence: {e}") from e
+    return data, digest
 
 
 def verify_manifest_schema(manifest, *, where: str = "manifest") -> dict:
