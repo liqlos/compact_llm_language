@@ -4,9 +4,33 @@ Inventories every retained 2B artifact and every live/rejected 4B artifact,
 validates all offline-checkable evidence, and emits ONE canonical
 machine-readable verdict plus a Markdown report:
 
-    READY     only if every mandatory prerequisite is actually proven
+    READY     only if every mandatory prerequisite is actually PROVEN by
+              this evidence set
     NOT_READY otherwise, with exact blocker codes and the smallest next
-              executable action — never a weakened gate.
+              executable action — never a weakened gate
+
+FAIL-CLOSED contract (every known fail-open is a blocker, never a skip):
+
+* Evidence parsing is STRICT JSON — NaN/Infinity literals make the file
+  invalid instead of silently parsing to float("nan").
+* Checkpoints must be identity-bound bundles whose PAYLOAD tensors are
+  verified FP32 for every floating trainable; report strings alone prove
+  nothing. bf16 payloads classify ``non-fp32-payload`` and block READY.
+* Discovery is symmetric: orphan checkpoints, orphan eval files,
+  byte-duplicate checkpoints bound to more than one run directory, and
+  unreadable artifacts are explicit blockers.
+* Every retained loadable 2B checkpoint needs valid rescored raw-score
+  eval evidence bound to it (adapter path + model + revision + current
+  suite hash) covering BOTH required splits (test_id AND test_ood); one
+  unrelated eval proves nothing globally.
+* The rejected 4B batch must be nonempty, markered, and complete: any
+  known-invalid or byte-duplicate 4B artifact left in any live tree is a
+  blocker; one differing file does not mask other identical live copies;
+  a marker-only empty quarantine proves nothing.
+* Bounded streaming SHA-256 fingerprints of both input roots are taken
+  before and after gating; any change aborts with an execution error.
+  ``--out`` may never overlap an input root, so the gate can never
+  self-inventory its outputs.
 
 Usage (from the repository root):
 
@@ -16,12 +40,13 @@ Usage (from the repository root):
         --out .rcc_work/no_spend_gate_20260824
 
 Exit semantics:
-    0  READY            every prerequisite PROVEN (not produced by this
-                        evidence set so far)
+    0  READY            every prerequisite PROVEN by this evidence set
     1  NOT_READY        evidence-backed negative verdict; see
                         gate_verdict.json blockers
-    2  EXECUTION ERROR  bad invocation, unreadable inputs, crash — no
-                        verdict may be inferred from exit code 2
+    2  EXECUTION ERROR  bad invocation (--out overlapping inputs), missing
+                        or unreadable inputs, inputs modified during the
+                        run, unwritable outputs, crash — no verdict may be
+                        inferred from exit code 2
 
 Hardware-free dry run (hashes/metadata only, no tensor payload loading):
 
@@ -54,7 +79,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .corrected_scoring import (
+    INVALID_RECORDS,
     MISSING_RAW_PREDICTION,
+    RESCORED_CORRECTED,
     select_best_checkpoint,
 )
 
@@ -67,7 +94,7 @@ VERDICT_NOT_READY = "NOT_READY"
 
 PREREQ_INVENTORY = "inventory_hashed_complete"
 PREREQ_REPORTS = "train_reports_schema_identity_and_pins"
-PREREQ_CKPT_STRICT = "checkpoints_strict_loadable_identity_bound"
+PREREQ_CKPT_STRICT = "checkpoints_strict_loadable_identity_bound_fp32_payload"
 PREREQ_RESCORE = "retained_evals_rescored_with_corrected_scorer"
 PREREQ_SELECTION = "checkpoint_selection_uses_corrected_metric"
 PREREQ_RUNTIME = "runtime_integrity_regressions_pass"
@@ -83,6 +110,9 @@ CKPT_LEGACY_UNBOUND = "legacy-unbound"
 CKPT_CORRUPT = "corrupt"
 CKPT_DUPLICATE = "duplicate"
 CKPT_UNPROVEN = "unproven"
+CKPT_NON_FP32_PAYLOAD = "non-fp32-payload"
+
+REQUIRED_SPLITS = ("test_id", "test_ood")
 
 _PINNED_REVISION_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 _SUITE_SHA_RE = re.compile(r"\A[0-9a-f]{64}\Z")
@@ -94,28 +124,12 @@ REQUIRED_CONFIG_FIELDS = {
     "seed": int,
     "steps": int,
 }
-REQUIRED_TOP_LEVEL_NUMERIC = ("best_val_acc", "best_step")
 
-# Regression proofs the gate executes (hardware-free, CPU-only) unless
-# skipped. These pin the runtime-integrity prerequisites.
-PROOF_TEST_NODES = (
-    "tests/test_latent_runtime_integrity.py::test_exact_save_load_roundtrip_and_persisted_metrics",
-    "tests/test_latent_runtime_integrity.py::test_bundle_identity_mismatch_rejected",
-    "tests/test_latent_runtime_integrity.py::test_lora_and_clock_trainables_are_fp32_over_bf16_backbone",
-    "tests/test_latent_runtime_integrity.py::test_recurrence_clock_is_fp32_regardless_of_default_dtype",
-    "tests/test_latent_runtime_integrity.py::test_nan_metric_and_nan_state_rejected",
-    "tests/test_latent_runtime_integrity.py::test_cached_localized_full_equivalence_across_fp32_roundtrip",
-    "tests/test_latent_run.py",
-)
-
-TRUST_BOUNDARY = (
-    "Gate ran read-only over an isolated private COPY of historical "
-    ".rcc_work evidence. .pt payloads were loaded only via "
-    "torch.load(weights_only=True) and the project loader "
-    "latent_lab.train.checkpointing.load_adapter_bundle; nothing was "
-    "modified, moved, deleted, executed beyond deserialization, nor sent "
-    "off-device. No cloud/GPU/paid resource was touched."
-)
+# Eval statuses that can never support the rescore prerequisite.
+EVAL_BAD_STATUSES = frozenset({
+    "unreadable", "malformed_json", "invalid_metadata", "suite_mismatch",
+    "NO_RECORDS", INVALID_RECORDS, MISSING_RAW_PREDICTION,
+})
 
 BLOCKER_ACTIONS = {
     "INVENTORY_UNREADABLE_FILES":
@@ -124,6 +138,10 @@ BLOCKER_ACTIONS = {
         "Re-emit train_report.json for each listed run through the current "
         "driver schema (config pins + trainable_precision); do not hand-edit "
         "historical files.",
+    "REPORT_SUITE_HASH_MISMATCH":
+        "Re-evaluate against the current suite revision so the retained "
+        "report pins the recomputed behavioral-v2 digest; never edit the "
+        "hash by hand.",
     "REPORT_TRAINABLE_PRECISION_MISSING":
         "Add explicit trainable dtype/precision fields to the training "
         "report schema and regenerate reports on the next supervised smoke.",
@@ -131,9 +149,37 @@ BLOCKER_ACTIONS = {
         "Rebuild identity-bound bundles via save_adapter_bundle ONLY after "
         "weight-provenance verification; otherwise retire the weights into "
         "the next capped paired-seed retrain decision.",
+    "CKPT_INVALID_IDENTITY":
+        "Repair or retire checkpoints whose in-bundle identity/schema "
+        "violates the binding requirements; they can never be reused.",
+    "ORPHAN_CHECKPOINT":
+        "Give every checkpoint file a sibling identity-bound "
+        "train_report.json (or remove/quarantine the orphan); unexplained "
+        "weights cannot enter the provenance chain.",
+    "ORPHAN_EVAL_FILE":
+        "Re-emit the eval with an adapter path that resolves to a "
+        "discovered run directory, or move the file out of the evidence "
+        "tree.",
+    "DUPLICATE_CHECKPOINT_BINDING":
+        "Keep exactly one canonical copy of each checkpoint digest inside "
+        "its owning run directory; delete or quarantine every other "
+        "byte-identical copy so the binding is unambiguous.",
+    "EVAL_SPLIT_COVERAGE_MISSING":
+        "Run the corrected raw-score evaluation for every listed "
+        "(run, split) pair before treating the checkpoint as proven.",
+    "EVAL_IDENTITY_MISMATCH":
+        "Regenerate the eval under the exact model id/revision/suite hash "
+        "of the checkpoint it claims to score.",
+    "EVAL_FILE_INVALID":
+        "Repair or re-emit each listed eval file (strict JSON, nonempty "
+        "binding metadata, nonempty valid raw-score records); invalid "
+        "files cannot be skipped or partially trusted.",
     "CKPT_CORRUPT":
         "Keep quarantined as negative evidence; exclude from any resume or "
         "rescore.",
+    "TRAINABLES_NOT_FP32_IN_RETAINED_CHECKPOINTS":
+        "Fix persistence to cast trainables to fp32 on save and verify on "
+        "the next CPU smoke before any GPU spend.",
     "NON_RESCORABLE_MISSING_RAW_PREDICTION":
         "Rerun evaluation with raw per-candidate score capture enabled "
         "(capped CUDA canary scope) or formally invalidate the latent "
@@ -142,15 +188,19 @@ BLOCKER_ACTIONS = {
         "Apply select_best_checkpoint over corrected-metric histories "
         "produced by the next validated run; discard historical best_step "
         "claims.",
-    "TRAINABLES_NOT_FP32_IN_RETAINED_CHECKPOINTS":
-        "Fix persistence to cast trainables to fp32 on save and verify on "
-        "the next CPU smoke before any GPU spend.",
     "LIVE_4B_DUPLICATES_REJECTED_NAN_BATCH":
         "After hashed backup + manifest promotion, remove the duplicated "
         "files under the LIVE 4B runs/ tree (deletion is outside this "
         "gate's authority) and keep _rejected_nan_batch as sole evidence.",
+    "LIVE_INVALID_4B_ARTIFACTS":
+        "Remove or formally quarantine every listed live-tree 4B artifact "
+        "(unreadable report, NaN loss, degenerate accuracy, corrupt "
+        "payload); live trees must hold only valid artifacts.",
     "QUARANTINE_MARKER_MISSING":
         "Restore/confirm REJECTED.md in the quarantine tree, then rerun.",
+    "QUARANTINE_BATCH_EMPTY":
+        "A marker-only empty quarantine proves nothing; populate the "
+        "rejected batch with its actual artifacts or remove the tree.",
     "PROOF_TESTS_FAILED":
         "Fix the failing regression(s) locally before any spend decision.",
 }
@@ -158,9 +208,22 @@ BLOCKER_ACTIONS = {
 NEXT_ACTION_GENERIC = "Review gate_verdict.json prerequisites and rerun."
 
 
+class GateExecutionError(RuntimeError):
+    """Unreadable inputs, mutated inputs, bad invocation — exit code 2."""
+
+
 # ---------------------------------------------------------------------------
-# deterministic JSON helpers
+# deterministic strict-JSON helpers
 # ---------------------------------------------------------------------------
+
+def _reject_json_constant(constant: str):
+    raise ValueError(f"non-strict JSON constant {constant!r}")
+
+
+def strict_json_loads(text: str):
+    """Parse JSON rejecting NaN/Infinity literals entirely."""
+    return json.loads(text, parse_constant=_reject_json_constant)
+
 
 def _json_safe(obj):
     """Recursively map values onto strict-JSON-safe equivalents.
@@ -193,6 +256,52 @@ def canonical_json_bytes(obj) -> bytes:
 def write_canonical(path: Path, obj) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(canonical_json_bytes(obj))
+
+
+# ---------------------------------------------------------------------------
+# bounded streaming source fingerprints
+# ---------------------------------------------------------------------------
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def source_fingerprint(root: Path) -> dict:
+    """Constant-memory Merkle fingerprint over every regular file below
+    root (sorted rel paths, streamed 1 MiB chunks). Raises
+    GateExecutionError when any file cannot be read."""
+    entries: list[tuple[str, str]] = []
+    n_bytes = 0
+    try:
+        for p in sorted(root.rglob("*")):
+            if not p.is_file() or p.is_symlink():
+                continue
+            st = p.stat()
+            entries.append((p.relative_to(root).as_posix(), sha256_file(p)))
+            n_bytes += st.st_size
+    except OSError as e:
+        raise GateExecutionError(
+            f"source fingerprint failed under {root}: {e}") from e
+    merkle = hashlib.sha256()
+    for rel, digest in entries:
+        merkle.update(rel.encode("utf-8"))
+        merkle.update(b"\0")
+        merkle.update(digest.encode("ascii"))
+        merkle.update(b"\n")
+    return {"merkle_sha256": merkle.hexdigest(),
+            "files": len(entries), "bytes": n_bytes}
+
+
+def paths_overlap(a: Path, b: Path) -> bool:
+    """True when either path equals or contains the other (after making
+    both absolute without requiring existence)."""
+    aa = Path(os.path.abspath(a))
+    bb = Path(os.path.abspath(b))
+    return aa == bb or aa in bb.parents or bb in aa.parents
 
 
 # ---------------------------------------------------------------------------
@@ -232,14 +341,6 @@ class ScannedFile:
     size: int
     sha256: str
     dev_ino: tuple[int, int]
-
-
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def scan_roots(results_2b: Path, results_4b: Path, *, errors: list[str]) -> list[ScannedFile]:
@@ -312,6 +413,7 @@ class RunInfo:
     report_rel: str | None
     checkpoint_rel: str | None
     report: dict | None = None
+    report_error: str | None = None
     report_sha256: str | None = None
     ckpt_sha256: str | None = None
 
@@ -321,7 +423,12 @@ def _is_pinned_revision(v) -> bool:
 
 
 def validate_train_report(report: dict) -> dict:
-    """Schema validation; every missing field is recorded, never defaulted."""
+    """Schema validation; every defect is recorded, never defaulted.
+
+    Steps must be non-negative integers (bool/float rejected), all
+    required metric/history values must be finite real numbers, identity
+    fields must be nonempty strings with pinned revision and 64-hex suite
+    digest."""
     problems: list[str] = []
     config = report.get("config")
     if not isinstance(config, dict):
@@ -336,17 +443,29 @@ def validate_train_report(report: dict) -> dict:
         elif typ is list:
             iv = config[key]
             if not (isinstance(iv, list) and len(iv) == 2
-                    and all(isinstance(x, int) for x in iv)):
+                    and all(isinstance(x, int) and not isinstance(x, bool)
+                            for x in iv)):
                 problems.append(f"config.{key}:type")
         elif not isinstance(config[key], typ):
             problems.append(f"config.{key}:type")
-    for key in REQUIRED_TOP_LEVEL_NUMERIC:
-        if key not in report:
-            problems.append(f"{key}:missing")
-        elif isinstance(report[key], bool) or \
-                not isinstance(report[key], (int, float)):
-            problems.append(f"{key}:type")
-    if "model" not in report or not str(report.get("model", "")).strip():
+    steps = config.get("steps")
+    if isinstance(steps, int) and not isinstance(steps, bool) and steps < 0:
+        problems.append("config.steps:negative")
+
+    acc = report.get("best_val_acc")
+    if "best_val_acc" not in report:
+        problems.append("best_val_acc:missing")
+    elif isinstance(acc, bool) or not isinstance(acc, (int, float)) \
+            or not math.isfinite(float(acc)):
+        problems.append("best_val_acc:type_or_nonfinite")
+    step = report.get("best_step")
+    if "best_step" not in report:
+        problems.append("best_step:missing")
+    elif isinstance(step, bool) or not isinstance(step, int) or step < 0:
+        problems.append("best_step:type")
+
+    model = report.get("model")
+    if not isinstance(model, str) or not model.strip():
         problems.append("model:missing_or_empty")
     rev = report.get("revision")
     if not _is_pinned_revision(rev):
@@ -354,11 +473,40 @@ def validate_train_report(report: dict) -> dict:
     suite = report.get("suite_sha256")
     if not isinstance(suite, str) or not _SUITE_SHA_RE.fullmatch(suite):
         problems.append("suite_sha256:not_64hex")
+
     hist = report.get("val_history")
     if not isinstance(hist, list) or not hist:
         problems.append("val_history:missing_or_empty")
+    else:
+        bad_idx = []
+        for i, entry in enumerate(hist):
+            ok = isinstance(entry, dict)
+            if ok:
+                s = entry.get("step")
+                m = entry.get("accuracy")
+                ok = (isinstance(s, int) and not isinstance(s, bool)
+                      and s >= 0
+                      and isinstance(m, (int, float))
+                      and not isinstance(m, bool)
+                      and math.isfinite(float(m)))
+            if not ok:
+                bad_idx.append(i)
+        if bad_idx:
+            shown = ",".join(str(i) for i in bad_idx[:8])
+            more = "" if len(bad_idx) <= 8 else ",…"
+            problems.append(f"val_history:bad_entries[{shown}{more}]")
+
+    loss = report.get("final_train_loss")
+    if "final_train_loss" not in report:
+        problems.append("final_train_loss:missing")
+    elif isinstance(loss, bool) or not isinstance(loss, (int, float)) \
+            or not math.isfinite(float(loss)):
+        problems.append("final_train_loss:type_or_nonfinite")
+    prec = report.get("trainable_precision")
     if "trainable_precision" not in report:
         problems.append("trainable_precision:missing")
+    elif not isinstance(prec, str) or not prec.strip():
+        problems.append("trainable_precision:type")
 
     selection = None
     if isinstance(hist, list) and hist:
@@ -367,6 +515,7 @@ def validate_train_report(report: dict) -> dict:
         reported_step = report.get("best_step")
         if sel is not None and isinstance(reported_acc, (int, float)) \
                 and not isinstance(reported_acc, bool) \
+                and math.isfinite(float(reported_acc)) \
                 and isinstance(reported_step, int) \
                 and not isinstance(reported_step, bool):
             selection = {
@@ -386,14 +535,33 @@ def validate_train_report(report: dict) -> dict:
         "problems": problems,
         "scorer_tag": config.get("scorer"),
         "identity": {
-            "model_id": report.get("model") if isinstance(
-                report.get("model"), str) else None,
+            "model_id": model if isinstance(model, str) else None,
             "revision": rev if _is_pinned_revision(rev) else None,
             "suite_sha256": suite if isinstance(suite, str) else None,
         },
         "selection_check": selection,
     }
 
+# Regression proofs the gate executes (hardware-free, CPU-only) unless
+# skipped. These pin the runtime-integrity prerequisites.
+PROOF_TEST_NODES = (
+    "tests/test_latent_runtime_integrity.py::test_exact_save_load_roundtrip_and_persisted_metrics",
+    "tests/test_latent_runtime_integrity.py::test_bundle_identity_mismatch_rejected",
+    "tests/test_latent_runtime_integrity.py::test_lora_and_clock_trainables_are_fp32_over_bf16_backbone",
+    "tests/test_latent_runtime_integrity.py::test_recurrence_clock_is_fp32_regardless_of_default_dtype",
+    "tests/test_latent_runtime_integrity.py::test_nan_metric_and_nan_state_rejected",
+    "tests/test_latent_runtime_integrity.py::test_cached_localized_full_equivalence_across_fp32_roundtrip",
+    "tests/test_latent_run.py",
+)
+
+TRUST_BOUNDARY = (
+    "Gate ran read-only over an isolated private COPY of historical "
+    ".rcc_work evidence. .pt payloads were loaded only via "
+    "torch.load(weights_only=True) and the project loader "
+    "latent_lab.train.checkpointing.load_adapter_bundle; nothing was "
+    "modified, moved, deleted, executed beyond deserialization, nor sent "
+    "off-device. No cloud/GPU/paid resource was touched."
+)
 
 # ---------------------------------------------------------------------------
 # checkpoint classification
@@ -440,9 +608,10 @@ def _classify_bundle(raw: dict, path: Path, report_identity, info: dict) -> dict
 
     bid, brev = raw.get("model_id"), raw.get("revision")
     info["bundle_identity"] = {"model_id": bid, "revision": brev}
-    if not _is_pinned_revision(brev):
+    if not isinstance(bid, str) or not bid.strip() \
+            or not _is_pinned_revision(brev):
         info["classification"] = CKPT_INVALID
-        info["reasons"].append("bundle_revision_not_pinned_40hex")
+        info["reasons"].append("bundle_identity_not_pinable")
         return info
     if report_identity:
         rep_mid = report_identity.get("model_id")
@@ -453,7 +622,11 @@ def _classify_bundle(raw: dict, path: Path, report_identity, info: dict) -> dict
             info["reasons"].append("bundle_identity_conflicts_with_report")
             return info
     try:
-        load_adapter_bundle(path, model_id=str(bid), revision=str(brev))
+        # Strict project loader: validates keys, declared shapes/dtypes,
+        # finiteness AND identity before returning tensor clones — the
+        # returned payload is the ground truth for the fp32 check below.
+        tensors = load_adapter_bundle(path, model_id=str(bid),
+                                      revision=str(brev))
     except AdapterBundleIdentityError as e:
         info["classification"] = CKPT_INVALID
         info["reasons"].append(f"identity_error:{e}")
@@ -470,8 +643,22 @@ def _classify_bundle(raw: dict, path: Path, report_identity, info: dict) -> dict
         info["classification"] = CKPT_CORRUPT
         info["reasons"].append(f"load_failed:{type(e).__name__}")
         return info
+
+    # Validate ACTUAL trainable dtypes from the bundle payload — a report
+    # string claiming fp32 proves nothing.
+    info["tensor_dtypes"] = sorted({str(t.dtype) for t in tensors.values()})
+    info["n_tensors"] = len(tensors)
+    bad_dtypes = sorted({str(t.dtype) for t in tensors.values()
+                         if t.is_floating_point()
+                         and str(t.dtype) != "torch.float32"})
+    if bad_dtypes:
+        info["classification"] = CKPT_NON_FP32_PAYLOAD
+        info["reasons"].append(
+            "bundle_payload_not_fp32:" + ",".join(bad_dtypes))
+        return info
     info["classification"] = CKPT_LOADABLE
     info["reasons"].append("strict_project_loader_passed")
+    info["reasons"].append("payload_floating_tensors_all_fp32")
     if report_identity:
         info["reasons"].append("identity_matches_sidecar_report")
     return info
@@ -506,51 +693,84 @@ def _classify_plain_state(raw: dict, info: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# eval rescoring eligibility
+# eval rescoring eligibility + identity binding
 # ---------------------------------------------------------------------------
 
-def evaluate_eval_file(path: Path, examples_by_id: dict | None) -> dict:
-    try:
-        data = json.loads(path.read_text())
-    except Exception as e:  # noqa: BLE001
-        return {"file": path.name, "status": "unreadable", "detail": str(e)}
-    if not isinstance(data, dict):
-        return {"file": path.name, "status": "unreadable",
-                "detail": "top level not an object"}
-    out = {
+def evaluate_eval_file(path: Path, examples_by_id: dict | None,
+                       *, root_label: str) -> dict:
+    out: dict = {
         "file": path.name,
-        "adapter": data.get("adapter"),
-        "split": data.get("split"),
-        "model": data.get("model"),
-        "revision": data.get("revision"),
+        "root": root_label,
+        "adapter": None,
+        "split": None,
+        "model": None,
+        "revision": None,
         "suite_sha256_matches_current_suite": None,
+        "bound_run": None,
+        "n_records": 0,
     }
-    records: list[dict] = []
-    for res in (data.get("results") or {}).values():
-        if isinstance(res, dict) and isinstance(res.get("records"), list):
-            records.extend(res["records"])
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        out["status"] = "unreadable"
+        out["detail"] = str(e)
+        return out
+    try:
+        data = strict_json_loads(text)
+    except ValueError as e:
+        out["status"] = "malformed_json"
+        out["detail"] = f"strict JSON parse failed: {e}"
+        return out
+    if not isinstance(data, dict):
+        out["status"] = "malformed_json"
+        out["detail"] = "top level not an object"
+        return out
+
+    for field in ("adapter", "split", "model", "revision", "suite_sha256"):
+        val = data.get(field)
+        if not isinstance(val, str) or not val.strip():
+            out["status"] = "invalid_metadata"
+            out["detail"] = f"{field}: missing or not a nonempty string"
+            return out
+        out[field] = val
+
+    matches = data["suite_sha256"] == current_suite_sha256()
+    out["suite_sha256_matches_current_suite"] = matches
+    if not matches:
+        out["status"] = "suite_mismatch"
+        out["detail"] = (
+            f"declared suite {data['suite_sha256'][:12]}… != current "
+            f"{current_suite_sha256()[:12]}…")
+        return out
+
+    records: list = []
+    results_obj = data.get("results")
+    if not isinstance(results_obj, dict) or not results_obj:
+        out["status"] = "invalid_metadata"
+        out["detail"] = "results: missing/empty or not an object"
+        return out
+    for key, res in results_obj.items():
+        if not isinstance(res, dict) or not isinstance(res.get("records"),
+                                                       list):
+            out["status"] = "invalid_metadata"
+            out["detail"] = f"results.{key}: records list missing/malformed"
+            return out
+        records.extend(res["records"])
     out["n_records"] = len(records)
 
     if examples_by_id is None:
         examples_by_id = suite_examples_by_id()
-    declared = data.get("suite_sha256")
-    out["suite_sha256_matches_current_suite"] = bool(
-        declared == current_suite_sha256())
 
-    if not records:
-        out["status"] = "NO_RECORDS"
-        return out
     from .corrected_scoring import rescore_records
 
     outcome = rescore_records(records, examples_by_id)
-    if outcome.status == "RESCORED_CORRECTED":
-        out["status"] = "RESCORED_CORRECTED"
+    out["status"] = outcome.status
+    if outcome.status == RESCORED_CORRECTED:
         out["corrected_accuracy"] = outcome.corrected_accuracy
-    elif outcome.status == MISSING_RAW_PREDICTION:
-        out["status"] = MISSING_RAW_PREDICTION
+    if outcome.detail:
         out["detail"] = outcome.detail
-    else:
-        out["status"] = "NO_RECORDS"
+    if outcome.flag_counts:
+        out["flag_counts"] = outcome.flag_counts
     return out
 
 
@@ -586,14 +806,22 @@ def current_suite_sha256() -> str:
 # 4B quarantine analysis
 # ---------------------------------------------------------------------------
 
+def _parse_report_lenient(path: Path):
+    """Tolerant parse used ONLY to detect pathology (a NaN literal must be
+    visible to the detector); any failure returns None."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def analyze_quarantine(scanned: list[ScannedFile]) -> dict:
     def files_under(prefix: str) -> dict[str, ScannedFile]:
-        sel = {
+        return {
             f.rel[len(prefix):]: f
             for f in scanned
             if f.label == "4b" and f.rel.startswith(prefix)
         }
-        return sel
 
     live = files_under("runs/")
     rejected = files_under("_rejected_nan_batch/")
@@ -610,34 +838,70 @@ def analyze_quarantine(scanned: list[ScannedFile]) -> dict:
             only_live.append(rel)
         else:
             only_rej.append(rel)
-    live_dupes_quarantine = bool(identical) and not differing
+    # ANY byte-identical quarantined file still present live is a blocker;
+    # a differing sibling must not mask the remaining identical copies.
+    live_dupes_quarantine = bool(identical)
 
-    nan_runs, fake_best_runs = [], []
+    nan_runs, fake_best_runs, unreadable_runs = [], [], []
     for rel, f in sorted(rejected.items()):
         if f.kind != "train_report":
             continue
-        rep = json.loads(f.abs.read_text())
+        rep = _parse_report_lenient(f.abs)
+        run = rel.split("/")[0]
+        if not isinstance(rep, dict):
+            unreadable_runs.append(run)
+            continue
         loss = rep.get("final_train_loss")
         acc = rep.get("best_val_acc")
-        run = rel.split("/")[0]
-        if isinstance(loss, float) and not math.isfinite(loss):
+        if isinstance(loss, (int, float)) and not isinstance(loss, bool) \
+                and not math.isfinite(float(loss)):
             nan_runs.append(run)
-        if isinstance(acc, (int, float)) and math.isfinite(float(acc)) \
-                and float(acc) >= 1.0:
+        if isinstance(acc, (int, float)) and not isinstance(acc, bool) \
+                and math.isfinite(float(acc)) and float(acc) >= 1.0:
             fake_best_runs.append(run)
+
+    # Known-invalid artifacts remaining LIVE are blockers too.
+    live_invalid_runs = []
+    for rel, f in sorted(live.items()):
+        if f.kind != "train_report":
+            continue
+        rep = _parse_report_lenient(f.abs)
+        run = rel.split("/")[0]
+        if not isinstance(rep, dict):
+            live_invalid_runs.append(run)
+            continue
+        loss = rep.get("final_train_loss")
+        acc = rep.get("best_val_acc")
+        invalid = False
+        if isinstance(loss, (int, float)) and not isinstance(loss, bool) \
+                and not math.isfinite(float(loss)):
+            invalid = True
+        if isinstance(acc, (int, float)) and not isinstance(acc, bool) \
+                and math.isfinite(float(acc)) and float(acc) >= 1.0:
+            invalid = True
+        if invalid:
+            live_invalid_runs.append(run)
+
+    rejected_reports = sorted({r.split("/")[0] for r in rejected
+                               if r.endswith("/train_report.json")})
+    marker_only_empty = marker is not None and not rejected_reports \
+        and len(rejected) <= 1
     return {
         "live_run_dirs": sorted({r.split("/")[0] for r in live
                                  if r.endswith("/train_report.json")}),
-        "rejected_run_dirs": sorted({r.split("/")[0] for r in rejected
-                                     if r.endswith("/train_report.json")}),
+        "rejected_run_dirs": rejected_reports,
         "quarantine_marker_present": marker is not None,
         "live_vs_rejected_identical_files": identical,
         "live_vs_rejected_differing_files": differing,
         "only_in_live": only_live,
         "only_in_rejected": only_rej,
         "live_tree_duplicates_quarantine": live_dupes_quarantine,
+        "rejected_batch_empty": not rejected_reports,
+        "marker_only_empty_quarantine": marker_only_empty,
         "rejected_runs_with_nan_final_loss": sorted(set(nan_runs)),
         "rejected_runs_with_degenerate_best_acc_1": sorted(set(fake_best_runs)),
+        "rejected_runs_unreadable_report": sorted(set(unreadable_runs)),
+        "live_invalid_runs": sorted(set(live_invalid_runs)),
     }
 
 
@@ -665,7 +929,6 @@ def run_proof_tests(repo_root: Path, log_path: Path | None = None) -> dict:
         "all_passed": proc.returncode == 0,
     }
 
-
 # ---------------------------------------------------------------------------
 # gate assembly
 # ---------------------------------------------------------------------------
@@ -679,6 +942,12 @@ class GateResult:
     report_md: str
 
 
+def _norm_adapter(value) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip().strip("/")
+
+
 def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
              dry_run: bool = False, skip_proof_tests: bool = False,
              proof_log_path: Path | None = None,
@@ -690,8 +959,17 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
     outcomes; the CLI never supplies it, so production runs either execute
     the regressions or record them skipped/unproven.
     """
+    fingerprints_before = {
+        "results_2b": source_fingerprint(results_2b),
+        "results_4b": source_fingerprint(results_4b),
+    }
+
     errors: list[str] = []
     scanned = scan_roots(results_2b, results_4b, errors=errors)
+    if errors:
+        # Unreadable inputs mean no trustworthy verdict is possible at all.
+        raise GateExecutionError(
+            "input roots unreadable/incomplete: " + "; ".join(sorted(errors)))
     inventory = build_inventory(scanned)
 
     # ---- runs (discovered, never hand-listed) ----------------------------
@@ -713,29 +991,61 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
             ri = RunInfo(run_id=d.name, root=label, dir_rel=rel,
                          report_rel=rep_rel, checkpoint_rel=ckpt_rel)
             if rep_rel:
-                ri.report = json.loads(files_by_id[rep_rel].abs.read_text())
-                ri.report_sha256 = files_by_id[rep_rel].sha256
+                sf = files_by_id[rep_rel]
+                ri.report_sha256 = sf.sha256
+                try:
+                    parsed = strict_json_loads(
+                        sf.abs.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, ValueError) as e:
+                    ri.report = None
+                    ri.report_error = \
+                        f"train_report unreadable/malformed: {e}"
+                else:
+                    if isinstance(parsed, dict):
+                        ri.report = parsed
+                    else:
+                        ri.report = None
+                        ri.report_error = (
+                            "train_report malformed: top level not an object")
             if ckpt_rel:
                 ri.ckpt_sha256 = files_by_id[ckpt_rel].sha256
             runs[label].append(ri)
 
-    # ---- checkpoint duplicate groups -------------------------------------
-    ckpt_paths = [f for f in scanned if f.kind == "adapter_checkpoint"]
-    dup_members: set[str] = set()
-    by_hash: dict[str, list[str]] = {}
-    for f in ckpt_paths:
-        by_hash.setdefault(f.sha256, []).append(f"{f.label}/{f.rel}")
-    primary: dict[str, str] = {}
-    for h, ids in sorted(by_hash.items()):
-        if len(ids) > 1:
-            ordered = sorted(ids)
-            primary[h] = ordered[0]
-            dup_members.update(ordered[1:])
+    # ---- symmetric checkpoint bookkeeping ---------------------------------
+    # RunInfo.checkpoint_rel already carries the "<root>/<path>" artifact id.
+    claimed_ckpt_ids = {ri.checkpoint_rel
+                        for lbl in ("2b", "4b") for ri in runs[lbl]
+                        if ri.checkpoint_rel}
+    orphan_ckpts = [f for f in scanned
+                    if f.kind == "adapter_checkpoint"
+                    and f"{f.label}/{f.rel}" not in claimed_ckpt_ids]
+
+    # Byte-identical checkpoint payloads owned by more than one run
+    # directory make checkpoint->report binding ambiguous.
+    owner_of: dict[str, tuple[str, str]] = {}
+    for lbl in ("2b", "4b"):
+        for ri in runs[lbl]:
+            if ri.checkpoint_rel:
+                owner_of[ri.checkpoint_rel] = (ri.root, ri.dir_rel)
+    ckpt_hash_groups: dict[str, list[str]] = {}
+    for f in scanned:
+        if f.kind == "adapter_checkpoint":
+            ckpt_hash_groups.setdefault(f.sha256, []).append(
+                f"{f.label}/{f.rel}")
+    dup_binding_groups: list[dict] = []
+    for digest, members in sorted(ckpt_hash_groups.items()):
+        owners = sorted({owner_of.get(m, ("<orphan>", "<orphan>"))
+                         for m in members})
+        if len(members) > 1 and len(owners) > 1:
+            dup_binding_groups.append({
+                "sha256": digest,
+                "members": sorted(members),
+                "owners": [f"{o[0]}/{o[1]}" for o in owners]})
 
     # ---- per-run validation + classification -----------------------------
     run_verdicts = []
-    for label in ("2b", "4b"):
-        for ri in runs[label]:
+    for lbl in ("2b", "4b"):
+        for ri in runs[lbl]:
             rv: dict = {"run_id": ri.run_id, "root": ri.root,
                         "dir": ri.dir_rel,
                         "scope": ("rejected_negative"
@@ -753,27 +1063,51 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
                 rv["suite_sha256_matches_current_suite"] = bool(
                     declared == current_suite_sha256())
             else:
-                rv["report_problems"] = ["train_report:missing"]
+                rv["report_problems"] = (
+                    ["train_report:malformed_json"]
+                    if ri.report_error else ["train_report:missing"])
+                if ri.report_error:
+                    rv["report_error"] = ri.report_error
             if ri.checkpoint_rel:
                 cls = classify_checkpoint(
                     files_by_id[ri.checkpoint_rel].abs,
                     report_identity=identity, dry_run=dry_run)
-                fid = f"{ri.root}/{ri.checkpoint_rel}"
-                if fid in dup_members:
-                    cls = dict(cls)
-                    cls["duplicate_of"] = primary[
-                        files_by_id[ri.checkpoint_rel].sha256]
                 rv["checkpoint"] = cls
                 rv["checkpoint_sha256"] = ri.ckpt_sha256
             run_verdicts.append(rv)
+
+    orphan_verdicts: list[dict] = []
+    if not dry_run:
+        for f in orphan_ckpts:
+            cls = classify_checkpoint(f.abs, report_identity=None,
+                                      dry_run=False)
+            orphan_verdicts.append({"id": f"{f.label}/{f.rel}",
+                                    "classification": cls["classification"],
+                                    "reasons": cls["reasons"]})
+    else:
+        orphan_verdicts = [{"id": f"{f.label}/{f.rel}",
+                            "classification": CKPT_UNPROVEN,
+                            "reasons": ["dry_run_skips_payload_loading"]}
+                           for f in orphan_ckpts]
 
     # ---- eval rescoring ----------------------------------------------------
     eval_verdicts = []
     if not dry_run:
         for f in scanned:
             if f.kind == "eval_json":
-                eval_verdicts.append(evaluate_eval_file(f.abs, None))
-    eval_verdicts.sort(key=lambda e: e["file"])
+                eval_verdicts.append(evaluate_eval_file(
+                    f.abs, None, root_label=f.label))
+    eval_verdicts.sort(key=lambda e: (e["root"], e["file"]))
+
+    # Bind every eval to a discovered run via its adapter path; unbound
+    # evals prove nothing and are blockers (symmetric discovery).
+    runs_by_adapter = {(rv["root"], _norm_adapter(rv["dir"])): rv
+                       for rv in run_verdicts}
+    for ev in eval_verdicts:
+        target = runs_by_adapter.get(
+            (ev["root"], _norm_adapter(ev.get("adapter"))))
+        ev["bound_run"] = (f"{target['root']}/{target['dir']}"
+                           if target else None)
 
     # ---- 4B quarantine -----------------------------------------------------
     quarantine = analyze_quarantine(scanned) if results_4b.is_dir() else {}
@@ -783,11 +1117,22 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
     if proof is None and not dry_run and not skip_proof_tests:
         proof = run_proof_tests(repo_root, log_path=proof_log_path)
 
+    # ---- inputs unchanged? ----------------------------------------------------
+    fingerprints_after = {
+        "results_2b": source_fingerprint(results_2b),
+        "results_4b": source_fingerprint(results_4b),
+    }
+    inputs_unchanged = fingerprints_before == fingerprints_after
+    if not inputs_unchanged:
+        raise GateExecutionError(
+            "input trees changed while the gate was running; no verdict is "
+            "trustworthy")
+
     # ---- prerequisites -------------------------------------------------------
     two_b_runs = [rv for rv in run_verdicts if rv["root"] == "2b"]
-    # Only checkpoints that are candidates for reuse gate the strict-load
-    # prerequisite; quarantined rejected 4B payloads are negative evidence
-    # and stay classified/inventoried without blocking READY.
+    # Retained candidates = every non-rejected run carrying a checkpoint
+    # payload (the retained 2B tree AND live 4B trees); quarantined negative
+    # evidence stays classified/inventoried without gating strict-load.
     candidate_ckpt_rvs = [rv for rv in run_verdicts
                           if rv.get("checkpoint")
                           and rv["scope"] == "retained_candidate"]
@@ -800,22 +1145,25 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
                    for c in ckpt_infos)
     n_corrupt = sum(c.get("classification") == CKPT_CORRUPT
                     for c in ckpt_infos)
+    n_invalid = sum(c.get("classification") == CKPT_INVALID
+                    for c in ckpt_infos)
     n_loadable = sum(c.get("classification") == CKPT_LOADABLE
                      for c in ckpt_infos)
-    n_dupes = sum("duplicate_of" in c for c in ckpt_infos)
-    n_bf16 = sum(any(str(r).startswith("non_fp32_trainables_stored")
-                     for r in c.get("reasons", []))
-                 for c in ckpt_infos)
+    n_nonfp32 = sum(c.get("classification") == CKPT_NON_FP32_PAYLOAD
+                    for c in ckpt_infos)
+    n_bf16 = n_nonfp32 + sum(
+        any(str(r).startswith("non_fp32_trainables_stored")
+            for r in c.get("reasons", []))
+        for c in ckpt_infos)
 
     prereqs: list[dict] = []
 
     def prereq(pid, status, detail):
         prereqs.append({"id": pid, "status": status, "detail": detail})
 
-    prereq(PREREQ_INVENTORY,
-           STATUS_PROVEN if not errors else STATUS_FAILED,
-           f"{len(scanned)} files hashed"
-           + ("" if not errors else f"; {len(errors)} unreadable"))
+    prereq(PREREQ_INVENTORY, STATUS_PROVEN,
+           f"{len(scanned)} files hashed; streaming input fingerprints "
+           f"taken before and after the gate and matched")
 
     schema_failures = [rv["run_id"] for rv in two_b_runs
                        if rv.get("report_problems")]
@@ -828,42 +1176,86 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
     prereq(PREREQ_REPORTS,
            STATUS_PROVEN if reports_ok else STATUS_FAILED,
            (f"{len(two_b_runs)}/{len(two_b_runs)} retained 2B reports fully "
-            f"schema-valid with pinned revision + suite hash matching the "
-            f"recomputed behavioral-v2 suite"
+            f"schema-valid with pinned revision + finite metrics + suite "
+            f"hash matching the recomputed behavioral-v2 suite"
             if reports_ok else
             f"{len(schema_failures)} 2B reports carry schema violations "
             f"(missing fields are blockers): "
             + "; ".join(
                 f"{rv['run_id']}: {','.join(rv['report_problems'])}"
-                for rv in sorted(two_b_runs,
-                                 key=lambda r: r["run_id"])
+                for rv in sorted(two_b_runs, key=lambda r: r["run_id"])
                 if rv.get("report_problems"))))
 
+    ckpt_strict_ok = (not dry_run and n_ckpts > 0 and n_loadable == n_ckpts
+                      and not orphan_ckpts and not dup_binding_groups)
     prereq(PREREQ_CKPT_STRICT,
-           STATUS_PROVEN if n_loadable == n_ckpts and n_ckpts > 0
-           else STATUS_FAILED,
-           (f"{n_loadable}/{n_ckpts} checkpoints strictly loadable with "
-            f"in-bundle identity; {n_legacy} legacy-unbound, {n_corrupt} "
-            f"corrupt, {n_dupes} duplicate-membered"))
+           STATUS_PROVEN if ckpt_strict_ok else STATUS_FAILED,
+           ("dry run skips payload loading; classification unproven"
+            if dry_run else
+            f"{n_loadable}/{n_ckpts} checkpoints strictly loadable with "
+            f"in-bundle identity and VERIFIED fp32 payload tensors; "
+            f"{n_legacy} legacy-unbound, {n_corrupt} corrupt, {n_invalid} "
+            f"invalid, {n_nonfp32} non-fp32-payload, "
+            f"{len(orphan_ckpts)} orphan, {len(dup_binding_groups)} "
+            f"ambiguous duplicate bindings"))
 
-    non_rescorable = [e for e in eval_verdicts
-                      if e.get("status") == MISSING_RAW_PREDICTION]
+    bad_evals = [e for e in eval_verdicts
+                 if e.get("status") in EVAL_BAD_STATUSES]
     rescored = [e for e in eval_verdicts
-                if e.get("status") == "RESCORED_CORRECTED"]
+                if e.get("status") == RESCORED_CORRECTED]
+    orphan_evals = [e for e in eval_verdicts if e.get("bound_run") is None]
+
+    eligible_rvs = [rv for rv in candidate_ckpt_rvs
+                    if rv["root"] == "2b"
+                    and rv.get("checkpoint", {}).get("classification")
+                    == CKPT_LOADABLE]
+    identity_mismatches: list[str] = []
+    coverage_gaps: list[str] = []
+    covered_runs: list[str] = []
+    if not dry_run:
+        for rv in eligible_rvs:
+            rid = f"{rv['root']}/{rv['dir']}"
+            ident = rv.get("identity") or {}
+            covered = set()
+            for ev in eval_verdicts:
+                if ev.get("bound_run") != rid:
+                    continue
+                if ev.get("status") != RESCORED_CORRECTED:
+                    continue
+                if ev.get("model") != ident.get("model_id") \
+                        or ev.get("revision") != ident.get("revision") \
+                        or ev.get("suite_sha256_matches_current_suite") \
+                        is not True:
+                    identity_mismatches.append(f"{ev['file']} vs {rid}")
+                    continue
+                covered.add(ev.get("split"))
+            missing = [s for s in REQUIRED_SPLITS if s not in covered]
+            if missing:
+                coverage_gaps.append(f"{rid}: missing {','.join(missing)}")
+            else:
+                covered_runs.append(rid)
+
     if dry_run:
         rescore_status, rescore_detail = STATUS_UNPROVEN, \
             "eval payload inspection skipped (dry run)"
-    elif non_rescorable:
+    elif (bad_evals or orphan_evals or identity_mismatches or coverage_gaps
+            or not eligible_rvs or not eval_verdicts):
         rescore_status = STATUS_FAILED
-        rescore_detail = (f"{len(non_rescorable)}/{len(eval_verdicts)} "
-                          f"retained 2B eval files retain only derived "
-                          f"correct/rank_of_gold — corrected rescoring "
-                          f"impossible offline")
-    elif eval_verdicts:
-        rescore_status = STATUS_PROVEN
-        rescore_detail = f"{len(rescored)} eval files rescored"
+        parts = [
+            f"{len(rescored)}/{len(eval_verdicts)} eval files rescored",
+            f"{len(bad_evals)} invalid/unrescorable",
+            f"{len(orphan_evals)} unbound",
+            f"{len(identity_mismatches)} identity mismatches",
+            f"{len(coverage_gaps)} runs with required-split gaps",
+        ]
+        rescore_detail = "retained-eval evidence incomplete: " \
+            + "; ".join(parts)
     else:
-        rescore_status, rescore_detail = STATUS_UNPROVEN, "no eval files"
+        rescore_status = STATUS_PROVEN
+        rescore_detail = (f"{len(rescored)} eval files rescored; all "
+                          f"{len(eligible_rvs)} loadable retained checkpoints "
+                          f"covered on {'+'.join(REQUIRED_SPLITS)} with "
+                          f"exact identity binding")
     prereq(PREREQ_RESCORE, rescore_status, rescore_detail)
 
     selection_ok = all(
@@ -901,17 +1293,29 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
 
     quarantine_ok = bool(quarantine) and \
         quarantine.get("quarantine_marker_present") and \
+        not quarantine.get("rejected_batch_empty") and \
+        not quarantine.get("marker_only_empty_quarantine") and \
+        not quarantine.get("live_tree_duplicates_quarantine") and \
         not quarantine.get("only_in_live") and \
-        not quarantine.get("live_tree_duplicates_quarantine")
+        not quarantine.get("live_invalid_runs")
+    if quarantine_ok:
+        qdetail = ("rejected NaN batch nonempty + markered + fully "
+                   "contained; live trees hold no duplicate or invalid 4B "
+                   "artifacts")
+    elif not quarantine:
+        qdetail = "no 4B root scanned"
+    else:
+        qdetail = (f"marker_present="
+                   f"{quarantine.get('quarantine_marker_present')}, "
+                   f"batch_empty={quarantine.get('rejected_batch_empty')}, "
+                   f"marker_only_empty="
+                   f"{quarantine.get('marker_only_empty_quarantine')}, "
+                   f"live_duplicates_quarantine="
+                   f"{quarantine.get('live_tree_duplicates_quarantine')}, "
+                   f"only_in_live={len(quarantine.get('only_in_live', []))}, "
+                   f"live_invalid={quarantine.get('live_invalid_runs', [])}")
     prereq(PREREQ_QUARANTINE,
-           STATUS_PROVEN if quarantine_ok else STATUS_FAILED,
-           ("rejected NaN batch fully quarantined; live tree clean"
-            if quarantine_ok else
-            f"marker_present="
-            f"{quarantine.get('quarantine_marker_present')}, "
-            f"live_duplicates_quarantine="
-            f"{quarantine.get('live_tree_duplicates_quarantine')}, "
-            f"only_in_live={len(quarantine.get('only_in_live', []))}"))
+           STATUS_PROVEN if quarantine_ok else STATUS_FAILED, qdetail)
 
     status_of = {p["id"]: p["status"] for p in prereqs}
 
@@ -923,8 +1327,6 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
                          "smallest_next_action":
                              BLOCKER_ACTIONS.get(code, NEXT_ACTION_GENERIC)})
 
-    if errors:
-        blocker("INVENTORY_UNREADABLE_FILES", "; ".join(sorted(errors)))
     if precision_missing:
         blocker("REPORT_TRAINABLE_PRECISION_MISSING",
                 f"{len(precision_missing)}/{len(two_b_runs)} 2B reports lack "
@@ -933,11 +1335,15 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
         blocker("REPORT_SCHEMA_MISSING_FIELDS",
                 f"{len(schema_failures)}/{len(two_b_runs)} 2B reports "
                 f"violate the required train-report schema")
+    if suite_mismatch:
+        blocker("REPORT_SUITE_HASH_MISMATCH",
+                f"{len(suite_mismatch)}/{len(two_b_runs)} 2B reports pin a "
+                f"suite hash different from the current recomputed suite")
     if n_bf16:
         blocker("TRAINABLES_NOT_FP32_IN_RETAINED_CHECKPOINTS",
-                f"{n_bf16}/{n_ckpts} retained checkpoints store LoRA "
-                f"trainables in bf16, contradicting the fp32-trainables "
-                f"prerequisite at artifact level")
+                f"{n_bf16}/{n_ckpts} retained checkpoints store floating "
+                f"trainables in non-fp32 dtypes (validated from bundle "
+                f"payloads, not report strings)")
     if n_legacy:
         blocker("CKPT_LEGACY_UNBOUND_IDENTITY",
                 f"{n_legacy}/{n_ckpts} checkpoints are plain state dicts "
@@ -946,22 +1352,87 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
     if n_corrupt:
         blocker("CKPT_CORRUPT",
                 f"{n_corrupt}/{n_ckpts} checkpoints are corrupt/non-finite")
-    if status_of[PREREQ_RESCORE] != STATUS_PROVEN and non_rescorable:
+    if n_invalid:
+        blocker("CKPT_INVALID_IDENTITY",
+                f"{n_invalid}/{n_ckpts} checkpoints violate bundle identity/"
+                f"schema requirements")
+    if orphan_ckpts:
+        blocker("ORPHAN_CHECKPOINT",
+                f"{len(orphan_ckpts)} checkpoint file(s) have no owning "
+                f"discovered run directory: "
+                + ", ".join(f"{f.label}/{f.rel}"
+                            for f in sorted(orphan_ckpts,
+                                            key=lambda x: (x.label, x.rel))))
+    if dup_binding_groups:
+        blocker("DUPLICATE_CHECKPOINT_BINDING",
+                f"{len(dup_binding_groups)} byte-identical checkpoint group(s) "
+                f"span multiple run directories (ambiguous binding): "
+                + "; ".join(g["members"][0] + "+" +
+                            str(len(g["members"]) - 1) + " more"
+                            for g in dup_binding_groups[:5]))
+    if bad_evals:
+        by_status: dict[str, int] = {}
+        for e in bad_evals:
+            by_status[e["status"]] = by_status.get(e["status"], 0) + 1
+        summary = ", ".join(f"{k}={v}" for k, v in sorted(by_status.items()))
+        listing = "; ".join(f"{e['file']}:{e['status']}"
+                            for e in bad_evals[:8])
+        blocker("EVAL_FILE_INVALID",
+                f"{len(bad_evals)}/{len(eval_verdicts)} eval files cannot "
+                f"support the rescore prerequisite ({summary}): {listing}")
+    non_rescorable = [e for e in eval_verdicts
+                      if e.get("status") == MISSING_RAW_PREDICTION]
+    if non_rescorable:
+        listing = "; ".join(f"{e['file']}" for e in non_rescorable[:8])
         blocker(MISSING_RAW_PREDICTION,
                 f"{len(non_rescorable)}/{len(eval_verdicts)} eval files "
-                f"cannot be rescored: records lack raw scorer inputs")
-    if status_of[PREREQ_SELECTION] != STATUS_PROVEN:
+                f"retain only derived correct/rank_of_gold (or reference "
+                f"unknown examples) — corrected rescoring impossible "
+                f"offline: {listing}")
+    if orphan_evals:
+        blocker("ORPHAN_EVAL_FILE",
+                f"{len(orphan_evals)} eval file(s) carry an adapter path that "
+                f"resolves to no discovered run directory: "
+                + ", ".join(e["file"] for e in orphan_evals[:8]))
+    if identity_mismatches:
+        blocker("EVAL_IDENTITY_MISMATCH",
+                f"{len(identity_mismatches)} eval file(s) bound to a run but "
+                f"scored under a different model/revision/suite hash: "
+                + "; ".join(identity_mismatches[:8]))
+    if coverage_gaps:
+        blocker("EVAL_SPLIT_COVERAGE_MISSING",
+                f"{len(coverage_gaps)}/{len(eligible_rvs)} loadable retained "
+                f"checkpoints lack valid rescored evidence on required splits: "
+                + "; ".join(coverage_gaps[:8]))
+    if status_of[PREREQ_RESCORE] != STATUS_PROVEN and not bad_evals \
+            and not orphan_evals and not identity_mismatches \
+            and not coverage_gaps and not dry_run:
+        blocker(MISSING_RAW_PREDICTION,
+                "no loadable fp32 retained checkpoint has complete "
+                "corrected raw eval evidence; nothing is proven by this "
+                "evidence set")
+    if status_of[PREREQ_SELECTION] != STATUS_PROVEN and not dry_run:
         blocker("SELECTION_PROVENANCE_NOT_CORRECTED",
-                "every reported best_step was selected by the invalidated "
-                "historical metric; the corrected selector is implemented "
-                "and tested but applicable to no retained history")
+                "reported best_step provenance does not satisfy the "
+                "corrected-metric selection prerequisite for this evidence")
     if quarantine.get("live_tree_duplicates_quarantine"):
         blocker("LIVE_4B_DUPLICATES_REJECTED_NAN_BATCH",
-                f"LIVE 4B runs/ tree byte-duplicates the rejected NaN batch "
-                f"({len(quarantine['live_vs_rejected_identical_files'])} "
-                f"identical files incl. all 8 train reports)")
-    if not quarantine.get("quarantine_marker_present"):
+                f"LIVE 4B runs/ tree holds {len(quarantine['live_vs_rejected_identical_files'])} "
+                f"byte-duplicate file(s) from the rejected NaN batch "
+                f"({', '.join(quarantine['live_vs_rejected_identical_files'][:6])}"
+                f"{'…' if len(quarantine['live_vs_rejected_identical_files']) > 6 else ''})")
+    if quarantine.get("live_invalid_runs"):
+        blocker("LIVE_INVALID_4B_ARTIFACTS",
+                f"known-invalid artifacts remain LIVE in the 4B tree: "
+                f"{quarantine.get('live_invalid_runs')} "
+                f"(NaN final loss / degenerate accuracy >= 1 / unreadable)")
+    if not quarantine.get("quarantine_marker_present") and quarantine:
         blocker("QUARANTINE_MARKER_MISSING", "REJECTED.md absent")
+    if quarantine.get("rejected_batch_empty") or \
+            quarantine.get("marker_only_empty_quarantine"):
+        blocker("QUARANTINE_BATCH_EMPTY",
+                "quarantine tree carries no rejected train_report artifacts "
+                "(marker-only empty quarantine proves nothing)")
     if proof and not proof["all_passed"]:
         blocker("PROOF_TESTS_FAILED", f"pytest rc={proof['returncode']}")
 
@@ -981,14 +1452,16 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
         f"{len(quarantine.get('rejected_run_dirs', []))} rejected 4B run "
         f"directories by content scan, not by a hand list",
         f"hashed {len(scanned)} files "
-        f"({sum(f.size for f in scanned)} bytes)",
+        f"({sum(f.size for f in scanned)} bytes); bounded streaming "
+        f"fingerprints before/after match: "
+        f"{fingerprints_before['results_2b']['merkle_sha256'][:12]}… / "
+        f"{fingerprints_before['results_4b']['merkle_sha256'][:12]}…",
         f"{sum(rv.get('suite_sha256_matches_current_suite') is True for rv in two_b_runs)}"
-        f"/{len(two_b_runs)} 2B reports pin suite hash dc24147b… which "
-        f"matches the locally recomputed behavioral-v2 suite digest",
+        f"/{len(two_b_runs)} 2B reports pin the locally recomputed "
+        f"behavioral-v2 suite digest",
         f"{sum((rv.get('selection_check') or {}).get('consistent_with_reported') is True for rv in two_b_runs)}"
         f"/{len(two_b_runs)} reported best_step values reproduce exactly "
-        f"from their own val_history (poisoning was metric-level, not "
-        f"bookkeeping-level)",
+        f"from their own val_history",
         finiteness_line,
     ]
 
@@ -1003,11 +1476,18 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
         "checkpoints_loadable": n_loadable,
         "checkpoints_legacy_unbound": n_legacy,
         "checkpoints_corrupt": n_corrupt,
-        "checkpoints_duplicate_membered": n_dupes,
+        "checkpoints_invalid": n_invalid,
         "checkpoints_non_fp32_stored": n_bf16,
+        "checkpoints_orphan": len(orphan_ckpts),
+        "checkpoints_duplicate_binding_groups": len(dup_binding_groups),
         "eval_files_checked": len(eval_verdicts),
         "eval_files_rescored_corrected": len(rescored),
-        "eval_files_missing_raw_prediction": len(non_rescorable),
+        "eval_files_missing_raw_prediction": len(non_rescorable := [
+            e for e in eval_verdicts
+            if e.get("status") == MISSING_RAW_PREDICTION]),
+        "eval_files_invalid_or_unbound": len(bad_evals) + len(orphan_evals),
+        "eligible_checkpoints_fully_covered": len(covered_runs),
+        "eligible_checkpoints_with_gaps": len(coverage_gaps),
     }
 
     gate_verdict = {
@@ -1019,6 +1499,10 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
             "results_2b": str(results_2b),
             "results_4b": str(results_4b),
             "proof_tests_executed": proof is not None,
+            "source_fingerprints": {
+                **fingerprints_before,
+                "unchanged_during_gate": True,
+            },
         },
         "counts": counts,
         "prerequisites": prereqs,
@@ -1035,15 +1519,22 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
     artifact_verdicts = {
         "schema_version": GATE_SCHEMA_VERSION,
         "gate": {"id": GATE_ID, "variant": GATE_VARIANT},
-        "runs": sorted(run_verdicts, key=lambda r: (r["root"], r["run_id"])),
+        "runs": sorted(run_verdicts, key=lambda r: (r["root"], r["dir"])),
+        "orphan_checkpoints": sorted(orphan_verdicts,
+                                     key=lambda o: o["id"]),
         "evaluations": eval_verdicts,
         "quarantine_4b": quarantine,
+        "duplicate_checkpoint_bindings": dup_binding_groups,
+        "required_splits": list(REQUIRED_SPLITS),
+        "coverage": {"fully_covered_runs": covered_runs,
+                     "gap_runs": coverage_gaps,
+                     "identity_mismatches": identity_mismatches},
         "proof_tests": None if proof is None else {
             "all_passed": proof["all_passed"],
             "returncode": proof["returncode"],
             "nodes": proof["nodes"],
         },
-        "scan_errors": sorted(errors),
+        "scan_errors": [],
     }
 
     report_md = render_markdown(gate_verdict)
@@ -1080,6 +1571,18 @@ def render_markdown(v: dict) -> str:
     lines += ["## Positive proofs", ""]
     for s in v["positive_proofs"]:
         lines.append(f"- {s}")
+    fp = (v.get("inputs") or {}).get("source_fingerprints") or {}
+    if fp:
+        lines += [
+            "",
+            "## Input integrity",
+            "",
+            f"- streaming SHA-256 fingerprints taken before AND after the "
+            f"gate matched (`unchanged_during_gate`), so the verdict "
+            f"describes exactly these inputs:",
+            f"- results_2b merkle `{fp.get('results_2b', {}).get('merkle_sha256', '?')}`",
+            f"- results_4b merkle `{fp.get('results_4b', {}).get('merkle_sha256', '?')}`",
+        ]
     lines += [
         "",
         "## Reproduction",
@@ -1129,48 +1632,63 @@ def main(argv=None) -> int:
                     help="do not write telemetry_timestamp.json")
     args = ap.parse_args(argv)
 
+    def exec_error(msg: str) -> int:
+        print(f"execution error: {msg}", file=sys.stderr)
+        return 2
+
     repo_root = Path.cwd()
     results_2b, results_4b = Path(args.results_2b), Path(args.results_4b)
+    out_dir = Path(args.out)
     if not results_2b.is_dir() or not results_4b.is_dir():
-        print(f"execution error: input roots missing "
-              f"({results_2b}, {results_4b})", file=sys.stderr)
-        return 2
+        return exec_error(
+            f"input roots missing ({results_2b}, {results_4b})")
+    # Fail BEFORE any write: --out must not equal, sit inside, or contain
+    # either input root (the gate must never self-inventory its outputs).
+    if paths_overlap(out_dir, results_2b) or paths_overlap(out_dir, results_4b):
+        return exec_error(
+            f"--out {out_dir} overlaps an input root "
+            f"({results_2b} or {results_4b}); refusing to write")
+
     try:
         result = run_gate(results_2b, results_4b, repo_root=repo_root,
                           dry_run=args.dry_run,
                           skip_proof_tests=args.skip_proof_tests,
-                          proof_log_path=Path(args.out) / "proof_tests.log")
+                          proof_log_path=out_dir / "proof_tests.log")
+    except GateExecutionError as e:
+        return exec_error(str(e))
     except Exception as e:  # noqa: BLE001
         import traceback
 
         traceback.print_exc()
-        print(f"execution error: {e}", file=sys.stderr)
-        return 2
+        return exec_error(f"{type(e).__name__}: {e}")
 
-    out_dir = Path(args.out)
-    inv_bytes = canonical_json_bytes(result.inventory)
-    verd_bytes = canonical_json_bytes(result.artifact_verdicts)
-    write_canonical(out_dir / "artifact_inventory.json", result.inventory)
-    write_canonical(out_dir / "artifact_verdicts.json",
-                    result.artifact_verdicts)
-    result.gate_verdict["artifact_digests"] = {
-        "artifact_inventory.json": hashlib.sha256(inv_bytes).hexdigest(),
-        "artifact_verdicts.json": hashlib.sha256(verd_bytes).hexdigest(),
-    }
-    write_canonical(out_dir / "gate_verdict.json", result.gate_verdict)
-    (out_dir / "GATE_REPORT.md").write_text(result.report_md,
-                                            encoding="utf-8")
-    if not args.no_telemetry:
-        import time
+    try:
+        inv_bytes = canonical_json_bytes(result.inventory)
+        verd_bytes = canonical_json_bytes(result.artifact_verdicts)
+        write_canonical(out_dir / "artifact_inventory.json", result.inventory)
+        write_canonical(out_dir / "artifact_verdicts.json",
+                        result.artifact_verdicts)
+        result.gate_verdict["artifact_digests"] = {
+            "artifact_inventory.json": hashlib.sha256(inv_bytes).hexdigest(),
+            "artifact_verdicts.json": hashlib.sha256(verd_bytes).hexdigest(),
+        }
+        write_canonical(out_dir / "gate_verdict.json", result.gate_verdict)
+        (out_dir / "GATE_REPORT.md").write_text(result.report_md,
+                                                encoding="utf-8")
+        if not args.no_telemetry:
+            import time
 
-        write_canonical(out_dir / "telemetry_timestamp.json", {
-            "note": "the ONLY wall-clock output; never referenced by "
-                    "canonical verdicts",
-            "telemetry_generated_at_utc": time.strftime(
-                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        })
+            write_canonical(out_dir / "telemetry_timestamp.json", {
+                "note": "the ONLY wall-clock output; never referenced by "
+                        "canonical verdicts",
+                "telemetry_generated_at_utc": time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            })
+    except OSError as e:
+        return exec_error(f"cannot write gate outputs under {out_dir}: {e}")
+
     print(f"{result.verdict}: {len(result.gate_verdict['blockers'])} "
-          f"blocker(s) -> {out_dir/'gate_verdict.json'}")
+          f"blocker(s) -> {out_dir / 'gate_verdict.json'}")
     return _exit_for(result.verdict)
 
 

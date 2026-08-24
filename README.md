@@ -85,16 +85,25 @@ uv run python -m bench.run_bench --exact --json .rcc_bench/results.json
 ## No-spend integrity gate (latent evidence)
 
 Deterministic, hardware-free-capable gate over the retained 2B/4B artifacts:
-inventories + hashes every file, validates train-report pins, classifies
-checkpoints via safe/strict bundle loading, checks rescoring eligibility,
-verifies 4B NaN-batch quarantine, and emits one canonical verdict.
+inventories + hashes every file, validates train-report pins (strict JSON,
+finite metrics, non-negative integer steps), classifies checkpoints via
+safe/strict identity-bound bundle loading with FP32 verified from the
+payload tensors, joins every retained checkpoint to exact-model/revision/
+suite eval evidence covering both ID and OOD splits, discovers orphans and
+duplicate bindings symmetrically, verifies the rejected 4B batch is nonempty,
+markered and fully contained, proves inputs unchanged via before/after
+streaming fingerprints, and emits one canonical verdict.
 
 ```bash
 uv run python -m latent_lab.bench.no_spend_gate   # full mode (CPU-only; runs proof regressions)
 uv run python -m latent_lab.bench.no_spend_gate --dry-run   # hashes/metadata only
 ```
 
-Exit codes: `0` READY · `1` NOT_READY · `2` execution error.
+Exit codes: `0` READY · `1` NOT_READY · `2` execution error (bad invocation,
+unreadable inputs, inputs mutated mid-run, unwritable outputs). `--out` may
+never overlap an input root. Every known fail-open is a blocker; negative
+controls for each audited fail-open are pinned in
+`tests/test_no_spend_gate.py`.
 Canonical outputs under `.rcc_work/no_spend_gate_20260824/` are byte-stable
 across reruns against unchanged inputs and contain no wall-clock value (the
 only timestamp lives in the separate `telemetry_timestamp.json`).
