@@ -23,11 +23,19 @@ Three responsibilities live here:
     object, group count/order, fields, per-group Parameter identities
     and order) back bit-exactly, without ever masking or replacing the
     original step exception. A state graph that cannot be captured
-    exactly (unsupported layouts, conjugate/neg bits, cross-dtype shared
-    storage) fails closed during preflight — before clipping or
-    stepping. The transaction set is derived from the
-    optimizer's own groups, so Parameters omitted by the caller stay
-    covered.
+    exactly (tensor subclasses, meta tensors, unsupported devices,
+    unsupported layouts, conjugate/neg bits, cross-dtype shared storage,
+    or a unique-storage byte total above the configured budget) fails
+    closed during preflight — before clipping or stepping. The
+    transaction set is derived from the optimizer's own groups, so
+    Parameters omitted by the caller stay covered.
+
+    PERFORMANCE BOUNDARY: the transaction never serializes state to CPU
+    and never copies per-leaf; it pays exactly ONE on-device clone per
+    unique backing storage plus per-tensor metadata/finiteness reads.
+    Paid Vast/CUDA training remains blocked until a target-CUDA A/B
+    benchmark shows <= 5% median AND p95 step-time regression versus the
+    unguarded baseline; no CUDA measurements are claimed anywhere here.
 """
 
 from __future__ import annotations
@@ -83,6 +91,36 @@ class OptimizerStateGraphError(CheckpointError):
 
 BUNDLE_KIND = "latent_lab.adapter_bundle"
 BUNDLE_FORMAT_VERSION = 1
+
+# -- stable OptimizerStateGraphError reason codes ---------------------------
+# Every fail-closed rejection carries one bracketed code as the first token
+# of its message so callers/tests can dispatch on it stably.
+REASON_TENSOR_SUBCLASS = "tensor-subclass"
+REASON_META_DEVICE = "meta-device"
+REASON_UNSUPPORTED_DEVICE = "unsupported-device"
+REASON_SPARSE_LAYOUT = "sparse-layout"
+REASON_NESTED_LAYOUT = "nested-layout"
+REASON_MKLDNN_LAYOUT = "mkldnn-layout"
+REASON_UNSUPPORTED_LAYOUT = "unsupported-layout"
+REASON_QUANTIZED = "quantized-tensor"
+REASON_CONJUGATE_VIEW = "conjugate-view"
+REASON_NEG_VIEW = "neg-bit-view"
+REASON_CROSS_DTYPE_STORAGE = "cross-dtype-shared-storage"
+REASON_BUDGET_EXCEEDED = "state-byte-budget-exceeded"
+REASON_POST_STEP_UNINSPECTABLE = "post-step-uninspectable-state"
+
+# Device types on which an exact whole-extent storage clone is known to
+# work. Anything else fails closed during preflight (documented, stable
+# ``unsupported-device`` reason) rather than risking a lossy transaction.
+_SUPPORTED_STATE_DEVICE_TYPES = frozenset({"cpu", "cuda", "mps"})
+
+# Default ceiling on the SUM of unique backing-storage bytes the state
+# snapshot may clone (16 GiB). This accommodates honest fp32 AdamW state —
+# exp_avg + exp_avg_sq (+ max_exp_avg_sq for amsgrad) for ~1B parameters,
+# including hidden storage extents — while bounding the damage of a tiny
+# view silently aliasing a huge backing store. Override per call with the
+# ``state_byte_budget`` keyword.
+DEFAULT_STATE_BYTE_BUDGET_BYTES = 1 << 34
 
 
 def _require_torch() -> None:
@@ -363,26 +401,122 @@ def _collect_state_tensors(obj, out, active, done) -> None:
         done.add(oid)
 
 
+def _capturable_rejection_reason(t, *, allow_parameter: bool = False):
+    """Stable reason code (or ``None``) for why tensor ``t`` cannot be
+    captured and restored EXACTLY as the same semantic type.
+
+    Tensor subclasses are rejected because the snapshot machinery rebuilds
+    plain ``torch.Tensor`` leaves; a subclass instance would silently lose
+    its semantic type on rollback (``allow_parameter`` relaxes this ONLY
+    for live Parameters, whose identity — not class — the parameter
+    rollback preserves)."""
+    if type(t) is not torch.Tensor:
+        if allow_parameter and type(t) is torch.nn.Parameter:
+            pass
+        else:
+            return REASON_TENSOR_SUBCLASS
+    if t.is_sparse:
+        return REASON_SPARSE_LAYOUT
+    if t.is_nested:
+        return REASON_NESTED_LAYOUT
+    if t.layout != torch.strided:
+        if t.layout == torch.mkldnn:
+            return REASON_MKLDNN_LAYOUT
+        return REASON_UNSUPPORTED_LAYOUT
+    if t.is_quantized:
+        return REASON_QUANTIZED
+    if t.is_meta:
+        return REASON_META_DEVICE
+    if t.device.type not in _SUPPORTED_STATE_DEVICE_TYPES:
+        return REASON_UNSUPPORTED_DEVICE
+    if t.is_conj():
+        return REASON_CONJUGATE_VIEW
+    if t.is_neg():
+        return REASON_NEG_VIEW
+    return None
+
+
+def _storage_identity_key(t) -> tuple:
+    """Device-safe unique-storage identity.
+
+    Keyed by ``(device type, device index, storage _cdata)`` — never by
+    ``data_ptr`` alone: raw addresses from different device address spaces
+    can collide numerically, while ``_cdata`` is process-global per
+    allocation and keeps even distinct EMPTY storages separate."""
+    dev = t.device
+    return (dev.type, dev.index, t.untyped_storage()._cdata)
+
+
 def _require_capturable_state_graph(tensors) -> None:
     """Fail closed when the reachable tensor/storage graph cannot be
-    captured and restored exactly: unsupported layouts (sparse/nested/
-    quantized/mkldnn), conjugate/neg bitwise views, or ONE backing
-    storage viewed at TWO dtypes."""
+    captured and restored exactly: tensor subclasses, meta tensors,
+    unsupported devices, unsupported layouts (sparse/nested/quantized/
+    mkldnn), conjugate/neg bitwise views, or ONE backing storage viewed
+    at TWO dtypes."""
     seen_dtype = {}
     for t in tensors:
-        if (t.layout != torch.strided or t.is_sparse or t.is_nested
-                or t.is_quantized or t.is_conj() or t.is_neg()):
+        reason = _capturable_rejection_reason(t)
+        if reason is not None:
             raise OptimizerStateGraphError(
-                f"optimizer-state tensor (shape={tuple(t.shape)}, "
-                f"layout={t.layout}) cannot be captured exactly")
-        st = t.untyped_storage()
-        known = seen_dtype.get(st._cdata)
+                f"[{reason}] optimizer-state tensor (shape={tuple(t.shape)}, "
+                f"dtype={t.dtype}, device={t.device}, layout={t.layout}) "
+                f"cannot be captured and restored exactly")
+        key = _storage_identity_key(t)
+        known = seen_dtype.get(key)
         if known is None:
-            seen_dtype[st._cdata] = t.dtype
+            seen_dtype[key] = t.dtype
         elif known is not t.dtype:
             raise OptimizerStateGraphError(
-                f"cross-dtype shared storage in optimizer state "
-                f"({known} vs {t.dtype}) cannot be captured exactly")
+                f"[{REASON_CROSS_DTYPE_STORAGE}] cross-dtype shared storage "
+                f"in optimizer state ({known} vs {t.dtype}) cannot be "
+                f"captured exactly")
+
+
+def _unique_storage_bytes(tensors) -> int:
+    """Overflow-safe sum of FULL backing-storage extents over UNIQUE
+    storages (Python ints cannot overflow; each storage counted once via
+    its device-safe identity key). A 2-element view over a 4 GiB backing
+    store therefore counts 4 GiB — what a snapshot must actually clone."""
+    seen, total = set(), 0
+    for t in tensors:
+        key = _storage_identity_key(t)
+        if key in seen:
+            continue
+        seen.add(key)
+        total += int(t.untyped_storage().nbytes())
+    return total
+
+
+def _require_state_bytes_within_budget(tensors, budget) -> int:
+    """Fail closed BEFORE any clone when unique storage bytes exceed the
+    configured snapshot budget; returns the counted total."""
+    counted = _unique_storage_bytes(tensors)
+    if counted > budget:
+        raise OptimizerStateGraphError(
+            f"[{REASON_BUDGET_EXCEEDED}] optimizer-state graph needs "
+            f"{counted} unique storage bytes, exceeding the configured "
+            f"state_byte_budget of {budget} bytes; refusing to clone")
+    return counted
+
+
+def _tensor_values_finite(t) -> bool:
+    """Finiteness including COMPLEX tensors: NaN/Inf in either component
+    makes a complex tensor non-finite (plain ``is_floating_point()``
+    checks miss complex dtypes entirely)."""
+    if t.is_floating_point() or t.is_complex():
+        return bool(torch.isfinite(t).all())
+    return True
+
+
+def _require_state_finite(tensors) -> None:
+    """Reject pre-existing non-finite optimizer-state values (complex
+    included) BEFORE any mutation."""
+    for i, t in enumerate(tensors):
+        if not _tensor_values_finite(t):
+            kind = "complex " if t.is_complex() else ""
+            raise NonFiniteTrainingStateError(
+                f"refusing optimizer.step: non-finite {kind}"
+                f"optimizer-state tensor #{i} (dtype={t.dtype})")
 
 
 def _rebuild_view(storage, template) -> torch.Tensor:
@@ -394,7 +528,7 @@ def _rebuild_view(storage, template) -> torch.Tensor:
         tuple(template.shape), tuple(template.stride()))
 
 
-def _capture_optimizer_state(state) -> tuple:
+def _capture_optimizer_state(state, *, byte_budget: int) -> tuple:
     """Structural snapshot of ``optimizer.state`` that preserves the FULL
     reachable storage graph: one cloned storage per unique backing
     storage cloned across its WHOLE extent (not just the visible region),
@@ -403,11 +537,17 @@ def _capture_optimizer_state(state) -> tuple:
     snapshot storage, and repeated references to the same Tensor object
     kept as ONE snapshot object. Returns ``(original_mapping_object,
     snapshot_tree)`` so rollback can also undo a hostile rebind of the
-    mapping itself. Raises ``OptimizerStateGraphError`` before any
-    mutation when the graph is not exactly capturable."""
+    mapping itself. Raises ``OptimizerStateGraphError`` before ANY clone
+    when the graph is not exactly capturable (subclasses, meta tensors,
+    unsupported devices/layouts, conjugate/neg bits, cross-dtype shared
+    storage) or when its unique storage bytes exceed ``byte_budget``;
+    raises ``NonFiniteTrainingStateError`` for pre-existing non-finite
+    state values, complex included — all strictly before any mutation."""
     tensors: list = []
     _collect_state_tensors(state, tensors, set(), set())
     _require_capturable_state_graph(tensors)
+    _require_state_bytes_within_budget(tensors, byte_budget)
+    _require_state_finite(tensors)
     snap_tensors: dict = {}
     snap_storages: dict = {}
 
@@ -417,10 +557,11 @@ def _capture_optimizer_state(state) -> tuple:
             if got is not None:
                 return got
             st = obj.untyped_storage()
-            snap_st = snap_storages.get(st._cdata)
+            key = _storage_identity_key(obj)
+            snap_st = snap_storages.get(key)
             if snap_st is None:
                 snap_st = st.clone()
-                snap_storages[st._cdata] = snap_st
+                snap_storages[key] = snap_st
             out = _rebuild_view(snap_st, obj)
             snap_tensors[id(obj)] = out
             return out
@@ -437,7 +578,7 @@ def _capture_optimizer_state(state) -> tuple:
 
 def _tree_is_finite(obj) -> bool:
     if torch.is_tensor(obj):
-        return not obj.is_floating_point() or bool(torch.isfinite(obj).all())
+        return _tensor_values_finite(obj)
     if isinstance(obj, dict):
         return all(_tree_is_finite(v) for v in obj.values())
     if isinstance(obj, (list, tuple)):
@@ -486,7 +627,7 @@ def _restore_optimizer_state(optimizer, snap) -> None:
     installed: dict = {}
 
     def fresh_storage(snap_t):
-        key = snap_t.untyped_storage()._cdata
+        key = _storage_identity_key(snap_t)
         st = fresh_storages.get(key)
         if st is None:
             st = snap_t.untyped_storage().clone()
@@ -498,12 +639,13 @@ def _restore_optimizer_state(optimizer, snap) -> None:
         if memo is not None:
             return memo                      # repeated reference: same obj
         if (torch.is_tensor(live)
+                and _capturable_rejection_reason(live) is None
                 and live.dtype == snap_t.dtype
-                and live.device == snap_t.device
-                and live.layout == torch.strided
-                and not live.is_sparse and not live.is_nested
-                and not live.is_quantized
-                and not live.is_conj() and not live.is_neg()):
+                and live.device == snap_t.device):
+            # in-place rebind ONLY for a live leaf that is itself an exact-
+            # inspectable plain dense tensor; anything the step injected
+            # (sparse/meta/quantized/subclass/conj/neg) is replaced by a
+            # fresh exact view instead of being set_ through.
             with torch.no_grad():
                 live.set_(fresh_storage(snap_t), snap_t.storage_offset(),
                           tuple(snap_t.shape), tuple(snap_t.stride()))
@@ -621,18 +763,71 @@ def _restore_param_groups(optimizer, snap) -> None:
     live[:] = rebuilt               # drop injected groups, restore order
 
 
-def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
+def _require_post_step_transaction_valid(params, optimizer) -> None:
+    """Post-step validation that can never silently pass an uninspectable
+    transaction: every live Parameter and every reachable optimizer-state
+    tensor must still be exactly inspectable (no sparse/meta/quantized/
+    nested/subclass/conj/neg swap) AND finite, complex values included.
+    Raises ``OptimizerStateGraphError`` (stable
+    ``[post-step-uninspectable-state]`` reason) for uninspectable leaves
+    and ``NonFiniteTrainingStateError`` for non-finite values; callers
+    must roll back the whole transaction on ANY exception from here."""
+    for p in params:
+        reason = _capturable_rejection_reason(p, allow_parameter=True)
+        if reason is not None:
+            raise OptimizerStateGraphError(
+                f"[{REASON_POST_STEP_UNINSPECTABLE}] parameter became "
+                f"uninspectable ({reason}) after optimizer.step")
+        if not _tensor_values_finite(p.detach()):
+            raise NonFiniteTrainingStateError(
+                "parameters became non-finite after optimizer.step")
+    tensors: list = []
+    _collect_state_tensors(optimizer.state, tensors, set(), set())
+    for t in tensors:
+        reason = _capturable_rejection_reason(t)
+        if reason is not None:
+            raise OptimizerStateGraphError(
+                f"[{REASON_POST_STEP_UNINSPECTABLE}] optimizer-state tensor "
+                f"became uninspectable ({reason}) after optimizer.step")
+    for t in tensors:
+        if not _tensor_values_finite(t):
+            raise NonFiniteTrainingStateError(
+                "optimizer state became non-finite after optimizer.step")
+
+
+def guarded_optimizer_step(optimizer, loss, params, clip_norm, *,
+                           state_byte_budget=None) -> None:
     """Step only when everything is finite; roll back completely otherwise.
+
+    ``state_byte_budget``: optional ceiling (int bytes) on the SUM of
+    unique backing-storage bytes the state snapshot may clone. ``None``
+    uses ``DEFAULT_STATE_BYTE_BUDGET_BYTES`` (16 GiB — sized for honest
+    fp32 AdamW state up to ~1B parameters including amsgrad and hidden
+    extents). A tiny view over a huge backing store counts its FULL
+    extent, so pathological aliasing cannot silently clone unbounded
+    memory; exceedance fails closed with the stable
+    ``[state-byte-budget-exceeded]`` reason before clipping/stepping.
+    Must be ``None`` or a non-negative ``int`` (``bool`` rejected);
+    invalid values raise ``ValueError`` before any mutation.
 
     Transactional contract:
       * PRE-STEP (before any mutation): finite loss, positive finite clip,
         finite parameters, finite gradients and a finite total gradient
         norm. Any rejection here performs no step and mutates nothing.
       * STATE-GRAPH PREFLIGHT: the reachable optimizer-state tensor/
-        storage graph must be exactly capturable — every strided dense
-        tensor at one dtype per backing storage — or the whole call
-        raises ``OptimizerStateGraphError`` BEFORE clipping or stepping,
-        claiming no lossy transaction.
+        storage graph must be exactly capturable — no tensor subclasses,
+        meta tensors, unsupported devices or layouts (sparse/nested/
+        quantized/mkldnn), no conjugate/neg views, every strided dense
+        tensor at one dtype per device-keyed unique storage, unique
+        storage bytes within budget, and all state values finite
+        (complex NaN/Inf included) — or the whole call raises
+        ``OptimizerStateGraphError`` / ``NonFiniteTrainingStateError``
+        BEFORE clipping or stepping, claiming no lossy transaction.
+      * COMPLETE SNAPSHOT BEFORE MUTATION: state, gradients, parameters
+        AND the full param-group topology/deepcopy all complete BEFORE
+        ``clip_grad_norm_`` runs; if any snapshot operation fails (e.g. a
+        hostile group field whose deepcopy raises), gradients were never
+        clipped and no object was touched.
       * Gradients are rechecked after clipping; a post-clip rejection also
         restores the pre-clip gradients.
       * Every trainable parameter, every pre-clip gradient (including the
@@ -643,31 +838,53 @@ def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
         every group field, and each group's live Parameter identities in
         exact order) are snapshotted before ``optimizer.step()``. The
         state snapshot clones each unique backing storage across its
-        WHOLE extent, rebuilds every leaf with exact shape/dtype/device/
-        layout/strides/storage-offset, keeps views of one storage sharing
-        one snapshot storage, keeps repeated references to the same
-        Tensor object as ONE object, and preserves the original
+        WHOLE extent — exactly ONE on-device clone per unique storage,
+        keyed by ``(device type/index, _cdata)``, never by ``data_ptr``
+        alone — rebuilds every leaf with exact shape/dtype/device/layout/
+        strides/storage-offset, keeps views of one storage sharing one
+        snapshot storage, keeps repeated references to the same Tensor
+        object as ONE object, and preserves the original
         ``optimizer.state`` mapping object. If the step raises, or any
-        post-step parameter or optimizer-state tensor is non-finite, all
-        of it — parameters, gradients, the complete state storage graph
+        post-step parameter or optimizer-state tensor is non-finite
+        (complex included) or has become uninspectable (sparse/meta/
+        quantized/subclass/...), or validation itself crashes, ALL of it
+        — parameters, gradients, the complete state storage graph
         (aliasing, extents, injected fields removed) and the full
         param-group structure down to outer-list identity — is restored
-        exactly while keeping the live Parameter identities; a state leaf
-        whose dtype/device was swapped mid-step is replaced by a fresh
-        exact view rather than copied through, so rollback itself can
-        never raise a size/dtype mismatch. A hostile rebind of the
-        optimizer.state mapping is undone. The original step exception is
-        then re-raised intact (rollback failures chain onto it as
-        __cause__, never replacing it). The optimizer remains usable
-        after rollback.
+        exactly while keeping the live Parameter identities; only then is
+        the stable guard error raised (``NonFiniteTrainingStateError``,
+        or ``OptimizerStateGraphError`` chaining the validation failure),
+        so a failed validation can never leave an applied update behind.
+        A state leaf whose dtype/device was swapped mid-step is replaced
+        by a fresh exact view rather than copied through, so rollback
+        itself can never raise a size/dtype mismatch. A hostile rebind of
+        the optimizer.state mapping is undone. The original step
+        exception is always re-raised intact after an exact rollback
+        (rollback failures chain onto it as __cause__, never replacing
+        it). The optimizer remains usable after rollback.
       * The caller-supplied ``params`` iterable is never trusted as
         exhaustive: the authoritative transaction/finite-check set is the
         deterministic first-occurrence union of the supplied Parameters
         with every Parameter owned by the optimizer's param_groups, so no
         optimizer-owned Parameter can be updated by ``optimizer.step()``
         without snapshot, post-check and rollback coverage.
+      * PERFORMANCE BOUNDARY: no CPU serialization, no per-leaf copies;
+        exactly one on-device clone per unique backing storage. Paid
+        Vast/CUDA training remains blocked until a target-CUDA A/B shows
+        <= 5% median AND p95 step-time regression; none are claimed.
     """
     _require_torch()
+    # -- configuration validation: nothing has been mutated yet --------------
+    if state_byte_budget is None:
+        budget = DEFAULT_STATE_BYTE_BUDGET_BYTES
+    elif (isinstance(state_byte_budget, bool)
+          or not isinstance(state_byte_budget, int)
+          or state_byte_budget < 0):
+        raise ValueError(
+            "state_byte_budget must be None or a non-negative int "
+            f"(bytes); got {state_byte_budget!r}")
+    else:
+        budget = state_byte_budget
     # -- pre-step validation: nothing has been mutated yet -------------------
     if loss is None or not torch.is_tensor(loss) \
             or not bool(torch.isfinite(loss.detach()).all()):
@@ -700,14 +917,16 @@ def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
             "refusing optimizer.step: non-finite gradient norm "
             "(clip would silently zero it)")
 
-    # -- transaction preflight: still nothing has been mutated ---------------
+    # -- transaction preflight + COMPLETE snapshot: still nothing mutated ----
     # The optimizer-state storage graph must be exactly capturable BEFORE
     # clipping or stepping: an exotic graph that could not be restored
     # verbatim must fail closed here rather than claim a lossy transaction.
-    state_snap = _capture_optimizer_state(optimizer.state)
+    state_snap = _capture_optimizer_state(optimizer.state, byte_budget=budget)
 
     grad_snap = {id(p): (None if p.grad is None else p.grad.detach().clone())
                  for p in params}
+    param_snap = [p.detach().clone() for p in params]
+    groups_snap = _snapshot_param_groups(optimizer)
 
     def restore_grads() -> None:
         with torch.no_grad():
@@ -728,9 +947,7 @@ def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
             raise NonFiniteTrainingStateError(
                 "gradients became non-finite after clipping")
 
-    # -- transaction: snapshot everything the step may corrupt ---------------
-    param_snap = [p.detach().clone() for p in params]
-    groups_snap = _snapshot_param_groups(optimizer)
+    # -- transaction: everything is snapshotted; step may corrupt it --------
 
     def restore_params() -> None:
         with torch.no_grad():
@@ -751,12 +968,26 @@ def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
         except BaseException as rollback_error:  # never mask the original
             raise step_error from rollback_error
         raise
-    for p in params:  # recheck after update
-        if not bool(torch.isfinite(p.detach()).all()):
+    # -- POST-STEP VALIDATION IS TRANSACTIONAL -------------------------------
+    # A successful step whose validation fails (non-finite values,
+    # uninspectable injected leaves, or a crashing check) must never leave
+    # the applied update behind: roll back the WHOLE transaction first,
+    # then raise the stable guard error.
+    try:
+        _require_post_step_transaction_valid(params, optimizer)
+    except BaseException as validation_error:
+        if isinstance(validation_error,
+                      (OptimizerStateGraphError, NonFiniteTrainingStateError)):
+            guard = validation_error
+        else:
+            guard = OptimizerStateGraphError(
+                "post-step validation crashed after a successful "
+                f"optimizer.step ({validation_error!r}); rolled back the "
+                "whole transaction")
+            guard.__cause__ = validation_error
+        try:
             rollback()
-            raise NonFiniteTrainingStateError(
-                "parameters became non-finite after optimizer.step")
-    if not _tree_is_finite(optimizer.state):
-        rollback()
-        raise NonFiniteTrainingStateError(
-            "optimizer state became non-finite after optimizer.step")
+        except BaseException as rollback_error:
+            guard.__cause__ = rollback_error
+            raise guard
+        raise guard
