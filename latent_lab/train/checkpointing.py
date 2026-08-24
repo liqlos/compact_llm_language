@@ -21,8 +21,17 @@ Three responsibilities live here:
     param-group topology (the original outer list object, group
     count/order, fields, per-group Parameter identities and order) back
     bit-exactly, without ever masking or replacing the original step
-    exception. The transaction set is derived from the optimizer's own
-    groups, so Parameters omitted by the caller stay covered.
+    exception. The state snapshot runs a fail-closed preflight BEFORE
+    gradient clipping and mutates nothing on rejection: unsupported
+    tensors (sparse/quantized/nested/meta, subclasses, unsupported
+    devices, conj/neg views), invalid storage bounds or a unique-storage
+    byte total over the configurable budget
+    (DEFAULT_STATE_STORAGE_BUDGET_BYTES) raise
+    OptimizerStateSnapshotError instead of falling back to per-leaf
+    clones; rollback also reinstates the original optimizer.state mapping
+    object if a hostile step rebound it. The transaction set is derived
+    from the optimizer's own groups, so Parameters omitted by the caller
+    stay covered.
 """
 
 from __future__ import annotations
@@ -57,6 +66,28 @@ class NonFiniteStateError(CheckpointError):
 
 class NonFiniteTrainingStateError(CheckpointError):
     """Loss/gradients/parameters/clip-norm were non-finite at step time."""
+
+
+class OptimizerStateSnapshotError(CheckpointError):
+    """optimizer.state held a case the exact snapshot refuses (fail-closed).
+
+    Raised BEFORE any mutation (in particular before gradient clipping):
+    unsupported tensor kinds (sparse/quantized/nested/meta, conj/neg
+    views), unsupported tensor subclasses or devices, storage bounds that
+    cannot hold the recorded views, or a unique-storage byte total over
+    the configured budget. There is no silent per-leaf clone fallback.
+    """
+
+
+# Fail-closed ceiling on the TOTAL bytes of unique optimizer-state
+# storages snapshotted per guarded step (configurable per call via
+# ``state_storage_budget_bytes``). Prevents a tiny view from silently
+# snapshotting an enormous backing storage.
+DEFAULT_STATE_STORAGE_BUDGET_BYTES = 1 << 30
+
+# Devices whose untyped storages the exact snapshot supports; anything
+# else (meta and exotic accelerators included) is rejected preflight.
+_SUPPORTED_STATE_DEVICE_TYPES = frozenset({"cpu", "cuda"})
 
 
 class AdapterBundleError(CheckpointError):
@@ -366,37 +397,104 @@ class _StateStorageSlot:
 class _StateTensorLeaf:
     """Snapshot record of one distinct tensor object in the state tree.
 
-    Strided leaves are recorded as (storage slot, dtype, size, stride,
-    storage offset, requires_grad); any leaf whose layout cannot be
-    rebuilt over raw storage bytes falls back to an opaque detached
-    clone. Repeated references to the same object share one leaf node,
+    Strided leaves are recorded as (storage slot, dtype, device, size,
+    stride, storage offset, requires_grad). Unsupported cases are
+    REJECTED before any mutation (fail-closed); there is no fallback
+    path. Repeated references to the same object share one leaf node,
     so restore reproduces the reference graph, not just values."""
 
-    __slots__ = ("slot", "dtype", "size", "stride", "offset",
-                 "requires_grad", "opaque")
+    __slots__ = ("slot", "dtype", "device", "size", "stride", "offset",
+                 "requires_grad")
 
-    def __init__(self, *, slot=None, dtype=None, size=None, stride=None,
-                 offset=0, requires_grad=False, opaque=None):
+    def __init__(self, *, slot, dtype, device, size, stride, offset,
+                 requires_grad):
         self.slot = slot
         self.dtype = dtype
+        self.device = device
         self.size = size
         self.stride = stride
         self.offset = offset
         self.requires_grad = requires_grad
-        self.opaque = opaque
 
 
 class _OptimizerStateSnapshot:
     """Structurally complete snapshot of ``optimizer.state``: the tree of
     containers/tensor-leaf nodes/original non-tensor objects plus every
-    distinct reachable storage slot with its full raw bytes."""
+    distinct reachable storage slot with its full raw bytes, AND the
+    identity of the original ``optimizer.state`` mapping object itself."""
 
-    __slots__ = ("slots", "slot_leaves", "tree")
+    __slots__ = ("slots", "slot_leaves", "tree", "mapping")
 
     def __init__(self):
         self.slots = []
         self.slot_leaves = []
         self.tree = None
+        self.mapping = None
+
+
+def _storage_key(ust, empty_token=None) -> tuple:
+    """Collision-safe unique-storage key: device plus true storage
+    identity (``_cdata`` where supported), never ``(data_ptr, nbytes)``
+    alone — distinct empty storages share ``data_ptr 0``/0 bytes but have
+    distinct identities and must never collapse into one slot. Without
+    ``_cdata``, non-empty storages fall back to their (live-unique)
+    ``data_ptr`` and empty ones to the caller-supplied per-snapshot
+    token (snapshot side: always-fresh ⇒ never merged; planning side:
+    ``None`` ⇒ conservatively collapsible, which can only force the
+    coherent rebuild path, never a wrong in-place claim)."""
+    dev = (str(ust.device.type), ust.device.index)
+    cdata = getattr(ust, "_cdata", None)
+    if cdata is not None:
+        return (dev, "cdata", int(cdata))
+    if ust.nbytes() == 0:
+        return (dev, "empty", empty_token)
+    return (dev, "ptr", ust.data_ptr())
+
+
+def _reject_unsupported(reason: str):
+    raise OptimizerStateSnapshotError(
+        f"optimizer state cannot be snapshotted exactly ({reason}); "
+        "refusing before any mutation (fail-closed)")
+
+
+def _preflight_state_tensor(t) -> None:
+    """Fail-closed rejection of every tensor case the exact storage-graph
+    snapshot cannot reconstruct bit-exactly. Called during the snapshot,
+    which itself runs BEFORE gradient clipping and before any mutation."""
+    if type(t) is not torch.Tensor and type(t) is not torch.nn.Parameter:
+        _reject_unsupported(f"tensor subclass {type(t).__name__}")
+    if t.is_sparse or getattr(t, "is_sparse_csr", False) \
+            or t.layout != torch.strided:
+        _reject_unsupported(f"non-strided layout {t.layout}")
+    if t.is_nested or t.is_quantized:
+        _reject_unsupported("nested/quantized tensor")
+    if t.device.type == "meta" or \
+            t.device.type not in _SUPPORTED_STATE_DEVICE_TYPES:
+        _reject_unsupported(f"unsupported device {t.device}")
+    if t.is_conj() or t.is_neg():
+        _reject_unsupported("conjugate/negative bit view")
+    try:
+        ust = t.untyped_storage()
+        nbytes, udev = ust.nbytes(), ust.device
+        shape, strides = tuple(t.shape), tuple(t.stride())
+        offset = t.storage_offset()
+        esize = t.element_size()
+    except Exception as e:  # noqa: BLE001 - exotic tensor: fail closed
+        raise OptimizerStateSnapshotError(
+            f"optimizer state tensor has no usable untyped storage "
+            f"({e}); refusing before any mutation (fail-closed)") from e
+    if udev != t.device:
+        _reject_unsupported(f"storage device {udev} != tensor {t.device}")
+    if any(s < 0 for s in strides) or offset < 0:
+        _reject_unsupported("negative stride/storage offset")
+    last = offset
+    for size, stride in zip(shape, strides):
+        if size > 0:
+            last += (size - 1) * stride
+    needed = last * esize + (esize if t.numel() > 0 else 0)
+    if needed > nbytes:
+        _reject_unsupported(
+            f"view needs {needed} storage bytes beyond {nbytes}")
 
 
 def _full_storage_bytes(tensor, storage, nbytes):
@@ -408,7 +506,7 @@ def _full_storage_bytes(tensor, storage, nbytes):
     return src.clone()
 
 
-def _snapshot_state_tree(state) -> _OptimizerStateSnapshot:
+def _snapshot_state_tree(state, budget_bytes) -> _OptimizerStateSnapshot:
     """Capture the FULL reachable storage graph of ``optimizer.state``.
 
     Every distinct tensor object becomes one leaf node carrying its exact
@@ -417,43 +515,50 @@ def _snapshot_state_tree(state) -> _OptimizerStateSnapshot:
     clone of the complete storage. Views (offset/non-dense strides),
     shared-storage aliases between different leaves and repeated
     references to one object are therefore all preserved exactly, which
-    ``detach().clone()`` per leaf cannot do."""
+    ``detach().clone()`` per leaf cannot do.
+
+    Fail-closed: unsupported tensor kinds (sparse/quantized/nested/meta,
+    subclasses, unsupported devices, conj/neg views), storage bounds that
+    cannot hold a recorded view, or a unique-storage byte total over
+    ``budget_bytes`` raise ``OptimizerStateSnapshotError`` — there is no
+    silent per-leaf clone fallback. Storages are identified by device +
+    ``_cdata`` (never ``(data_ptr, nbytes)``, which collapses empties).
+    The original mapping object is retained by identity so rollback can
+    reinstate it if a hostile step rebound ``optimizer.state``."""
     snap = _OptimizerStateSnapshot()
-    slot_of_ptr = {}
+    snap.mapping = state
+    slot_of_key = {}
     leaf_of_obj = {}
+    budget_used = 0
+    empty_counter = iter(range(1 << 62))
 
     def capture_leaf(t, path):
+        nonlocal budget_used
         node = leaf_of_obj.get(id(t))
         if node is not None:
-            if node.slot is not None:
-                snap.slot_leaves[node.slot].append((path, node))
+            snap.slot_leaves[node.slot].append((path, node))
             return node
-        rg = bool(t.requires_grad)
-        slot_idx = None
-        if t.layout == torch.strided:
-            try:
-                ust = t.untyped_storage()
-                ptr, nbytes, dev = ust.data_ptr(), ust.nbytes(), ust.device
-            except Exception:  # noqa: BLE001 - exotic tensor: opaque below
-                ust = None
-            if ust is not None:
-                slot_idx = slot_of_ptr.get(ptr)
-                if slot_idx is None:
-                    snap.slots.append(_StateStorageSlot(
-                        _full_storage_bytes(t, ust, nbytes), nbytes, dev))
-                    slot_idx = len(snap.slots) - 1
-                    slot_of_ptr[ptr] = slot_idx
-                    snap.slot_leaves.append([])
-        if slot_idx is not None:
-            node = _StateTensorLeaf(
-                slot=slot_idx, dtype=t.dtype, size=tuple(t.shape),
-                stride=tuple(t.stride()), offset=t.storage_offset(),
-                requires_grad=rg)
-            snap.slot_leaves[slot_idx].append((path, node))
-        else:
-            node = _StateTensorLeaf(
-                dtype=t.dtype, requires_grad=rg,
-                opaque=t.detach().clone())
+        _preflight_state_tensor(t)
+        ust = t.untyped_storage()
+        key = _storage_key(ust, empty_token=next(empty_counter))
+        slot_idx = slot_of_key.get(key)
+        if slot_idx is None:
+            nbytes = ust.nbytes()
+            budget_used += nbytes
+            if budget_used > budget_bytes:
+                _reject_unsupported(
+                    f"unique storage bytes {budget_used} exceed the "
+                    f"configured snapshot budget {budget_bytes}")
+            slot_idx = len(snap.slots)
+            snap.slots.append(_StateStorageSlot(
+                _full_storage_bytes(t, ust, nbytes), nbytes, t.device))
+            slot_of_key[key] = slot_idx
+            snap.slot_leaves.append([])
+        node = _StateTensorLeaf(
+            slot=slot_idx, dtype=t.dtype, device=t.device,
+            size=tuple(t.shape), stride=tuple(t.stride()),
+            offset=t.storage_offset(), requires_grad=bool(t.requires_grad))
+        snap.slot_leaves[slot_idx].append((path, node))
         leaf_of_obj[id(t)] = node
         return node
 
@@ -496,7 +601,8 @@ def _leaf_matches_live(live, leaf, slot) -> bool:
             or tuple(live.shape) != leaf.size \
             or tuple(live.stride()) != leaf.stride \
             or live.storage_offset() != leaf.offset \
-            or live.device != slot.device:
+            or live.device != slot.device \
+            or bool(live.requires_grad) != leaf.requires_grad:
         return False
     try:
         ust = live.untyped_storage()
@@ -511,12 +617,14 @@ def _plan_state_slot_restore(state, snap) -> list:
     A slot restores IN PLACE through the live objects only when EVERY
     referencing leaf still exists at its path with bit-identical
     metadata and all of them still share ONE live storage of exactly the
-    snapshotted size/device, uniquely claimed by this slot. Then the
-    pristine bytes are copied back wholesale — live tensor objects and
-    their aliasing stay untouched. Any structural divergence (replaced
-    leaf, swapped metadata, broken/merged/split sharing, missing entry)
-    forces a REBUILD: fresh storage from the raw byte clone, every leaf
-    re-homed onto it with its exact metadata."""
+    snapshotted size/device (identified collision-safely by device +
+    ``_cdata``), uniquely claimed by this slot. Then the pristine bytes
+    are copied back wholesale — live tensor objects and their aliasing
+    stay untouched. Any structural divergence (replaced leaf, swapped
+    metadata or requires_grad, broken/merged/split sharing, missing
+    entry) forces a REBUILD: fresh storage from the raw byte clone,
+    every leaf of the group re-homed onto it with its exact metadata —
+    never a torn per-view repair of one alias group."""
     plans = [("rebuild", None) for _ in snap.slots]
     claimed = set()
     for idx, slot in enumerate(snap.slots):
@@ -530,15 +638,15 @@ def _plan_state_slot_restore(state, snap) -> list:
             live_map[path] = live
         if not ok:
             continue
-        ptrs = {live.untyped_storage().data_ptr()
+        keys = {_storage_key(live.untyped_storage())
                 for live in live_map.values()}
-        if len(ptrs) != 1:
+        if len(keys) != 1:
             continue
-        ptr = next(iter(ptrs))
-        if ptr in claimed:
+        key = next(iter(keys))
+        if key in claimed:
             continue
         plans[idx] = ("inplace", live_map)
-        claimed.add(ptr)
+        claimed.add(key)
     with torch.no_grad():
         for idx, (kind, _) in enumerate(plans):
             if kind != "inplace":
@@ -591,12 +699,6 @@ def _materialize_state_node(node, ctx, path):
     storage-faithful reconstructions over one fresh shared storage,
     non-tensor originals are rebound by identity."""
     if isinstance(node, _StateTensorLeaf):
-        if node.slot is None:      # opaque layout: rebind a fresh clone
-            if id(node) not in ctx.memo:
-                ctx.memo[id(node)] = (
-                    node.opaque.detach().clone()
-                    if torch.is_tensor(node.opaque) else node.opaque)
-            return ctx.memo[id(node)]
         kind, live_map = ctx.plans[node.slot]
         if kind == "inplace":
             return live_map[path]
@@ -617,15 +719,20 @@ def _restore_optimizer_state(optimizer, snap) -> None:
     """Roll ``optimizer.state`` back to the snapshot exactly.
 
     Values AND the full storage graph are restored: every tensor's
-    dtype/device/layout/shape/strides/storage_offset, shared-storage
-    alias relationships among leaves, repeated tensor objects (one
-    object stays one object) and all non-tensor fields by original
-    identity. Hostilely injected keys are dropped; hostile removals and
-    replacements are overwritten with the snapshot reconstruction.
-    Restoration never routes a mismatched copy through ``Tensor.copy_``:
-    incompatible subtrees are rebound wholesale, so rollback itself
-    cannot raise a shape/dtype/size error."""
-    state = optimizer.state
+    dtype/device/layout/shape/strides/storage_offset/requires_grad,
+    shared-storage alias relationships among leaves, repeated tensor
+    objects (one object stays one object) and all non-tensor fields by
+    original identity. If a hostile step rebound the ``optimizer.state``
+    ATTRIBUTE to a different mapping object, the original snapshot-time
+    mapping is reinstated by assignment first, so any reference to it
+    stays authoritative; hostilely injected keys are then dropped and
+    hostile removals/replacements overwritten with the snapshot
+    reconstruction. Restoration never routes a mismatched copy through
+    ``Tensor.copy_``: incompatible subtrees are rebound wholesale, so
+    rollback itself cannot raise a shape/dtype/size error."""
+    if optimizer.state is not snap.mapping:
+        optimizer.state = snap.mapping    # undo hostile attribute rebind
+    state = snap.mapping
     for key in list(state.keys()):
         if key not in snap.tree:
             del state[key]
@@ -752,13 +859,28 @@ def _restore_param_groups(optimizer, snap) -> None:
     live[:] = rebuilt               # drop injected groups, restore order
 
 
-def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
+def guarded_optimizer_step(optimizer, loss, params, clip_norm, *,
+                           state_storage_budget_bytes=None) -> None:
     """Step only when everything is finite; roll back completely otherwise.
 
     Transactional contract:
       * PRE-STEP (before any mutation): finite loss, positive finite clip,
         finite parameters, finite gradients and a finite total gradient
         norm. Any rejection here performs no step and mutates nothing.
+      * The optimizer-state snapshot (with its fail-closed preflight) and
+        the ``param_groups`` snapshot COMPLETE BEFORE GRADIENT CLIPPING,
+        so a snapshot/preflight rejection leaves parameters, gradients,
+        state, param_groups and the ``optimizer.state`` mapping identity
+        untouched. Preflight rejects, before ANY mutation, every state
+        tensor case the exact snapshot cannot reconstruct: sparse/
+        quantized/nested/meta tensors, tensor subclasses, unsupported
+        devices, conjugate/negative-bit views, invalid storage bounds,
+        or a unique-storage byte total over
+        ``state_storage_budget_bytes`` (default:
+        ``DEFAULT_STATE_STORAGE_BUDGET_BYTES``; the budget bounds the
+        TOTAL unique backing-storage bytes cloned per step so a tiny view
+        cannot silently snapshot an enormous backing storage). There is
+        no silent per-leaf clone fallback.
       * Gradients are rechecked after clipping; a post-clip rejection also
         restores the pre-clip gradients.
       * Every trainable parameter, every pre-clip gradient (including the
@@ -772,15 +894,16 @@ def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
         parameters, gradients, complete optimizer state with every
         tensor's exact shape/dtype/device/layout/stride/storage-offset
         metadata, shared-storage alias relationships between state
-        leaves, repeated tensor objects, injected fields removed — and
-        the full param-group structure down to outer-list identity are
-        restored exactly while keeping the live Parameter identities; a
-        state leaf whose metadata was swapped mid-step is rebound from
-        the pristine snapshot rather than copied through, so rollback
-        itself can never raise a size/dtype mismatch. The original step
-        exception is then re-raised intact (rollback failures chain onto
-        it as __cause__, never replacing it). The optimizer remains
-        usable after rollback.
+        leaves, repeated tensor objects, injected fields removed, and the
+        original ``optimizer.state`` MAPPING object reinstated if a
+        hostile step rebound it — and the full param-group structure down
+        to outer-list identity are restored exactly while keeping the
+        live Parameter identities; a state leaf whose metadata was swapped
+        mid-step is rebound from the pristine snapshot rather than copied
+        through, so rollback itself can never raise a size/dtype mismatch.
+        The original step exception is then re-raised intact (rollback
+        failures chain onto it as __cause__, never replacing it). The
+        optimizer remains usable after rollback.
       * The caller-supplied ``params`` iterable is never trusted as
         exhaustive: the authoritative transaction/finite-check set is the
         deterministic first-occurrence union of the supplied Parameters
@@ -836,6 +959,18 @@ def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
                 else:
                     p.grad.copy_(saved)
 
+    # -- transaction snapshot BEFORE clipping: preflight failure here has
+    # mutated NOTHING (parameters, gradients, state, groups, identities).
+    budget = (DEFAULT_STATE_STORAGE_BUDGET_BYTES
+              if state_storage_budget_bytes is None
+              else int(state_storage_budget_bytes))
+    if budget <= 0:
+        raise OptimizerStateSnapshotError(
+            f"state storage budget must be positive, got "
+            f"{state_storage_budget_bytes!r}")
+    state_snap = _snapshot_state_tree(optimizer.state, budget)
+    groups_snap = _snapshot_param_groups(optimizer)
+
     torch.nn.utils.clip_grad_norm_(params, clip)
     for p, _ in pairs:  # recheck after clipping
         if not bool(torch.isfinite(p.grad).all()):
@@ -843,10 +978,7 @@ def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
             raise NonFiniteTrainingStateError(
                 "gradients became non-finite after clipping")
 
-    # -- transaction: snapshot everything the step may corrupt ---------------
     param_snap = [p.detach().clone() for p in params]
-    state_snap = _snapshot_state_tree(optimizer.state)
-    groups_snap = _snapshot_param_groups(optimizer)
 
     def restore_params() -> None:
         with torch.no_grad():

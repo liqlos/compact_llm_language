@@ -1430,6 +1430,689 @@ def test_poststep_nonfinite_alias_poison_rolls_back_storage_graph():
 
 
 # ---------------------------------------------------------------------------
+# stronger contract (v2): preflight/budget fail-closed snapshot ordering,
+# exotic alias graphs (zero-stride/scalar/empty/cross-dtype/hidden bytes),
+# optimizer.state mapping identity
+# ---------------------------------------------------------------------------
+
+def _cdata_of(t):
+    return t.untyped_storage()._cdata
+
+
+_EXOTIC_KEYS = ("x_base", "x_view", "x_trans", "x_expand", "x_scalar",
+                "x_empty_off", "x_empty_own", "x_u8", "x_f16", "x_repeat")
+
+
+def _safe_base(g, n=8):
+    """Random base whose raw bytes stay FINITE under a float16
+    reinterpretation (so the exotic views do not themselves count as
+    non-finite state corruption)."""
+    while True:
+        base = torch.rand(n, generator=g) * 0.5 - 0.25
+        if bool(torch.isfinite(base.view(torch.float16)).all()):
+            return base
+
+
+def _install_exotic_state(opt, ps, seed):
+    """Install one shared-storage alias graph on ps[0]: base + offset view
+    + transposed view + ZERO-STRIDE expand + scalar WITH storage offset +
+    empty view WITH offset + separately-owned empty storage + cross-dtype
+    uint8/float16 views over the SAME bytes + a repeated reference."""
+    w = ps[0]
+    g = torch.Generator().manual_seed(seed)
+    base = _safe_base(g)
+    st = opt.state[w]
+    st["x_base"] = base
+    st["x_view"] = base[1:5]                      # offset 1
+    st["x_trans"] = base[:6].view(2, 3).t()       # strides (1, 3)
+    st["x_expand"] = base.view(1, 8).expand(4, 8)   # strides (0, 1)
+    st["x_scalar"] = base[3]                      # shape (), offset 3
+    st["x_empty_off"] = base[6:6]                 # shape (0,), offset 6
+    st["x_empty_own"] = torch.empty(0)            # OWN distinct empty storage
+    st["x_u8"] = base.view(torch.uint8)           # cross-dtype, full bytes
+    st["x_f16"] = base.view(torch.float16)[::2]   # strided fp16 view
+    st["x_repeat"] = base                         # repeated tensor OBJECT
+    return base.clone()
+
+
+def _assert_exotic_exact(st, expected_base):
+    """Metadata + value + storage-topology exactness of the exotic graph,
+    against an explicitly captured dense base."""
+    b, v, t = st["x_base"], st["x_view"], st["x_trans"]
+    e, s = st["x_expand"], st["x_scalar"]
+    eo, ew = st["x_empty_off"], st["x_empty_own"]
+    u8, f16, r = st["x_u8"], st["x_f16"], st["x_repeat"]
+    exp = expected_base
+
+    def meta(x, shape, stride, off, dt=torch.float32):
+        return (tuple(x.shape) == shape and tuple(x.stride()) == stride
+                and x.storage_offset() == off and x.dtype == dt
+                and x.device.type == "cpu" and x.layout == torch.strided
+                and not x.requires_grad)
+
+    assert meta(b, (8,), (1,), 0)
+    assert meta(v, (4,), (1,), 1), "offset view lost its storage_offset"
+    assert meta(t, (3, 2), (1, 3), 0), "transposed view metadata drifted"
+    assert meta(e, (4, 8), (0, 1), 0), \
+        f"zero-stride expand lost its stride {tuple(e.stride())}"
+    assert meta(s, (), (), 3), "scalar lost its nonzero storage_offset"
+    assert meta(eo, (0,), (1,), 6), "offset-empty lost its metadata"
+    assert meta(ew, (0,), (1,), 0), "own-empty metadata drifted"
+    assert meta(u8, (32,), (1,), 0, torch.uint8), "u8 view metadata drifted"
+    assert meta(f16, (8,), (2,), 0, torch.float16), \
+        "strided fp16 view metadata drifted"
+    assert r is b, "repeated state reference was split into two objects"
+
+    assert bool(torch.equal(b, exp)), "base values not restored"
+    assert bool(torch.equal(v, exp[1:5])), "view values not restored"
+    assert bool(torch.equal(t, exp[:6].view(2, 3).t()))
+    assert bool(torch.equal(e, exp.view(1, 8).expand(4, 8))), \
+        "zero-stride expand values not restored"
+    assert float(s) == float(exp[3]), "scalar value not restored"
+    assert bool(torch.equal(u8.view(torch.float32), exp)), \
+        "uint8 cross-dtype view bytes not restored"
+    exp_f16 = exp.view(torch.float16)[::2]
+    # NaN-aware bit-value comparison (random bytes may decode to NaN)
+    assert bool(torch.equal(torch.isnan(f16), torch.isnan(exp_f16))) \
+        and bool(torch.equal(f16.nan_to_num(), exp_f16.nan_to_num())), \
+        "strided fp16 view values not restored"
+
+    # topology: every leaf except the own-empty shares ONE storage;
+    # the two distinct empty storages must never collapse into one.
+    shared = {_cdata_of(x) for x in (b, v, t, e, s, eo, u8, f16)}
+    assert len(shared) == 1, "alias leaves do not share exactly one storage"
+    assert _cdata_of(ew) not in shared, \
+        "distinct empty storages were merged"
+    assert b.untyped_storage().nbytes() == 32
+    assert ew.untyped_storage().nbytes() == 0
+
+
+class _ExoticPoisonSGD(torch.optim.SGD):
+    """Real update, then corrupts the aliased graph THROUGH the shared
+    storage, replaces/deletes/injects entries, HIJACKS the
+    ``optimizer.state`` attribute itself onto a foreign mapping, corrupts
+    params/gradients/group topology, and raises a captured exception."""
+
+    def __init__(self, params, lr):
+        super().__init__(params, lr=lr, momentum=0.9)
+        self.armed = False
+        self.foreign = torch.nn.Parameter(torch.zeros(1))
+        self.original_state_map = self.state      # identity captured early
+        self.raised = None
+
+    def step(self, closure=None):
+        super().step(closure)
+        if not self.armed:
+            return
+        w = self.param_groups[0]["params"][0]
+        b = self.param_groups[0]["params"][1]
+        st = self.state[w]
+        with torch.no_grad():
+            st["x_base"].add_(13.0)               # corruption via the alias
+            w.add_(7.0)
+            if b.grad is not None:
+                b.grad.fill_(99.0)                # hostile gradient rewrite
+            for group in self.param_groups:
+                group["lr"] = 123.0
+                group["injected_meta"] = {"evil": [1]}
+        st["x_view"] = torch.zeros(3, dtype=torch.float16)   # wrong dtype+shape
+        del st["x_trans"]                                  # hostile removal
+        st["poison_flag"] = "corrupted"                    # hostile injection
+        g0 = self.param_groups[0]                          # topology rewrite
+        g0["params"].reverse()
+        g0["params"].append(self.foreign)
+        self.state = {"hijacked": True}          # hostile MAPPING rebinding
+        err = RuntimeError("exotic-adversarial failure")
+        self.raised = err
+        raise err
+
+
+class _ExoticInfPoisonSGD(_ExoticPoisonSGD):
+    """Armed variant that poisons ONLY values through the shared storage
+    (no structural rewrite) so post-step finiteness triggers rollback."""
+
+    def step(self, closure=None):
+        super(_ExoticPoisonSGD, self).step(closure)
+        if self.armed:
+            with torch.no_grad():
+                st = self.state[self.param_groups[0]["params"][0]]
+                st["x_far"] = st["x_base"][7:]
+                st["x_far"].mul_(float("inf"))
+
+
+def _exotic_pair(seed, adv_cls=_ExoticPoisonSGD):
+    """Candidate + independent control with identical parameters,
+    momentum state AND identical exotic alias graph installed."""
+    torch.manual_seed(seed)
+    m_adv = torch.nn.Linear(4, 4)
+    m_ctl = torch.nn.Linear(4, 4)
+    m_ctl.load_state_dict(m_adv.state_dict())
+    x = torch.randn(8, 4)
+    ps_adv = list(m_adv.parameters())
+    ps_ctl = list(m_ctl.parameters())
+    opt_adv = adv_cls(ps_adv, lr=0.05)
+    opt_ctl = torch.optim.SGD(ps_ctl, lr=0.05, momentum=0.9)
+
+    def fresh_grads(m):
+        m.zero_grad(set_to_none=True)
+        loss = (m(x) ** 2).mean()
+        loss.backward()
+        return loss
+
+    def ctl_step():
+        fresh_grads(m_ctl)
+        torch.nn.utils.clip_grad_norm_(ps_ctl, 1.0)
+        opt_ctl.step()
+
+    guarded_optimizer_step(opt_adv, fresh_grads(m_adv).detach(), ps_adv, 1.0)
+    ctl_step()
+    exp_adv = _install_exotic_state(opt_adv, ps_adv, seed + 100)
+    exp_ctl = _install_exotic_state(opt_ctl, ps_ctl, seed + 100)
+    assert bool(torch.equal(exp_adv, exp_ctl))
+    return (m_adv, m_ctl, x, ps_adv, ps_ctl, opt_adv, opt_ctl,
+            fresh_grads, ctl_step, exp_adv)
+
+
+def test_exotic_alias_graph_with_zero_stride_expand_rolls_back_exactly():
+    """Zero-stride expand views, scalars/empties with nonzero offsets,
+    repeated references and cross-dtype views all survive rollback with
+    exact metadata, values and shared-storage topology; the hostilely
+    hijacked optimizer.state mapping object is reinstated; the original
+    exception object is re-raised by identity; retry matches control."""
+    (m_adv, m_ctl, x, ps_adv, ps_ctl, opt_adv, opt_ctl,
+     fresh_grads, ctl_step, expected_base) = _exotic_pair(47)
+    w_a = ps_adv[0]
+    original_map = opt_adv.original_state_map
+    assert opt_adv.state is original_map
+
+    opt_adv.armed = True
+    fresh_grads(m_adv)
+    pre_params = _snapshot(ps_adv)
+    pre_ids = _param_group_param_ids(opt_adv)
+
+    with pytest.raises(RuntimeError,
+                       match="exotic-adversarial failure") as e:
+        guarded_optimizer_step(opt_adv, torch.tensor(0.5), ps_adv, 1.0)
+    assert type(e.value) is RuntimeError, \
+        "original step exception was masked by a rollback failure"
+    assert e.value is opt_adv.raised, \
+        "re-raised exception is not the ORIGINAL exception object"
+
+    # hostile mapping rebind undone: the ORIGINAL mapping object is back
+    assert opt_adv.state is original_map, \
+        "rollback did not restore the original optimizer.state mapping"
+    assert "hijacked" not in dict(opt_adv.state.items()), \
+        "hostilely rebound mapping contents leaked through"
+    assert set(opt_adv.state.keys()) == set(original_map.keys())
+
+    assert _unchanged(ps_adv, pre_params), "parameter corruption survived"
+    assert _param_group_param_ids(opt_adv) == pre_ids, \
+        "per-group Parameter identity/order not restored"
+    assert [g["lr"] for g in opt_adv.param_groups] == [0.05], \
+        "mutated LR was not rolled back"
+    assert all("injected_meta" not in g for g in opt_adv.param_groups), \
+        "injected group field survived the rollback"
+
+    st = opt_adv.state[w_a]
+    assert set(st.keys()) == {"momentum_buffer", *_EXOTIC_KEYS}, \
+        "hostilely injected/removed state fields survived rollback"
+    assert st["momentum_buffer"].dtype == torch.float32
+    _assert_exotic_exact(st, expected_base)
+
+    # behavioral alias probe: writes through the base must show up via
+    # the cross-dtype views (proves ONE live shared storage end-to-end)
+    with torch.no_grad():
+        st["x_base"].fill_(0.5)
+        probe = bool(torch.equal(
+            st["x_u8"].view(torch.float32),
+            torch.full((8,), 0.5, dtype=torch.float32)))
+        st["x_base"].copy_(expected_base)
+    assert probe, "cross-dtype views no longer alias the base storage"
+
+    # -- disarmed retry of the SAME update vs independent control ----------
+    opt_adv.armed = False
+    fresh_grads(m_adv)
+    guarded_optimizer_step(opt_adv, (m_adv(x) ** 2).mean(), ps_adv, 1.0)
+    ctl_step()
+
+    assert bool(torch.equal(w_a.detach(), ps_ctl[0].detach())) and \
+        bool(torch.equal(ps_adv[1].detach(), ps_ctl[1].detach())), \
+        "post-retry trajectory diverges from the clean control"
+    assert bool(torch.equal(
+        opt_adv.state[w_a]["momentum_buffer"],
+        opt_ctl.state[ps_ctl[0]]["momentum_buffer"])), \
+        "momentum diverges from the clean control after retry"
+    _assert_exotic_exact(opt_adv.state[w_a], expected_base)
+
+
+def test_poststep_nonfinite_exotic_alias_rolls_back_storage_graph():
+    (m_adv, m_ctl, x, ps_adv, ps_ctl, opt_adv, opt_ctl,
+     fresh_grads, ctl_step, expected_base) = _exotic_pair(
+        49, adv_cls=_ExoticInfPoisonSGD)
+    w_a = ps_adv[0]
+
+    opt_adv.armed = True
+    fresh_grads(m_adv)
+    pre_params = _snapshot(ps_adv)
+    with pytest.raises(NonFiniteTrainingStateError):
+        guarded_optimizer_step(opt_adv, (m_adv(x) ** 2).mean(), ps_adv, 1.0)
+
+    st = opt_adv.state[w_a]
+    assert set(st.keys()) == {"momentum_buffer", *_EXOTIC_KEYS}
+    _assert_exotic_exact(st, expected_base)
+    assert _unchanged(ps_adv, pre_params)
+    assert _param_group_param_ids(opt_adv) == [[id(p) for p in ps_adv]]
+
+    opt_adv.armed = False
+    fresh_grads(m_adv)
+    guarded_optimizer_step(opt_adv, (m_adv(x) ** 2).mean(), ps_adv, 1.0)
+    ctl_step()
+    assert bool(torch.equal(w_a.detach(), ps_ctl[0].detach()))
+
+
+def _install_cross_dtype(opt, ps, seed=151):
+    """float32 base + full-byte uint8 view + strided fp16 view over ONE
+    shared storage; returns a lossless dense copy of the base."""
+    g = torch.Generator().manual_seed(seed)
+    base = _safe_base(g)
+    st = opt.state[ps[0]]
+    st["cd_base"] = base
+    st["cd_u8"] = base.view(torch.uint8)
+    st["cd_f16"] = base.view(torch.float16)[::2]
+    return base.clone()
+
+
+def test_cross_dtype_views_share_one_untyped_storage_after_rollback():
+    """float32 base + uint8 full-byte view + strided float16 view share
+    ONE untyped storage; corrupting all of them and replacing the uint8
+    leaf must roll back onto ONE shared storage with exact dtypes."""
+    torch.manual_seed(51)
+    m_adv = torch.nn.Linear(4, 4)
+    m_ctl = torch.nn.Linear(4, 4)
+    m_ctl.load_state_dict(m_adv.state_dict())
+    x = torch.randn(8, 4)
+    ps_adv = list(m_adv.parameters())
+    ps_ctl = list(m_ctl.parameters())
+    opt_adv = _CrossDtypePoisonSGD(ps_adv, lr=0.05)
+    opt_ctl = torch.optim.SGD(ps_ctl, lr=0.05, momentum=0.9)
+
+    def fresh_grads(m):
+        m.zero_grad(set_to_none=True)
+        loss = (m(x) ** 2).mean()
+        loss.backward()
+        return loss
+
+    def ctl_step():
+        fresh_grads(m_ctl)
+        torch.nn.utils.clip_grad_norm_(ps_ctl, 1.0)
+        opt_ctl.step()
+
+    guarded_optimizer_step(opt_adv, fresh_grads(m_adv).detach(), ps_adv, 1.0)
+    ctl_step()
+    w = ps_adv[0]
+    # separate identically-seeded bases: adv and ctl must NOT share storage
+    expected = _install_cross_dtype(opt_adv, ps_adv)
+    _install_cross_dtype(opt_ctl, ps_ctl)
+
+    opt_adv.armed = True
+    fresh_grads(m_adv)
+    with pytest.raises(RuntimeError, match="cross-dtype failure"):
+        guarded_optimizer_step(opt_adv, torch.tensor(0.5), ps_adv, 1.0)
+
+    st = opt_adv.state[w]
+    assert st["cd_u8"].dtype == torch.uint8 \
+        and st["cd_f16"].dtype == torch.float16, "leaf dtypes not restored"
+    assert _cdata_of(st["cd_base"]) == _cdata_of(st["cd_u8"]) == \
+        _cdata_of(st["cd_f16"]), "cross-dtype leaves do not share ONE storage"
+    assert bool(torch.equal(st["cd_base"], expected)), "base not restored"
+    assert bool(torch.equal(st["cd_u8"].view(torch.float32), expected))
+    assert bool(torch.equal(st["cd_f16"],
+                            expected.view(torch.float16)[::2]))
+    assert bool(torch.equal(
+        st["cd_base"], opt_ctl.state[ps_ctl[0]]["cd_base"]))
+
+    # disarmed retry still matches the control
+    opt_adv.armed = False
+    fresh_grads(m_adv)
+    guarded_optimizer_step(opt_adv, (m_adv(x) ** 2).mean(), ps_adv, 1.0)
+    ctl_step()
+    assert bool(torch.equal(w.detach(), ps_ctl[0].detach()))
+
+
+class _CrossDtypePoisonSGD(torch.optim.SGD):
+    def __init__(self, params, lr):
+        super().__init__(params, lr=lr, momentum=0.9)
+        self.armed = False
+
+    def step(self, closure=None):
+        super().step(closure)
+        if not self.armed:
+            return
+        st = self.state[self.param_groups[0]["params"][0]]
+        with torch.no_grad():
+            st["cd_base"].mul_(-3.0)
+            st["cd_u8"].fill_(123)
+            st["cd_f16"].fill_(999.0)
+        st["cd_u8"] = "junk-not-a-tensor"       # hostile leaf replacement
+        raise RuntimeError("cross-dtype failure")
+
+
+_NARROW_KEYS = ("n_left", "n_right")
+
+
+def _install_narrow_views(opt, ps, seed):
+    """Two small views whose visible ranges cover only part of the
+    backing storage: hidden byte ranges exist OUTSIDE every leaf."""
+    w = ps[0]
+    g = torch.Generator().manual_seed(seed)
+    base = torch.rand(8, generator=g) - 0.5
+    st = opt.state[w]
+    st["n_left"] = base[2:4]          # bytes [8, 16)
+    st["n_right"] = base[6:7]         # bytes [24, 28)
+    return base.clone()
+
+
+def _raw_bytes_view(t):
+    raw = torch.empty(0, dtype=torch.uint8, device=t.device)
+    return raw.set_(t.untyped_storage(), 0,
+                    (t.untyped_storage().nbytes(),), (1,))
+
+
+def test_hidden_backing_bytes_outside_visible_leaves_restored():
+    """A mid-step fill of the WHOLE backing storage (including byte ranges
+    no visible leaf covers) must be fully undone by rollback."""
+    torch.manual_seed(53)
+    m_adv = torch.nn.Linear(4, 4)
+    m_ctl = torch.nn.Linear(4, 4)
+    m_ctl.load_state_dict(m_adv.state_dict())
+    x = torch.randn(8, 4)
+    ps_adv = list(m_adv.parameters())
+    ps_ctl = list(m_ctl.parameters())
+    opt_adv = _HiddenBytePoisonSGD(ps_adv, lr=0.05)
+    opt_ctl = torch.optim.SGD(ps_ctl, lr=0.05, momentum=0.9)
+
+    def fresh_grads(m):
+        m.zero_grad(set_to_none=True)
+        loss = (m(x) ** 2).mean()
+        loss.backward()
+        return loss
+
+    def ctl_step():
+        fresh_grads(m_ctl)
+        torch.nn.utils.clip_grad_norm_(ps_ctl, 1.0)
+        opt_ctl.step()
+
+    guarded_optimizer_step(opt_adv, fresh_grads(m_adv).detach(), ps_adv, 1.0)
+    ctl_step()
+    w = ps_adv[0]
+    expected = _install_narrow_views(opt_adv, ps_adv, 153)
+    _install_narrow_views(opt_ctl, ps_ctl, 153)
+
+    # pristine pre-step FULL backing bytes (captured independently)
+    pristine_raw = _raw_bytes_view(opt_adv.state[w]["n_left"]) \
+        .detach().clone()
+
+    opt_adv.armed = True
+    fresh_grads(m_adv)
+    with pytest.raises(RuntimeError, match="hidden-byte failure"):
+        guarded_optimizer_step(opt_adv, torch.tensor(0.5), ps_adv, 1.0)
+
+    st = opt_adv.state[w]
+    assert set(_NARROW_KEYS) <= set(st.keys())
+    assert bool(torch.equal(st["n_left"], expected[2:4])), \
+        "visible left view not restored"
+    assert bool(torch.equal(st["n_right"], expected[6:7])), \
+        "visible right view not restored"
+    live_raw = _raw_bytes_view(st["n_left"])
+    assert bool(torch.equal(live_raw, pristine_raw)), \
+        "hidden backing bytes outside all visible leaf ranges were " \
+        "not restored"
+
+    # hidden-range spot proof: byte range [28, 32) holds the pristine tail
+    assert bool(torch.equal(live_raw[28:32], pristine_raw[28:32]))
+    # retry matches control
+    opt_adv.armed = False
+    fresh_grads(m_adv)
+    guarded_optimizer_step(opt_adv, (m_adv(x) ** 2).mean(), ps_adv, 1.0)
+    ctl_step()
+    assert bool(torch.equal(w.detach(), ps_ctl[0].detach()))
+    assert bool(torch.equal(
+        st["n_left"], opt_ctl.state[ps_ctl[0]]["n_left"]))
+
+
+class _HiddenBytePoisonSGD(torch.optim.SGD):
+    def __init__(self, params, lr):
+        super().__init__(params, lr=lr, momentum=0.9)
+        self.armed = False
+
+    def step(self, closure=None):
+        super().step(closure)
+        if not self.armed:
+            return
+        st = self.state[self.param_groups[0]["params"][0]]
+        with torch.no_grad():
+            _raw_bytes_view(st["n_left"]).fill_(170)   # whole storage
+        raise RuntimeError("hidden-byte failure")
+
+
+def test_hostile_optimizer_state_rebinding_restores_original_mapping():
+    """A step that REBINDS the optimizer.state attribute to a foreign
+    mapping must be rolled back onto the ORIGINAL mapping object, with
+    exact contents, and remain usable for a retry matching control."""
+    (m_adv, m_ctl, x, ps_adv, ps_ctl, opt_adv, opt_ctl,
+     fresh_grads, ctl_step, expected_base) = _exotic_pair(59)
+    w_a = ps_adv[0]
+    original_map = opt_adv.original_state_map
+
+    opt_adv.armed = True
+    fresh_grads(m_adv)
+    pre_params = _snapshot(ps_adv)
+    with pytest.raises(RuntimeError, match="exotic-adversarial failure"):
+        guarded_optimizer_step(opt_adv, torch.tensor(0.5), ps_adv, 1.0)
+
+    assert opt_adv.state is original_map, \
+        "optimizer.state was not restored to the ORIGINAL mapping object"
+    assert set(opt_adv.state[w_a].keys()) == \
+        {"momentum_buffer", *_EXOTIC_KEYS}, \
+        "state contents differ after mapping restoration"
+    _assert_exotic_exact(opt_adv.state[w_a], expected_base)
+    assert _unchanged(ps_adv, pre_params)
+
+    opt_adv.armed = False
+    fresh_grads(m_adv)
+    guarded_optimizer_step(opt_adv, (m_adv(x) ** 2).mean(), ps_adv, 1.0)
+    ctl_step()
+    assert opt_adv.state is original_map, \
+        "retry did not keep writing into the original mapping object"
+    assert bool(torch.equal(w_a.detach(), ps_ctl[0].detach())), \
+        "post-retry trajectory diverges from the clean control"
+
+
+class _EvilSubclassTensor(torch.Tensor):
+    pass
+
+
+def test_preflight_rejects_unsupported_state_tensors_before_clipping():
+    """Sparse/meta/quantized/subclass state leaves are rejected BEFORE any
+    mutation: gradients are NOT yet clipped, parameters/state/groups and
+    the optimizer.state mapping identity are untouched."""
+    from latent_lab.train.checkpointing import OptimizerStateSnapshotError
+
+    big = torch.full((64,), 10.0)              # norm >> clip: clipping
+    cases = {
+        "sparse-coo": lambda: torch.sparse_coo_tensor(
+            torch.tensor([[0]]), torch.tensor([1.0]), (2,)),
+        "meta": lambda: torch.empty(2, device="meta"),
+        "quantized": lambda: torch.quantize_per_tensor(
+            torch.tensor([1.0, 2.0]), 1.0, 0, torch.qint8),
+        "subclass": lambda: torch.zeros(2).as_subclass(_EvilSubclassTensor),
+    }
+    for name, make_bad in cases.items():
+        torch.manual_seed(61)
+        m = torch.nn.Linear(4, 4)
+        x = torch.randn(6, 4)
+        ps = list(m.parameters())
+        opt = torch.optim.SGD(ps, lr=0.1, momentum=0.9)
+        (m(x) ** 2).mean().backward()          # real non-empty state+grads
+        guarded_optimizer_step(opt, (m(x) ** 2).mean(), ps, 1.0)
+        m.zero_grad(set_to_none=True)
+        (m(x) ** 2).mean().backward()
+        with torch.no_grad():
+            for p in ps:
+                p.grad.copy_(big[:p.grad.numel()].view_as(p))
+        param_snap = _snapshot(ps)
+        grad_snap = [p.grad.detach().clone() for p in ps]
+        groups_snap = _param_groups_snapshot(opt)
+        ids_before = _param_group_param_ids(opt)
+        orig_map = opt.state
+        opt.state[ps[0]]["bad_flag"] = make_bad()
+        bad_leaf = opt.state[ps[0]]["bad_flag"]
+        momentum_snap = opt.state[ps[0]]["momentum_buffer"].detach().clone()
+
+        with pytest.raises(OptimizerStateSnapshotError,
+                           match="fail-closed"):
+            guarded_optimizer_step(opt, (m(x) ** 2).mean(), ps, 1.0)
+        # gradients were NOT clipped (still exactly the huge originals)
+        for p, g0 in zip(ps, grad_snap):
+            assert p.grad is not None and bool(torch.equal(p.grad, g0)), \
+                f"[{name}] gradients moved before the snapshot completed"
+        assert float(torch.linalg.vector_norm(ps[0].grad)) > 35.0, \
+            f"[{name}] gradient was scaled: clipping ran before preflight"
+        assert _unchanged(ps, param_snap), f"[{name}] parameters mutated"
+        # every pre-existing field untouched; the injected probe leaf
+        # itself left exactly as installed (same object, same values)
+        st_now = opt.state[ps[0]]
+        assert set(st_now.keys()) == {"momentum_buffer", "bad_flag"}, \
+            f"[{name}] state key set disturbed by the rejected step"
+        assert bool(torch.equal(st_now["momentum_buffer"], momentum_snap)), \
+            f"[{name}] momentum buffer mutated before rejection"
+        assert st_now["bad_flag"] is bad_leaf, \
+            f"[{name}] probe leaf was touched by the snapshot attempt"
+        del opt.state[ps[0]]["bad_flag"]       # undo probe injection
+        assert set(opt.state[ps[0]].keys()) == {"momentum_buffer"}, \
+            f"[{name}] probe cleanup disturbed other fields"
+        assert opt.state is orig_map, f"[{name}] mapping identity changed"
+        assert _param_groups_unchanged(opt, groups_snap), \
+            f"[{name}] param-group fields mutated"
+        assert _param_group_param_ids(opt) == ids_before, \
+            f"[{name}] params topology mutated"
+        # optimizer stays usable: a normal step succeeds afterwards
+        guarded_optimizer_step(opt, (m(x) ** 2).mean(), ps, 1.0)
+        assert not _unchanged(ps, param_snap), \
+            f"[{name}] post-rejection recovery step did not run"
+
+
+def test_unique_storage_byte_budget_enforced_before_mutation():
+    """A tiny view over an enormous backing storage is rejected when the
+    configured unique-storage byte budget is exceeded — before ANY
+    mutation — while the default budget accepts it."""
+    import latent_lab.train.checkpointing as ckpt_mod
+
+    assert ckpt_mod.DEFAULT_STATE_STORAGE_BUDGET_BYTES >= (1 << 20)
+
+    def build():
+        torch.manual_seed(63)
+        m = torch.nn.Linear(4, 4)
+        x = torch.randn(6, 4)
+        ps = list(m.parameters())
+        opt = torch.optim.SGD(ps, lr=0.1, momentum=0.9)
+        (m(x) ** 2).mean().backward()          # real grads + state
+        guarded_optimizer_step(opt, (m(x) ** 2).mean(), ps, 1.0)
+        m.zero_grad(set_to_none=True)
+        (m(x) ** 2).mean().backward()
+        with torch.no_grad():
+            for p in ps:                       # norm >> clip: detect clipping
+                p.grad.fill_(10.0)
+        huge = torch.empty(1 << 22, dtype=torch.float32)   # 16 MiB storage
+        opt.state[ps[0]]["huge_slack"] = huge[:1]          # tiny view!
+        return m, x, ps, opt
+
+    m, x, ps, opt = build()
+    param_snap = _snapshot(ps)
+    grad_snap = [p.grad.detach().clone() for p in ps]
+    state_snap = _deep_opt_state(opt)
+    orig_map = opt.state
+
+    with pytest.raises(ckpt_mod.OptimizerStateSnapshotError,
+                       match="budget"):
+        guarded_optimizer_step(opt, (m(x) ** 2).mean(), ps, 1.0,
+                               state_storage_budget_bytes=(1 << 20))
+
+    for p, g0 in zip(ps, grad_snap):           # nothing mutated at all
+        assert p.grad is not None and bool(torch.equal(p.grad, g0)), \
+            "gradients were clipped despite the budget rejection"
+    assert float(torch.linalg.vector_norm(ps[0].grad)) > 35.0, \
+        "clipping ran before the budget check"
+    assert _unchanged(ps, param_snap), "parameters mutated on rejection"
+    assert _opt_state_unchanged(opt, state_snap), "state mutated"
+    assert opt.state is orig_map, "mapping identity changed"
+
+    # default budget: the very same state steps cleanly
+    guarded_optimizer_step(opt, (m(x) ** 2).mean(), ps, 1.0)
+    assert not _unchanged(ps, param_snap), \
+        "default-budget step unexpectedly refused"
+
+
+def test_rollback_failure_chains_as_cause_of_original_exception(monkeypatch):
+    """When rollback itself detonates, the ORIGINAL step exception is
+    re-raised with the rollback failure chained as __cause__ (never
+    masking or replacing it)."""
+    import latent_lab.train.checkpointing as ckpt_mod
+
+    def boom(*a, **kw):
+        raise RuntimeError("rollback detonated")
+
+    monkeypatch.setattr(ckpt_mod, "_restore_optimizer_state", boom)
+    (m_adv, m_ctl, x, ps_adv, ps_ctl, opt_adv, opt_ctl,
+     fresh_grads, ctl_step, expected_base) = _exotic_pair(67)
+    opt_adv.armed = True
+    fresh_grads(m_adv)
+    with pytest.raises(RuntimeError,
+                       match="exotic-adversarial failure") as e:
+        guarded_optimizer_step(opt_adv, torch.tensor(0.5), ps_adv, 1.0)
+    assert e.value is opt_adv.raised, "original exception object replaced"
+    assert e.value.__cause__ is not None, \
+        "rollback failure was not chained as __cause__"
+    assert isinstance(e.value.__cause__, RuntimeError)
+    assert "rollback detonated" in str(e.value.__cause__), \
+        "chained cause is not the rollback failure"
+    assert e.value.__suppress_context__, \
+        "explicit raise-from must suppress the implicit context"
+
+    # -- unpatched: a CLEAN rollback preserves the original exception by
+    # identity, type, message and traceback, with NO chained cause, and
+    # the storage-graph-exact state survives for a control-matched retry
+    monkeypatch.undo()
+    (m_adv, m_ctl, x, ps_adv, ps_ctl, opt_adv, opt_ctl,
+     fresh_grads, ctl_step, expected_base) = _exotic_pair(71)
+    original_map = opt_adv.original_state_map
+    opt_adv.armed = True
+    fresh_grads(m_adv)
+    pre_params = _snapshot(ps_adv)
+    with pytest.raises(RuntimeError,
+                       match="exotic-adversarial failure") as e2:
+        guarded_optimizer_step(opt_adv, torch.tensor(0.5), ps_adv, 1.0)
+    assert e2.value is opt_adv.raised, \
+        "original exception object replaced by the guard"
+    assert type(e2.value) is RuntimeError and \
+        "exotic-adversarial failure" in str(e2.value)
+    assert e2.value.__traceback__ is not None, "traceback was stripped"
+    assert e2.value.__cause__ is None, \
+        "clean rollback must not chain any failure into the original"
+    assert opt_adv.state is original_map and \
+        _assert_exotic_exact(opt_adv.state[ps_adv[0]], expected_base) is None
+    assert _unchanged(ps_adv, pre_params)
+
+    opt_adv.armed = False
+    fresh_grads(m_adv)
+    guarded_optimizer_step(opt_adv, (m_adv(x) ** 2).mean(), ps_adv, 1.0)
+    ctl_step()
+    assert bool(torch.equal(
+        ps_adv[0].detach(), ps_ctl[0].detach())), \
+        "retry after a clean rollback diverges from the control"
+
+
+# ---------------------------------------------------------------------------
 # fp32 trainables over a lower-precision backbone
 # ---------------------------------------------------------------------------
 
