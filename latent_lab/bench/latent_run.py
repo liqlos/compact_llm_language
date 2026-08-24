@@ -122,7 +122,8 @@ def evaluate(rec, data: SuiteTensors, k_steps, indices, *, ablate=None,
         order, scores, rep = rec.rank_candidates(
             data.prompt_ids[i].to(device), data.cand_ids[i], k_steps,
             ablate=ablate, partner_input_ids=partner)
-        pred_rank = order.index(0) if 0 in order else -1
+        gold_idx = ex.candidates.index(ex.answer)
+        pred_rank = order.index(gold_idx) if gold_idx in order else -1
         records.append({
             "ex_id": ex.ex_id, "family": ex.family, "depth": ex.depth,
             "correct": 1.0 if pred_rank == 0 else 0.0,
