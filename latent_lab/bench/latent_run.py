@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import resource
 import sys
@@ -231,6 +232,34 @@ def recipe_from_config(cfg: dict, suite_sha256: str) -> dict:
     return recipe_from_config(cfg, suite_sha256)
 
 
+def mode_from_spec(interval_spec: str, k: int) -> str:
+    """The preregistered mode implied by the interval spec and K."""
+    return ("D-full" if interval_spec == "full"
+            else "F-control" if k == 0 else "E-localized")
+
+
+def train_recipe_digest(*, mode, interval, k, max_k, lora_r, lora_alpha,
+                        lr, steps, seed, optimizer, weight_decay,
+                        lr_schedule, warmup, clip, detach_z0,
+                        grad_checkpoint, suite_sha256) -> str:
+    """ONE canonical digest binding EVERY behavior-changing field.
+
+    The single source of truth shared by the trainer and the paid
+    driver's preregistration: any change to mode/interval/K/max_k/LoRA/
+    LR/steps/seed/optimizer/weight-decay/schedule/warmup/clip/detach/
+    checkpointing/suite produces a materially different config_sha256.
+    """
+    cfg = {
+        "mode": mode, "interval": list(interval), "k": k, "max_k": max_k,
+        "lora_r": lora_r, "lora_alpha": lora_alpha,
+        "lr": lr, "steps": steps, "seed": seed,
+        "optimizer": optimizer, "weight_decay": weight_decay,
+        "lr_schedule": lr_schedule, "warmup": warmup, "clip": clip,
+        "detach_z0": detach_z0, "grad_checkpoint": grad_checkpoint,
+    }
+    return recipe_from_config(cfg, suite_sha256)["config_sha256"]
+
+
 def _mark_run_fatal(out: Path, e: BaseException) -> None:
     """Atomically mark the run fatal; no success artifact may follow."""
     from latent_lab.train.checkpointing import write_run_status
@@ -239,9 +268,26 @@ def _mark_run_fatal(out: Path, e: BaseException) -> None:
                      error_type=type(e).__name__, error=str(e))
 
 
+def _quarantine_evidence_root(out: Path) -> None:
+    """Guarantee no complete-looking generation stays in the ACTIVE root.
+
+    First every fixed-name success artifact is quarantined; if ANY of
+    those operations fails, the ENTIRE root is moved aside atomically so
+    no validator can ever see it as active evidence again, and a fresh
+    empty root is created for fatal-status publication.
+    """
+    from latent_lab.train.checkpointing import quarantine_success_artifacts
+    try:
+        quarantine_success_artifacts(out)
+    except Exception:
+        target = out.with_name(f"{out.name}.invalid.{time.time_ns()}")
+        os.replace(out, target)
+        out.mkdir(parents=True, exist_ok=True)
+
+
 def cmd_train(args):
     from latent_lab.train.checkpointing import (
-        FatalRunInvalidError, require_pinned_revision, write_run_status)
+        EvidenceLifecycleError, require_pinned_revision, write_run_status)
 
     # fail closed BEFORE loading/training/saving on a mutable revision
     revision = require_pinned_revision(args.revision)
@@ -253,18 +299,38 @@ def cmd_train(args):
                      model=args.model, revision=revision, seed=args.seed)
     try:
         _train_inner(args, out, device, revision)
-    except FatalRunInvalidError as e:
-        # explicit fatal status; NO success artifact may exist afterwards
-        _mark_run_fatal(out, e)
+        # The terminal complete-status transition is INSIDE the protected
+        # success-publication lifecycle: a failure writing it must never
+        # escape unhandled and leave status 'running' beside finished
+        # evidence.
+        write_run_status(out, "complete", command=" ".join(sys.argv))
+    except BaseException as e:
+        # Fail-stop publication hygiene. FIRST invalidate/quarantine
+        # every fixed-name success artifact so no validator can accept
+        # this root as a complete generation (escalating to whole-root
+        # quarantine if any removal fails), THEN attempt to publish
+        # fatal status. If either step fails, fail closed — raising an
+        # explicit lifecycle error that preserves the ORIGINAL exception
+        # as cause (never replaced by the secondary cleanup/reporting
+        # error).
+        try:
+            _quarantine_evidence_root(out)
+        except BaseException as cleanup_err:
+            raise EvidenceLifecycleError(
+                f"run failed ({type(e).__name__}: {e}) AND success-artifact "
+                f"quarantine failed ({type(cleanup_err).__name__}: "
+                f"{cleanup_err}); failing closed — the evidence root at "
+                f"{out} is untrusted and carries no complete generation"
+            ) from e
+        try:
+            _mark_run_fatal(out, e)
+        except BaseException as fatal_err:
+            raise EvidenceLifecycleError(
+                f"run failed ({type(e).__name__}: {e}) AND fatal-status "
+                f"publication failed ({type(fatal_err).__name__}: "
+                f"{fatal_err}); failing closed — the evidence root at "
+                f"{out} carries no complete generation") from e
         raise
-    except Exception as e:
-        # an unexpected crash must never leave the run marked 'running'
-        # (which readers could confuse with an active/incomplete run);
-        # it is marked fatal atomically and re-raised unchanged
-        _mark_run_fatal(out, e)
-        raise
-    write_run_status(out, "complete",
-                     command=" ".join(sys.argv))
 
 
 def _train_inner(args, out: Path, device: str, revision: str):
@@ -349,8 +415,7 @@ def _train_inner(args, out: Path, device: str, revision: str):
             "no finite validation checkpoint was accepted; refusing to "
             "report or save final state")
 
-    mode = ("D-full" if args.interval == "full"
-            else "F-control" if args.k == 0 else "E-localized")
+    mode = mode_from_spec(args.interval, args.k)
     suite_sha = suite.manifest()["sha256"]
     cfg = {
         "mode": mode,
@@ -459,7 +524,8 @@ def cmd_eval(args):
 
     torch.manual_seed(args.seed)
     device = args.device
-    report = json.loads(
+    from latent_lab.train.checkpointing import strict_json_loads
+    report = strict_json_loads(
         (Path(args.adapter) / "train_report.json").read_text())
     cfg = report["config"]
     model_id = cfg.get("model")

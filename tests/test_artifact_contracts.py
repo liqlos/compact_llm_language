@@ -12,6 +12,7 @@ Coverage map (each test fails on rejected candidate 6bf51fd):
 """
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -44,6 +45,7 @@ from tests.artifact_fakes import (
     build_verified_run,
     cfg as fake_cfg,
     eval_record,
+    run_contract,
 )
 
 # ---------------------------------------------------------------------------
@@ -448,21 +450,24 @@ def test_report_manifest_and_bundle_bind_one_canonical_recipe(tmp_path):
 def test_run_dir_name_is_never_evidence_k8_seed2_in_E4_k4_s0(tmp_path):
     """Reproduced false accept: a directory named E4_k4_s0 whose report
     was K8/seed2. Contents-coherent evidence still PASSES bare
-    validation but MUST fail the driver's preregistered contract."""
+    validation but MUST fail the driver's FULL preregistered contract."""
     d = _run_dir_named(tmp_path, "E4_k4_s0")
     build_verified_run(d, config=fake_cfg(k=8, seed=2, steps=400))
     # coherent contents alone are accepted when nobody declares intent...
     assert artifacts.validate_run(d)["status"] == "complete"
-    # ...but the driver's expected contract rejects it outright
+    # ...but the driver's full expected contract rejects it outright
     with pytest.raises(Exception) as ei:
-        artifacts.validate_run(d, expected={"label": "E4_k4_s0", "seed": 0,
-                                            "k": 4})
+        artifacts.validate_run(d, expected=run_contract())
     msg = str(ei.value)
     assert "mismatch" in msg
     # and the CLI form used by drivers behaves identically
-    assert artifacts.main(["validate-run", str(d), "--expect-label",
-                           "E4_k4_s0", "--expect-seed", "0",
-                           "--expect-k", "4"]) == 1
+    rc = run_contract()
+    assert artifacts.main(
+        ["validate-run", str(d), "--expect-model", rc["model_id"],
+         "--expect-rev", rc["revision"], "--expect-suite",
+         rc["suite_sha256"], "--expect-seed", "0", "--expect-label",
+         "E4_k4_s0", "--expect-k", "4", "--expect-steps", "800",
+         "--expect-config-sha256", rc["config_sha256"]]) == 1
 
 
 def test_two_file_hash_manifest_with_non_bundle_checkpoint_rejected(
@@ -623,3 +628,491 @@ def test_cmd_eval_identity_block_covers_the_required_key_set():
     for key in _EVAL_IDENTITY_KEYS:
         assert key in block, \
             f"cmd_eval identity omits required field {key!r}"
+
+
+# ---------------------------------------------------------------------------
+# Repair cycle 2 — Blocker 1: fatal lifecycle can never leave
+# complete-looking evidence at the active root
+# ---------------------------------------------------------------------------
+
+def _train_args(tmp_path):
+    return SimpleNamespace(revision=REV_OK, device="cpu", model=MODEL,
+                           seed=0, out=str(tmp_path / "run"))
+
+
+def _late_writer(payload):
+    def late(args, out, device, revision):
+        build_verified_run(Path(out))
+        raise RuntimeError(payload)
+    return late
+
+
+def test_cmd_train_late_failure_quarantines_complete_looking_evidence(
+        tmp_path, monkeypatch):
+    """Exact repro 1: a late exception from _train_inner AFTER it wrote
+    train_report.json/best_params.pt/run_manifest.json must leave NO
+    complete-looking artifact at the evidence root."""
+    from latent_lab.train.checkpointing import (
+        CHECKPOINT_FILE,
+        RUN_MANIFEST_FILE,
+        TRAIN_REPORT_FILE,
+    )
+    out = tmp_path / "run"
+
+    monkeypatch.setattr(latent_run, "_train_inner",
+                        _late_writer("late boom after generation"))
+    with pytest.raises(RuntimeError, match="late boom"):
+        latent_run.cmd_train(_train_args(tmp_path))
+
+    st = ckpt.read_run_status(out)
+    assert st is not None and st["status"] == "fatal"
+    for name in (TRAIN_REPORT_FILE, CHECKPOINT_FILE, RUN_MANIFEST_FILE):
+        assert not (out / name).exists(), name
+    quarantined = sorted(p.name for p in out.glob("*"))
+    assert sum(".invalid." in n for n in quarantined) >= 4, quarantined
+    with pytest.raises(Exception):
+        ckpt.verify_generation(out)
+    with pytest.raises(Exception):
+        artifacts.validate_run(out)
+
+
+def test_cmd_train_final_complete_status_write_failure_fails_closed(
+        tmp_path, monkeypatch):
+    """Exact repro 2: the terminal complete-status write sits INSIDE the
+    protected lifecycle; its failure must never leave 'running' beside
+    completed evidence and must re-raise the ORIGINAL error."""
+    out = tmp_path / "run"
+    out.mkdir(parents=True)
+    build_verified_run(out)
+    real = ckpt.write_run_status
+
+    def disk_full(out_dir, status, **kw):
+        if status == "complete":
+            raise OSError("disk full at terminal transition")
+        return real(out_dir, status, **kw)
+
+    monkeypatch.setattr(ckpt, "write_run_status", disk_full)
+    monkeypatch.setattr(latent_run, "_train_inner",
+                        lambda *a, **k: None)
+    with pytest.raises(OSError, match="disk full"):
+        latent_run.cmd_train(_train_args(tmp_path))
+
+    st = ckpt.read_run_status(out)
+    assert st is not None and st["status"] == "fatal"
+    assert st["error_type"] == "OSError"
+    for name in (ckpt.TRAIN_REPORT_FILE, ckpt.CHECKPOINT_FILE,
+                 ckpt.RUN_MANIFEST_FILE):
+        assert not (out / name).exists(), f"{name} survived"
+        assert list(out.glob(f"{name}.invalid.*")), name
+    with pytest.raises(Exception):
+        artifacts.validate_run(out)
+
+
+def test_cmd_train_cleanup_failure_escalates_to_whole_root_quarantine(
+        tmp_path, monkeypatch):
+    """Per-artifact purge failure => the ENTIRE root is moved aside and
+    a fresh root carries only fatal status; the ORIGINAL exception is
+    re-raised unchanged."""
+    out = tmp_path / "run"
+    monkeypatch.setattr(latent_run, "_train_inner",
+                        _late_writer("original boom"))
+
+    def broken_purge(root):
+        raise OSError("purge boom")
+
+    monkeypatch.setattr(ckpt, "quarantine_success_artifacts", broken_purge)
+    with pytest.raises(RuntimeError, match="original boom"):
+        latent_run.cmd_train(_train_args(tmp_path))
+
+    moved = list(tmp_path.glob("run.invalid.*"))
+    assert moved and (moved[0] / ckpt.RUN_STATUS_FILE).exists(), \
+        "complete-looking generation stayed in an active root"
+    st = ckpt.read_run_status(out)
+    assert st is not None and st["status"] == "fatal"
+    assert list(out.iterdir()) == [out / ckpt.RUN_STATUS_FILE]
+    with pytest.raises(Exception):
+        ckpt.verify_generation(out)
+
+
+def test_cmd_train_double_cleanup_failure_escalates_preserving_original(
+        tmp_path, monkeypatch):
+    """When BOTH per-artifact quarantine AND whole-root escalation fail,
+    fail closed with an explicit lifecycle error whose cause is the
+    ORIGINAL exception — never a secondary cleanup error."""
+    monkeypatch.setattr(latent_run, "_train_inner",
+                        _late_writer("original boom"))
+
+    def broken_purge(root):
+        raise OSError("purge boom")
+
+    monkeypatch.setattr(ckpt, "quarantine_success_artifacts", broken_purge)
+    real_replace = os.replace
+
+    def broken_rename(a, b, *r, **kw):
+        if "run.invalid." in str(b):
+            raise OSError("rename refused")
+        return real_replace(a, b, *r, **kw)
+
+    monkeypatch.setattr(os, "replace", broken_rename)
+    with pytest.raises(ckpt.EvidenceLifecycleError) as ei:
+        latent_run.cmd_train(_train_args(tmp_path))
+    cause = ei.value.__cause__
+    assert isinstance(cause, RuntimeError) and "original boom" in str(cause)
+    assert "failing closed" in str(ei.value)
+    assert not list((tmp_path).glob("run.invalid.*")), \
+        "escalation claimed success it did not have"
+
+
+def test_cmd_train_fatal_publication_failure_leaves_no_generation(
+        tmp_path, monkeypatch):
+    """Fatal-status write failure after quarantine => fail closed with
+    the original exception preserved as cause."""
+    out = tmp_path / "run"
+    monkeypatch.setattr(latent_run, "_train_inner",
+                        _late_writer("boom before fatal"))
+
+    def broken_fatal(out_p, e):
+        raise OSError("no space for fatal status")
+
+    monkeypatch.setattr(latent_run, "_mark_run_fatal", broken_fatal)
+    with pytest.raises(ckpt.EvidenceLifecycleError) as ei:
+        latent_run.cmd_train(_train_args(tmp_path))
+    assert isinstance(ei.value.__cause__, RuntimeError)
+    assert not (out / ckpt.RUN_STATUS_FILE).exists()
+    with pytest.raises(Exception):
+        ckpt.verify_generation(out)
+
+
+def test_cmd_train_success_publishes_complete_validating_generation(
+        tmp_path, monkeypatch):
+    """Control: normal success publishes a generation that validates
+    under the FULL preregistered contract."""
+    out = tmp_path / "run"
+    monkeypatch.setattr(latent_run, "_train_inner",
+                        lambda args, o, device, revision:
+                        build_verified_run(Path(o)))
+    latent_run.cmd_train(_train_args(tmp_path))
+    assert ckpt.require_complete_run(out)["status"] == "complete"
+    manifest = artifacts.validate_run(out, expected=run_contract())
+    assert manifest["status"] == "complete"
+
+
+# ---------------------------------------------------------------------------
+# Repair cycle 2 — Blocker 4: strict JSON everywhere in evidence
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_atomic_write_json_refuses_non_finite_values(tmp_path, bad):
+    p = tmp_path / "x.json"
+    for payload in ({"v": bad}, {"nested": [{"deep": {"v": bad}}]}):
+        with pytest.raises(ValueError):
+            ckpt.atomic_write_json(p, payload)
+    assert not p.exists()
+
+
+def test_strict_reader_rejects_nan_infinity_constants():
+    for const in ("NaN", "Infinity", "-Infinity"):
+        with pytest.raises(ValueError, match="non-standard JSON constant"):
+            ckpt.strict_json_loads('{"final_train_loss": %s}' % const)
+        with pytest.raises(ValueError, match="non-standard JSON constant"):
+            ckpt.strict_json_loads('{"wall_seconds": [%s]}' % const)
+
+
+def test_decoded_object_scan_rejects_non_finite_anywhere():
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(Exception, match="non-finite number"):
+            ckpt.assert_json_numbers_finite(
+                {"a": [1, {"b": {"c": bad}}], "d": [0.5]})
+
+
+def test_validate_run_rejects_nan_and_infinity_in_report(tmp_path):
+    """Reproduced accept: final_train_loss=NaN and wall_seconds=Infinity
+    written as literal JSON constants must fail validation even when the
+    manifest byte-hashes were refreshed around them."""
+    from latent_lab.train.checkpointing import (
+        RUN_MANIFEST_FILE,
+        TRAIN_REPORT_FILE,
+        sha256_file,
+    )
+
+    for field, bad_float in (("final_train_loss", float("nan")),
+                             ("wall_seconds", float("inf"))):
+        build_verified_run(tmp_path)
+        rp = tmp_path / TRAIN_REPORT_FILE
+        raw = json.loads(rp.read_text())
+        # permissive dump writes the literal NaN/Infinity constant
+        raw[field] = bad_float
+        rp.write_text(json.dumps(raw))
+        m = json.loads((tmp_path / RUN_MANIFEST_FILE).read_text())
+        m["report_sha256"] = sha256_file(rp)     # keep ONLY finiteness able to reject
+        ckpt.atomic_write_json(tmp_path / RUN_MANIFEST_FILE, m)
+        with pytest.raises(ValueError) as ei:
+            artifacts.validate_run(tmp_path)
+        msg = str(ei.value)
+        assert "non-standard JSON constant" in msg \
+            or "non-finite number" in msg, msg
+        assert ("NaN" in msg) == (field == "final_train_loss")
+
+
+def test_read_run_status_treats_non_finite_status_as_unusable(tmp_path):
+    p = tmp_path / ckpt.RUN_STATUS_FILE
+    p.write_text(json.dumps({"status": "complete",
+                             "wall_seconds": float("inf")}))
+    assert ckpt.read_run_status(tmp_path) is None
+
+
+def test_validate_eval_rejects_non_finite_numbers_nested(tmp_path):
+    ep = tmp_path / "ev.json"
+
+    def mutate(d):
+        d["results"]["clean"]["seconds"] = float("nan")
+        d["results"]["clean"]["records"][0]["second_best"] = -float("inf")
+
+    payload = build_eval_payload()
+    mutate(payload)
+    ep.write_text(json.dumps(payload))            # literal NaN/Inf on disk
+    with pytest.raises(ValueError):
+        artifacts.validate_eval(ep)
+
+    # decoded-object layer: the same tree rejected without any parse step
+    d = build_eval_payload()
+    mutate(d)
+    from latent_lab.train.checkpointing import assert_json_numbers_finite
+    with pytest.raises(RuntimeError, match="non-finite"):
+        assert_json_numbers_finite(d, where="payload")
+
+
+# ---------------------------------------------------------------------------
+# Repair cycle 2 — Blocker 2: resume bound to the FULL canonical recipe
+# ---------------------------------------------------------------------------
+
+def test_resume_rejects_old_partial_contract_structurally(tmp_path):
+    """The reproduced hole: the driver's old model/rev/seed/label/k/steps
+    allowlist accepted a coherent wrong-suite/wrong-LR/wrong-interval
+    artifact. Partial contracts are now structurally impossible."""
+    d = _run_dir_named(tmp_path, "E4_k4_s0")
+    build_verified_run(d, config=fake_cfg(suite_sha256="ee" * 32,
+                                          lr=9e-4, interval=[6, 18]))
+    stale_partial = {"model_id": MODEL, "revision": REV_OK, "seed": 0,
+                     "label": "E4_k4_s0", "k": 4, "steps": 800}
+    with pytest.raises(ValueError) as ei:
+        artifacts.validate_run(d, expected=dict(stale_partial))
+    assert "incomplete expected contract" in str(ei.value)
+    assert "config_sha256" in str(ei.value)
+    # the FULL preregistered contract rejects the drifted artifact
+    with pytest.raises(ValueError) as ei2:
+        artifacts.validate_run(d, expected=run_contract())
+    assert "mismatch" in str(ei2.value)
+
+
+@pytest.mark.parametrize("over", [
+    ("suite", dict(suite_sha256="ee" * 32)),
+    ("lr", dict(lr=5e-5)),
+    ("interval", dict(interval=[10, 14])),
+    ("lora_r", dict(lora_r=16)),
+    ("lora_alpha", dict(lora_alpha=32.0)),
+    ("optimizer", dict(optimizer="sgd")),
+    ("weight_decay", dict(weight_decay=0.0)),
+    ("lr_schedule", dict(lr_schedule="cosine")),
+    ("warmup", dict(warmup=10)),
+    ("clip", dict(clip=1.0)),
+    ("detach_z0", dict(detach_z0=True)),
+    ("grad_checkpoint", dict(grad_checkpoint=False)),
+    ("k", dict(k=8)),
+    ("max_k", dict(max_k=8)),
+    ("steps", dict(steps=400)),
+    ("seed", dict(seed=2)),
+    ("mode", dict(mode="D-full")),
+])
+def test_resume_binds_every_recipe_category_via_canonical_digest(
+        tmp_path, over):
+    name, cfg_over = over
+    d = _run_dir_named(tmp_path, "E4_k4_s0")
+    build_verified_run(d, config=fake_cfg(**cfg_over))
+    with pytest.raises(Exception) as ei:
+        artifacts.validate_run(d, expected=run_contract())
+    msg = str(ei.value)
+    assert "mismatch" in msg or "canonical training identity" in msg
+
+
+def test_full_preregistered_contract_accepts_matching_artifact(tmp_path):
+    d = _run_dir_named(tmp_path, "E4_k4_s0")
+    build_verified_run(d)
+    manifest = artifacts.validate_run(d, expected=run_contract())
+    digest = manifest["checkpoint_content_digest"]
+    assert artifacts.validate_run(
+        d, expected={**run_contract(),
+                     "checkpoint_content_digest": digest}) is not None
+
+
+def test_unexpected_expectation_keys_are_rejected(tmp_path):
+    d = _run_dir_named(tmp_path, "E4_k4_s0")
+    build_verified_run(d)
+    with pytest.raises(ValueError, match="unexpected expectation keys"):
+        artifacts.validate_run(d, expected={**run_contract(),
+                                            "flavor": "vanilla"})
+    ep = tmp_path / "ev.json"
+    ep.write_text(json.dumps(build_eval_payload()))
+    ok = {"model_id": MODEL, "revision": REV_OK, "suite_sha256": SUITE_SHA,
+          "checkpoint_content_digest": "cd" * 32, "split": "test_id",
+          "ablation": "clean", "k": 4, "seed": 0}
+    with pytest.raises(ValueError, match="unexpected expectation keys"):
+        artifacts.validate_eval(ep, expected={**ok, "flavor": "x"})
+
+
+def test_unexpected_config_metadata_is_rejected_not_ignored(tmp_path):
+    from latent_lab.train.checkpointing import (
+        RUN_MANIFEST_FILE,
+        TRAIN_REPORT_FILE,
+        sha256_file,
+    )
+    build_verified_run(tmp_path)
+    rp = tmp_path / TRAIN_REPORT_FILE
+    d = json.loads(rp.read_text())
+    d["config"]["quantization"] = "none"          # unexpected alias/metadata
+    ckpt.atomic_write_json(rp, d)
+    m = json.loads((tmp_path / RUN_MANIFEST_FILE).read_text())
+    m["report_sha256"] = sha256_file(rp)
+    ckpt.atomic_write_json(tmp_path / RUN_MANIFEST_FILE, m)
+    with pytest.raises(ValueError, match="unexpected config metadata"):
+        artifacts.validate_run(tmp_path)
+
+
+def test_cli_supports_expect_config_sha256_flag(tmp_path):
+    d = _run_dir_named(tmp_path, "E4_k4_s0")
+    build_verified_run(d)
+    rc = run_contract()
+    flags = ["--expect-model", rc["model_id"], "--expect-rev",
+             rc["revision"], "--expect-suite", rc["suite_sha256"],
+             "--expect-seed", "0", "--expect-label", "E4_k4_s0",
+             "--expect-k", "4", "--expect-steps", "800"]
+    assert artifacts.main(["validate-run", str(d), *flags]) == 1  # incomplete
+    assert artifacts.main(["validate-run", str(d), *flags,
+                           "--expect-config-sha256",
+                           rc["config_sha256"]]) == 0
+    assert artifacts.main(["validate-run", str(d), *flags,
+                           "--expect-config-sha256", "ab" * 32]) == 1
+
+
+def test_train_recipe_digest_matches_trainer_recipe_binding():
+    """Driver preregistration helper and the trainer's recipe agree; any
+    semantic drift produces a different digest."""
+    base = latent_run.train_recipe_digest(
+        mode="E-localized", interval=[12, 18], k=4, max_k=16, lora_r=8,
+        lora_alpha=16.0, lr=1e-4, steps=800, seed=0, optimizer="adamw",
+        weight_decay=0.01, lr_schedule="constant", warmup=50, clip=0.5,
+        detach_z0=False, grad_checkpoint=True, suite_sha256=SUITE_SHA)
+    assert base == run_contract()["config_sha256"]
+    drift = latent_run.train_recipe_digest(
+        mode="E-localized", interval=[12, 18], k=4, max_k=16, lora_r=8,
+        lora_alpha=16.0, lr=3e-4, steps=800, seed=0, optimizer="adamw",
+        weight_decay=0.01, lr_schedule="constant", warmup=50, clip=0.5,
+        detach_z0=False, grad_checkpoint=True, suite_sha256=SUITE_SHA)
+    assert drift != base
+    assert latent_run.mode_from_spec("full", 4) == "D-full"
+    assert latent_run.mode_from_spec("mid", 0) == "F-control"
+    assert latent_run.mode_from_spec("mid", 4) == "E-localized"
+
+
+# ---------------------------------------------------------------------------
+# Repair cycle 2 — Blocker 3: eval validation reconciles EVERY duplicated
+# identity field (exact hostile repro + per-field regressions + controls)
+# ---------------------------------------------------------------------------
+
+_EVAL_OK_EXPECTED = {"model_id": MODEL, "revision": REV_OK,
+                     "suite_sha256": SUITE_SHA,
+                     "checkpoint_content_digest": "cd" * 32,
+                     "split": "test_id", "ablation": "clean", "k": 4,
+                     "seed": 0}
+
+
+def _mutated_payload(mut):
+    d = build_eval_payload()
+    mut(d)
+    return d
+
+
+@pytest.mark.parametrize("name,mut", [
+    ("top_model", lambda d: d.update(model="WRONG-MODEL")),
+    ("top_revision_40_zeroes", lambda d: d.update(revision="0" * 40)),
+    ("top_suite", lambda d: d.update(suite_sha256="12" * 32)),
+    ("top_split", lambda d: d.update(split="test_ood")),
+    ("top_seed", lambda d: d.update(seed=2)),
+    ("config_k_says_K0", lambda d: d.update(config={"k": 0})),
+    ("config_seed", lambda d: d.update(config={"seed": 3})),
+    ("config_model", lambda d: d.update(config={"model": "Other/Model"})),
+    ("config_interval", lambda d: d.update(config={"interval": [6, 18]})),
+    ("config_max_k", lambda d: d.update(config={"max_k": 8})),
+    ("result_key_alias", lambda d: d.update(
+        results={"zero_state": d["results"]["clean"]})),
+    ("extra_result_alias", lambda d: d["results"].update(
+        {"bypass_interval": dict(d["results"]["clean"])})),
+    ("result_k_steps", lambda d:
+        d["results"]["clean"].update(k_steps=8)),
+    ("tag_garbage_ffn_K0", lambda d:
+        d["results"]["clean"].update(tag="ffn/K0")),
+    ("tag_wrong_split", lambda d: d["results"]["clean"].update(
+        tag="E-localized|test_ood|clean|K=4")),
+    ("tag_wrong_k", lambda d: d["results"]["clean"].update(
+        tag="E-localized|test_id|clean|K=8")),
+    ("clean_carries_ablate", lambda d: d["results"]["clean"].update(
+        ablate={"zero_state": True})),
+])
+def test_validate_eval_reconciles_every_duplicated_field(tmp_path, name,
+                                                          mut):
+    ep = tmp_path / "ev.json"
+    ep.write_text(json.dumps(_mutated_payload(mut)))
+    with pytest.raises(ValueError) as ei:
+        artifacts.validate_eval(ep)
+    msg = str(ei.value).lower()
+    assert any(tok in msg for tok in
+               ("contradict", "unexpected selected results",
+                "no matching results entry", "not the canonical")), msg
+
+
+def test_validate_eval_exact_hostile_contradictory_payload_rejected(
+        tmp_path):
+    """The independently reproduced payload: nested identity matches the
+    expected Qwen/test_id/clean/K4/seed0/digest while EVERY top-level
+    duplicate contradicts it."""
+    ep = tmp_path / "ev.json"
+    hostile = build_eval_payload()
+    hostile.update({
+        "model": "WRONG-MODEL",
+        "revision": "0" * 40,
+        "suite_sha256": "12" * 32,
+        "split": "test_ood",
+        "seed": 2,
+        "config": {"k": 0},
+    })
+    res = hostile["results"]["clean"]
+    res["tag"] = "ffn/K0"
+    res["k_steps"] = 0
+    ep.write_text(json.dumps(hostile))
+    with pytest.raises(ValueError):
+        artifacts.validate_eval(ep)
+    # even with NO expectation supplied the contradictions reject
+    with pytest.raises(ValueError):
+        artifacts.validate_eval(ep, expected=None)
+
+
+def test_validate_eval_normal_valid_controls_pass(tmp_path):
+    ep = tmp_path / "ev.json"
+    ep.write_text(json.dumps(build_eval_payload()))
+    d = artifacts.validate_eval(ep)
+    assert d["status"] == "complete"
+    assert artifacts.validate_eval(ep, expected=_EVAL_OK_EXPECTED) \
+        is not None
+
+
+def test_validate_eval_extended_identity_fields_are_well_formed(tmp_path):
+    ep = tmp_path / "ev.json"
+    bad_interval = build_eval_payload(identity={
+        **EVAL_IDENTITY, "interval": [18]})
+    ep.write_text(json.dumps(bad_interval))
+    with pytest.raises(ValueError, match="identity.interval"):
+        artifacts.validate_eval(ep)
+    bad_max_k = build_eval_payload(identity={**EVAL_IDENTITY, "max_k": 0})
+    ep.write_text(json.dumps(bad_max_k))
+    with pytest.raises(ValueError, match="identity.max_k"):
+        artifacts.validate_eval(ep)

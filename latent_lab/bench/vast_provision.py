@@ -3,10 +3,20 @@
 Policy (owner directive 2026-08-23): ALWAYS create with runtype="ssh_direct"
 — direct SSH is more stable than proxied connections.
 
+SEALED LAUNCH ENVIRONMENT (fail closed): ``--create`` is refused unless it
+receives an EXPLICITLY immutable image reference
+(``repository@sha256:<64 lowercase hex>``) AND a sealed-environment
+contract file binding Python, torch, transformers, huggingface_hub and
+the project lockfile SHA — with the contract's image equal to the
+requested digest. Mutable tags are never accepted as launch images and
+no default image exists: an unsealed request aborts BEFORE any provider
+contact. Until pre-spend supplies a verified compatible digest, this
+provisioner honestly has NO launchable default.
+
 Uses VAST_AI_API_KEY from the environment (never printed). Selects only
-verified on-demand NVIDIA offers with one GPU and >=22 GB VRAM, records the
-chosen offer/instance JSON under .rcc_work/, and never destroys instances
-from this script.
+verified on-demand NVIDIA offers with one GPU and >=22 GB VRAM, records
+the chosen offer/instance JSON under .rcc_work/, and never destroys
+instances from this script.
 """
 from __future__ import annotations
 
@@ -15,14 +25,11 @@ import json
 import os
 from pathlib import Path
 
-from vastai import VastAI
-
 ROOT = Path(__file__).resolve().parents[2]
 STATE = ROOT / ".rcc_work" / "vast_instance.json"
 QUERY = ("verified=true rentable=true gpu_arch=nvidia num_gpus=1 "
          "gpu_name in [RTX_3090,RTX_4090] gpu_ram>=22 direct_port_count>=1 "
          "reliability>=0.98 cpu_ram>=16 inet_down>=500 disk_space>=40")
-IMAGE = "pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime"
 LABEL = "rcc-latent-gate"
 
 
@@ -32,7 +39,40 @@ def parsed(value):
     return value
 
 
-def attach_local_ssh_key(client: VastAI, instance_id: int) -> None:
+def sealed_launch_requirements(args) -> dict | None:
+    """Validate the immutable image + contract BEFORE any provider use.
+
+    Returns the sealed binding for --create; None for non-spending
+    invocations (--status/--attach-key create nothing).
+    """
+    from latent_lab.bench.sealed_env import (
+        SealedEnvironmentError,
+        check_contract_pins,
+        load_contract,
+        require_immutable_image,
+    )
+
+    if not args.create:
+        return None
+    try:
+        image = require_immutable_image(args.image)
+        if not args.env_contract:
+            raise SealedEnvironmentError(
+                "--env-contract FILE is required for --create: "
+                "provisioning without an exact sealed-environment "
+                "contract (python/torch/transformers/huggingface_hub/"
+                "lockfile sha) is refused")
+        contract = load_contract(args.env_contract)
+        # provisioning and the remote driver are bound to the SAME
+        # immutable digest/contract
+        check_contract_pins(contract, pins={"image": image})
+    except SealedEnvironmentError as e:
+        raise SystemExit(f"FATAL: sealed launch environment refused: {e}")
+    return {"image": image, "contract_path": str(args.env_contract),
+            "contract": contract}
+
+
+def attach_local_ssh_key(client, instance_id: int) -> None:
     public_key = Path.home() / ".ssh" / "id_ed25519.pub"
     if not public_key.is_file():
         raise SystemExit("missing local ~/.ssh/id_ed25519.pub")
@@ -49,11 +89,23 @@ def main() -> None:
     ap.add_argument("--create", action="store_true")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--attach-key", action="store_true")
+    ap.add_argument("--image", default=None,
+                    help="immutable repository@sha256:<64-hex> reference "
+                    "(REQUIRED for --create; mutable tags refused)")
+    ap.add_argument("--env-contract", default=None,
+                    help="sealed-environment contract JSON (REQUIRED for "
+                    "--create)")
     args = ap.parse_args()
+
+    # fail closed BEFORE any provider contact or API-key use
+    sealed = sealed_launch_requirements(args)
 
     api_key = os.environ.get("VAST_AI_API_KEY")
     if not api_key:
         raise SystemExit("missing VAST_AI_API_KEY in environment")
+
+    from vastai import VastAI  # lazy: sealing errors precede any import/use
+
     client = VastAI(api_key=api_key, raw=True)
 
     instances = parsed(client.show_instances())
@@ -107,17 +159,23 @@ def main() -> None:
         return
 
     result = parsed(client.create_instance(
-        id=int(offer["id"]), image=IMAGE, disk=40, runtype="ssh_direct",
-        label=LABEL, cancel_unavail=True))
+        id=int(offer["id"]), image=sealed["image"], disk=40,
+        runtype="ssh_direct", label=LABEL, cancel_unavail=True))
     instance_id = result.get("new_contract") or result.get("id")
     if not instance_id:
         raise SystemExit(f"create returned no id: {result!r}")
     STATE.parent.mkdir(parents=True, exist_ok=True)
     STATE.write_text(json.dumps({"offer": selected,
                                  "create_result": result,
-                                 "instance_id": instance_id}, indent=2))
+                                 "instance_id": instance_id,
+                                 "sealed": {
+                                     "image": sealed["image"],
+                                     "contract_path":
+                                         sealed["contract_path"],
+                                     "contract": sealed["contract"],
+                                 }}, indent=2))
     print(json.dumps({"status": "created", "instance_id": instance_id,
-                      "offer": selected}))
+                      "offer": selected, "image": sealed["image"]}))
 
 
 if __name__ == "__main__":

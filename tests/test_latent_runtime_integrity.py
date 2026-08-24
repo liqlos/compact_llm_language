@@ -1217,17 +1217,26 @@ def test_artifact_validation_cli_contract(tmp_path):
     # missing everything -> invalid
     assert artifacts_main(["validate-run", str(tmp_path)]) == 1
 
-    # a fully coherent generation validates, and expected contracts bind
+    # a fully coherent generation validates, and the FULL expected
+    # run contract (incl. canonical config digest) binds resume
+    from tests.artifact_fakes import run_contract
+
     build_verified_run(tmp_path)
     assert artifacts_main(["validate-run", str(tmp_path)]) == 0
-    assert artifacts_main(
-        ["validate-run", str(tmp_path), "--expect-seed", "0",
-         "--expect-label", "E4_k4_s0"]) == 0
-    assert artifacts_main(
-        ["validate-run", str(tmp_path), "--expect-seed", "2"]) == 1
-    assert artifacts_main(
-        ["validate-run", str(tmp_path),
-         "--expect-model", "WRONG-MODEL"]) == 1
+    rc = run_contract()
+    full_flags = ["--expect-model", rc["model_id"], "--expect-rev",
+                  rc["revision"], "--expect-suite", rc["suite_sha256"],
+                  "--expect-seed", str(rc["seed"]), "--expect-label",
+                  rc["label"], "--expect-k", str(rc["k"]),
+                  "--expect-steps", str(rc["steps"]),
+                  "--expect-config-sha256", rc["config_sha256"]]
+    assert artifacts_main(["validate-run", str(tmp_path), *full_flags]) == 0
+    wrong_seed = [*full_flags]
+    wrong_seed[wrong_seed.index("--expect-seed") + 1] = "2"
+    assert artifacts_main(["validate-run", str(tmp_path), *wrong_seed]) == 1
+    wrong_model = [*full_flags]
+    wrong_model[wrong_model.index("--expect-model") + 1] = "WRONG-MODEL"
+    assert artifacts_main(["validate-run", str(tmp_path), *wrong_model]) == 1
 
     eval_payload = build_eval_payload()
     ep = tmp_path / "eval.json"

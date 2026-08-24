@@ -96,6 +96,19 @@ def test_no_installs_upgrades_or_ignored_failures():
     assert "set -euo pipefail" in _src()
 
 
+def test_no_mutable_image_default_anywhere_in_launch_path():
+    """The known-incompatible mutable tag can never reappear as a launch
+    environment, and the driver has NO image default: an unsealed run
+    aborts instead."""
+    src = _src()
+    assert "pytorch/pytorch:" not in src
+    assert not re.search(r"^\s*IMAGE\s*=", src, re.M)
+    provisioner = (REPO / "latent_lab" / "bench" / "vast_provision.py"
+                   ).read_text()
+    assert "pytorch/pytorch:" not in provisioner
+    assert not re.search(r"^IMAGE\s*=", provisioner, re.M)
+
+
 # ---------------------------------------------------------------------------
 # pre-spend gate ordering
 # ---------------------------------------------------------------------------
@@ -159,10 +172,15 @@ def test_paired_k_arms_use_same_adapter_and_bounded_evals():
 
 def test_resume_requires_full_expected_contract_validation():
     src = _src()
-    # run validation carries model/rev/seed/label/k/steps expectations
-    for flag in ("--expect-model", "--expect-rev", "--expect-seed",
-                 "--expect-label", "--expect-k", "--expect-steps"):
-        assert flag in src, f"run contract flag {flag} missing"
+    # run validation carries the FULL canonical contract: model/rev/
+    # suite/seed/label/k/steps + the canonical config-recipe digest
+    expect_run_start = src.index("expect_run=(")
+    expect_run_block = src[expect_run_start:src.index(")",
+                                                      expect_run_start)]
+    for flag in ("--expect-model", "--expect-rev", "--expect-suite",
+                 "--expect-seed", "--expect-label", "--expect-k",
+                 "--expect-steps", "--expect-config-sha256"):
+        assert flag in expect_run_block, f"run contract flag {flag} missing"
     # eval validation carries model/rev/suite/digest/split/ablation/k/seed
     for flag in ("--expect-suite", "--expect-digest", "--expect-split",
                  "--expect-ablation"):
