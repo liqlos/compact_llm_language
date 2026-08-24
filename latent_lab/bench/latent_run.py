@@ -173,7 +173,7 @@ def cmd_train(args):
 
     order = list(range(len(train)))
     history = []
-    best = {"acc": -1.0, "state": None, "step": -1}
+    tracker = BestCheckpointTracker()
     t0 = time.perf_counter()
     base_lr = args.lr
 
@@ -199,8 +199,7 @@ def cmd_train(args):
                                    args.k, detach_z0=args.detach_z0)
         opt.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(params, args.clip)
-        opt.step()
+        guarded_optimizer_step(opt, loss, params, args.clip)
         final_loss = float(loss.detach())
         if step % 50 == 0 or step == args.steps - 1:
             print(f"step {step} loss {final_loss:.4f} lr {lr_at(step):.2e} "
@@ -212,19 +211,23 @@ def cmd_train(args):
             ev.pop("records")
             history.append(ev)
             print(f"  val acc {ev['accuracy']} @step {step+1}", flush=True)
-            if ev["accuracy"] > best["acc"]:
-                best = {
-                    "acc": ev["accuracy"], "step": step + 1,
-                    "state": rec.adapter_state_dict(),
-                }
+            tracker.update(ev["accuracy"], rec.adapter_state_dict(),
+                           step=step + 1)
 
+    if not tracker.has_best():
+        raise RuntimeError(
+            "training produced no accepted validation checkpoint; "
+            "refusing to fall back to the final state")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    torch.save(best["state"], out / "best_params.pt")
+    rec.load_adapter_state(tracker.best_state())
+    tracker.save(out / "best_params.pt", model_id=args.model,
+                 revision=args.revision)
     report = {
         "config": {
             "mode": ("D-full" if args.interval == "full" else
                      "F-control" if args.k == 0 else "E-localized"),
+            "model": args.model, "revision": args.revision,
             "interval": list(interval), "k": args.k,
             "lora_r": args.lora_r, "lr": args.lr, "steps": args.steps,
             "seed": args.seed, "max_k": args.max_k,
@@ -233,7 +236,7 @@ def cmd_train(args):
         },
         "model": args.model, "revision": args.revision,
         "suite_sha256": suite.manifest()["sha256"],
-        "best_val_acc": best["acc"], "best_step": best["step"],
+        "best_val_acc": tracker.best_score, "best_step": tracker.best_step,
         "val_history": history,
         "final_train_loss": final_loss,
         "gpu_mem": _gpu_mem_report(device),
@@ -243,14 +246,15 @@ def cmd_train(args):
     }
     with open(out / "train_report.json", "w") as fh:
         json.dump(report, fh, indent=1)
-    print(f"[train done] best_val={best['acc']} @step {best['step']} "
-          f"-> {out}")
+    print(f"[train done] best_val={tracker.best_score} "
+          f"@step {tracker.best_step} -> {out}")
 
 
-def load_adapter_state(path):
-    import torch
+def load_adapter_bundle(path, *, model_id, revision):
+    from latent_lab.train.checkpointing import load_adapter_bundle as _load
 
-    return torch.load(Path(path) / "best_params.pt", map_location="cpu")
+    return _load(Path(path) / "best_params.pt", model_id=model_id,
+                 revision=revision)
 
 
 def cmd_eval(args):
@@ -263,12 +267,20 @@ def cmd_eval(args):
     device = args.device
     cfg = json.load(open(Path(args.adapter) / "train_report.json")
                     )["config"]
-    model, tok = load_model(device, cfg.get("model"), cfg.get("revision"))
+    model_id = cfg.get("model")
+    revision = cfg.get("revision")
+    if not isinstance(model_id, str) or not model_id \
+            or not isinstance(revision, str) or not revision:
+        raise ValueError(
+            f"adapter {args.adapter} carries no immutable model/revision "
+            "identity; refusing to evaluate")
+    model, tok = load_model(device, model_id, revision)
     interval = tuple(cfg["interval"])
     rec = LocalizedRecurrence(model, None, interval=interval,
                               max_k=cfg["max_k"], lora_r=cfg["lora_r"],
                               grad_checkpoint=False)
-    state = load_adapter_state(args.adapter)
+    state = load_adapter_bundle(args.adapter, model_id=model_id,
+                                revision=revision)
     rec.load_adapter_state(state)
 
     suite = build_suite()
@@ -305,8 +317,8 @@ def cmd_eval(args):
     if args.out:
         payload = {
             "adapter": args.adapter, "split": split_name,
-            "config": cfg, "model": cfg.get("model"),
-            "revision": cfg.get("revision"),
+            "config": cfg, "model": model_id,
+            "revision": revision,
             "suite_sha256": suite.manifest()["sha256"],
             "device": device, "seed": args.seed,
             "results": results,

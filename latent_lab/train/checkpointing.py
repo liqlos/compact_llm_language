@@ -1,0 +1,331 @@
+"""Runtime-integrity primitives.
+
+Three responsibilities live here:
+  * BestCheckpointTracker — accepts only finite validation metrics over
+    finite states, clones the accepted state, and can reload the selected
+    best state; it never falls back to the final training state.
+  * Identity-bound adapter bundles — the on-disk best_params.pt carries the
+    (model_id, revision) it was trained against plus per-tensor metadata;
+    loads prevalidate every key, tensor type, shape, dtype and finiteness
+    before any tensor is copied, so failed loads are atomic.
+  * guarded_optimizer_step — fail-closed stepping: no optimizer.step()
+    unless loss, gradients, parameters and the clip norm are finite, with
+    rechecks after clipping and after the update.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+from pathlib import Path
+
+try:
+    import torch
+except ImportError:  # pragma: no cover - import-safety without lab group
+    torch = None
+
+
+class CheckpointError(RuntimeError):
+    """Base class for runtime-integrity failures."""
+
+
+class EmptyCheckpointError(CheckpointError):
+    """No accepted checkpoint exists; refusing to fall back to final state."""
+
+
+class NonFiniteMetricError(CheckpointError):
+    """A validation/persisted metric was not finite."""
+
+
+class NonFiniteStateError(CheckpointError):
+    """A checkpoint state contained non-finite values or bad entries."""
+
+
+class NonFiniteTrainingStateError(CheckpointError):
+    """Loss/gradients/parameters/clip-norm were non-finite at step time."""
+
+
+class AdapterBundleError(CheckpointError):
+    """An adapter bundle failed structural or content validation."""
+
+
+class AdapterBundleIdentityError(AdapterBundleError):
+    """Bundle was produced for a different (model_id, revision)."""
+
+
+class AdapterBundleSchemaError(AdapterBundleError):
+    """Bundle violated the metadata schema (key/type/shape/dtype)."""
+
+
+BUNDLE_KIND = "latent_lab.adapter_bundle"
+BUNDLE_FORMAT_VERSION = 1
+
+
+def _require_torch() -> None:
+    if torch is None:
+        raise RuntimeError("torch required for checkpointing")
+
+
+def assert_all_finite(obj, *, where: str = "state") -> None:
+    """Recursively require every floating tensor in obj to be finite."""
+    _require_torch()
+    if torch.is_tensor(obj):
+        if obj.is_floating_point() and not bool(torch.isfinite(obj).all()):
+            raise NonFiniteStateError(f"non-finite tensor at {where}")
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            assert_all_finite(v, where=f"{where}[{k!r}]")
+    elif isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            assert_all_finite(v, where=f"{where}[{i}]")
+
+
+def validated_state_clone(state) -> dict:
+    """Validate a {str: Tensor} state and return detached CPU clones."""
+    _require_torch()
+    if not isinstance(state, dict) or not state:
+        raise NonFiniteStateError("checkpoint state must be a non-empty dict")
+    out = {}
+    for k, v in state.items():
+        if not isinstance(k, str) or not k:
+            raise NonFiniteStateError(f"bad checkpoint key {k!r}")
+        if not torch.is_tensor(v):
+            raise NonFiniteStateError(f"checkpoint value for {k!r} is not a tensor")
+        out[k] = v.detach().to("cpu").clone()
+    assert_all_finite(out, where="checkpoint")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# best-checkpoint tracking
+# ---------------------------------------------------------------------------
+
+class BestCheckpointTracker:
+    """Keep the best finite validation checkpoint; never the final state."""
+
+    def __init__(self) -> None:
+        self._state = None
+        self._score = None
+        self._step = None
+
+    @property
+    def best_score(self):
+        return self._score
+
+    @property
+    def best_step(self):
+        return self._step
+
+    def has_best(self) -> bool:
+        return self._state is not None
+
+    def update(self, score, state, step=None) -> bool:
+        """Accept (score, state) only if both are finite; clone on improve."""
+        try:
+            s = float(score)
+        except (TypeError, ValueError) as e:
+            raise NonFiniteMetricError(f"metric {score!r} is not a number") from e
+        if not math.isfinite(s):
+            raise NonFiniteMetricError(f"validation metric {score!r} is not finite")
+        clean = validated_state_clone(state)
+        improved = self._score is None or s > self._score
+        if improved:
+            self._state = clean
+            self._score = s
+            self._step = None if step is None else float(step)
+        return improved
+
+    def best_state(self) -> dict:
+        """Fresh clones of the selected best state."""
+        if self._state is None:
+            raise EmptyCheckpointError(
+                "no accepted checkpoint; refusing to fall back to final state")
+        return {k: v.clone() for k, v in self._state.items()}
+
+    def apply_best(self, apply_fn):
+        """Reload the selected best state through apply_fn({str: Tensor})."""
+        return apply_fn(self.best_state())
+
+    def save(self, path, *, model_id, revision):
+        """Persist the selected best state as an identity-bound bundle."""
+        state = self.best_state()
+        return save_adapter_bundle(
+            path, state, model_id=model_id, revision=revision,
+            metrics={"best_score": self._score, "best_step": self._step})
+
+
+# ---------------------------------------------------------------------------
+# identity-bound adapter bundles
+# ---------------------------------------------------------------------------
+
+def _require_identity(value, name: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise AdapterBundleIdentityError(f"{name} must be a non-empty string")
+    return value
+
+
+def build_adapter_bundle(state, *, model_id, revision, metrics=None) -> dict:
+    """Build the identity-bound bundle; validates everything up front."""
+    clean = validated_state_clone(state)
+    mid = _require_identity(model_id, "model_id")
+    rev = _require_identity(revision, "revision")
+    met: dict = {}
+    if metrics:
+        if not isinstance(metrics, dict):
+            raise AdapterBundleSchemaError("metrics must be a dict")
+        for k, v in metrics.items():
+            if not isinstance(k, str) or not k:
+                raise AdapterBundleSchemaError(f"bad metric key {k!r}")
+            try:
+                f = float(v)
+            except (TypeError, ValueError) as e:
+                raise AdapterBundleSchemaError(
+                    f"metric {k!r} is not a number") from e
+            if not math.isfinite(f):
+                raise NonFiniteMetricError(
+                    f"refusing to persist non-finite metric {k}={v!r}")
+            met[k] = f
+    tensors = {
+        name: {"data": t, "shape": list(t.shape), "dtype": str(t.dtype)}
+        for name, t in clean.items()
+    }
+    return {
+        "format_version": BUNDLE_FORMAT_VERSION,
+        "kind": BUNDLE_KIND,
+        "model_id": mid,
+        "revision": rev,
+        "metrics": met,
+        "tensors": tensors,
+    }
+
+
+def save_adapter_bundle(path, state, *, model_id, revision, metrics=None) -> dict:
+    """Atomically persist an identity-bound bundle (tmp file + os.replace)."""
+    bundle = build_adapter_bundle(state, model_id=model_id, revision=revision,
+                                  metrics=metrics)
+    _require_torch()
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        torch.save(bundle, tmp)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+    return bundle
+
+
+def load_adapter_bundle(path, *, model_id, revision) -> dict:
+    """Load + fully prevalidate a bundle before returning any tensor.
+
+    Nothing outside this function is mutated; the returned tensors are fresh
+    clones, so a failure anywhere leaves the caller's model untouched.
+    """
+    _require_torch()
+    mid = _require_identity(model_id, "model_id")
+    rev = _require_identity(revision, "revision")
+    p = Path(path)
+    try:
+        bundle = torch.load(p, map_location="cpu", weights_only=True)
+    except Exception as e:  # noqa: BLE001 - any decode failure is a bad bundle
+        raise AdapterBundleError(f"cannot read bundle {p}: {e}") from e
+
+    if not isinstance(bundle, dict):
+        raise AdapterBundleSchemaError("bundle is not a metadata dict")
+    if bundle.get("format_version") != BUNDLE_FORMAT_VERSION:
+        raise AdapterBundleSchemaError(
+            f"unsupported bundle format_version {bundle.get('format_version')!r}")
+    if bundle.get("kind") != BUNDLE_KIND:
+        raise AdapterBundleSchemaError(f"unknown bundle kind {bundle.get('kind')!r}")
+
+    bid = bundle.get("model_id")
+    brev = bundle.get("revision")
+    if not isinstance(bid, str) or not isinstance(brev, str):
+        raise AdapterBundleSchemaError("bundle identity fields missing")
+    if bid != mid or brev != rev:
+        raise AdapterBundleIdentityError(
+            f"bundle identity mismatch: saved for ({bid!r}, {brev!r}), "
+            f"loading into ({mid!r}, {rev!r})")
+
+    met = bundle.get("metrics")
+    if not isinstance(met, dict):
+        raise AdapterBundleSchemaError("bundle metrics missing")
+    for k, v in met.items():
+        if not isinstance(k, str) or isinstance(v, bool) \
+                or not isinstance(v, (int, float)):
+            raise AdapterBundleSchemaError(f"bad persisted metric {k!r}")
+        if not math.isfinite(float(v)):
+            raise NonFiniteMetricError(
+                f"non-finite persisted metric {k}={v!r}")
+
+    tensors = bundle.get("tensors")
+    if not isinstance(tensors, dict) or not tensors:
+        raise AdapterBundleSchemaError("bundle tensors missing")
+
+    out = {}
+    for name, entry in tensors.items():
+        if not isinstance(name, str) or not name:
+            raise AdapterBundleSchemaError(f"bad tensor key {name!r}")
+        if not isinstance(entry, dict) or set(entry) != {"data", "shape", "dtype"}:
+            raise AdapterBundleSchemaError(f"tensor {name!r}: bad metadata entry")
+        data, shape, dtype = entry["data"], entry["shape"], entry["dtype"]
+        if not torch.is_tensor(data):
+            raise AdapterBundleSchemaError(f"tensor {name!r}: data is not a Tensor")
+        if not isinstance(shape, list) or any(
+                not isinstance(x, int) for x in shape):
+            raise AdapterBundleSchemaError(f"tensor {name!r}: bad shape metadata")
+        if list(data.shape) != shape:
+            raise AdapterBundleSchemaError(
+                f"tensor {name!r}: shape {list(data.shape)} != declared {shape}")
+        if not isinstance(dtype, str) or dtype != str(data.dtype):
+            raise AdapterBundleSchemaError(
+                f"tensor {name!r}: dtype {data.dtype} != declared {dtype!r}")
+        if data.is_floating_point() and not bool(torch.isfinite(data).all()):
+            raise NonFiniteStateError(f"tensor {name!r} has non-finite values")
+        out[name] = data.clone()
+    return out
+
+
+# ---------------------------------------------------------------------------
+# fail-closed optimizer stepping
+# ---------------------------------------------------------------------------
+
+def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
+    """Step only when loss, gradients, params and clip norm are all finite.
+
+    Checks run BEFORE any mutation: non-finite loss/gradients/norm raise
+    without calling optimizer.step(), so a bad batch can never silently clip
+    garbage to zero or corrupt weights. Gradients are rechecked after
+    clipping and parameters after the update.
+    """
+    _require_torch()
+    if loss is None or not torch.is_tensor(loss) \
+            or not bool(torch.isfinite(loss.detach()).all()):
+        raise NonFiniteTrainingStateError(
+            "refusing optimizer.step: non-finite loss")
+    pairs = [(p, p.grad) for p in params if p.grad is not None]
+    for _, g in pairs:
+        if not bool(torch.isfinite(g).all()):
+            raise NonFiniteTrainingStateError(
+                "refusing optimizer.step: non-finite gradient")
+    clip = float(clip_norm)
+    if not math.isfinite(clip) or clip <= 0.0:
+        raise NonFiniteTrainingStateError(
+            f"refusing optimizer.step: invalid clip norm {clip_norm!r}")
+    total_sq = torch.zeros((), dtype=torch.float32)
+    for _, g in pairs:
+        total_sq = total_sq + g.detach().float().pow(2).sum()
+    if not math.isfinite(float(torch.sqrt(total_sq))):
+        raise NonFiniteTrainingStateError(
+            "refusing optimizer.step: non-finite gradient norm "
+            "(clip would silently zero it)")
+    torch.nn.utils.clip_grad_norm_([p for p in params], clip)
+    for p, _ in pairs:  # recheck after clipping
+        if not bool(torch.isfinite(p.grad).all()):
+            raise NonFiniteTrainingStateError(
+                "gradients became non-finite after clipping")
+    optimizer.step()
+    for p in params:  # recheck after update
+        if not bool(torch.isfinite(p.detach()).all()):
+            raise NonFiniteTrainingStateError(
+                "parameters became non-finite after optimizer.step")

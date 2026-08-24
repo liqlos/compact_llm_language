@@ -20,6 +20,7 @@ is adapted, so K>0 vs K=0 differences isolate the recurrence itself.
 from __future__ import annotations
 
 import contextlib
+import math
 from dataclasses import dataclass, field
 
 try:
@@ -30,6 +31,10 @@ except ImportError:  # pragma: no cover - import-safety without lab group
 
 class LatentLoopViolation(RuntimeError):
     """Forbidden vocabulary/tokenizer operation inside the latent loop."""
+
+
+class NonFiniteCandidateScores(RuntimeError):
+    """A candidate score was non-finite; ranking is refused."""
 
 
 class VocabGuard:
@@ -110,11 +115,14 @@ class LoRALinear(_Base):
         for p in self.base.parameters():
             p.requires_grad_(False)
         self.scaling = alpha / r
-        dev, dt = next(base.parameters()).device, next(base.parameters()).dtype
+        # master LoRA weights stay fp32 even over a lower-precision backbone
+        dev = next(base.parameters()).device
         self.lora_A = torch.nn.Parameter(torch.zeros(r, base.in_features,
-                                                     dtype=dt, device=dev))
+                                                     dtype=torch.float32,
+                                                     device=dev))
         self.lora_B = torch.nn.Parameter(torch.zeros(base.out_features, r,
-                                                     dtype=dt, device=dev))
+                                                     dtype=torch.float32,
+                                                     device=dev))
         torch.nn.init.kaiming_uniform_(self.lora_A, a=5 ** 0.5)
 
     def forward(self, x):
@@ -150,6 +158,14 @@ def lora_parameters(injected) -> list:
     for lora in injected:
         ps += [lora.lora_A, lora.lora_B]
     return ps
+
+
+def make_step_clock(hidden: int, max_k: int, device=None):
+    """Zero-initialized per-step clock embeddings; always fp32."""
+    clock = torch.nn.Embedding(max_k + 1, hidden, device=device,
+                               dtype=torch.float32)
+    torch.nn.init.zeros_(clock.weight)
+    return clock
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +381,11 @@ class LocalizedRecurrence:
             lp = sum(float(logp[0, j, tid]) for j, tid in enumerate(cand))
             scores.append(lp)
         t3 = time.perf_counter()
+        bad = [i for i, s in enumerate(scores) if not math.isfinite(s)]
+        if bad:
+            raise NonFiniteCandidateScores(
+                f"candidate scores at indices {bad} are not finite "
+                f"({[scores[i] for i in bad]}); refusing to rank")
         order = sorted(range(len(scores)), key=lambda i: -scores[i])
         rep = RecurrenceReport(
             k_steps=k_steps, interval=self.interval,
@@ -426,11 +447,60 @@ class LocalizedRecurrence:
             sd["clock.weight"] = self.clock.weight.detach().to("cpu").clone()
         return sd
 
+    def _expected_adapter_targets(self):
+        targets = {}
+        for i, l in enumerate(self.injected):
+            targets[f"lora.{i}.A"] = l.lora_A
+            targets[f"lora.{i}.B"] = l.lora_B
+        if self.use_clock:
+            targets["clock.weight"] = self.clock.weight
+        return targets
+
     def load_adapter_state(self, sd):
+        """Prevalidate every key/tensor/shape/dtype/finiteness, then copy.
+
+        Nothing is copied until ALL entries validate, so a failed load leaves
+        the live adapter bit-for-bit unchanged (atomic).
+        """
+        from ..train.checkpointing import (
+            AdapterBundleSchemaError, NonFiniteStateError)
+        targets = self._expected_adapter_targets()
+        if not isinstance(sd, dict):
+            raise AdapterBundleSchemaError("adapter state must be a dict")
+        missing = sorted(set(targets) - set(sd))
+        extra = sorted(set(sd) - set(targets))
+        if missing or extra:
+            raise AdapterBundleSchemaError(
+                f"adapter state keys mismatch: missing={missing} "
+                f"unexpected={extra}")
+        staged = {}
+        for key, target in targets.items():
+            t = sd[key]
+            if not torch.is_tensor(t):
+                raise AdapterBundleSchemaError(f"{key}: value is not a Tensor")
+            if tuple(t.shape) != tuple(target.shape):
+                raise AdapterBundleSchemaError(
+                    f"{key}: shape {tuple(t.shape)} != expected "
+                    f"{tuple(target.shape)}")
+            if t.dtype != target.dtype:
+                raise AdapterBundleSchemaError(
+                    f"{key}: dtype {t.dtype} != expected {target.dtype}")
+            if t.is_floating_point() and not bool(torch.isfinite(t).all()):
+                raise NonFiniteStateError(f"{key}: contains non-finite values")
+            staged[key] = t.to(target.device)
         with torch.no_grad():
-            for i, l in enumerate(self.injected):
-                l.lora_A.copy_(sd[f"lora.{i}.A"].to(l.lora_A.device))
-                l.lora_B.copy_(sd[f"lora.{i}.B"].to(l.lora_B.device))
-            if self.use_clock and "clock.weight" in sd:
-                self.clock.weight.copy_(
-                    sd["clock.weight"].to(self.clock.weight.device))
+            for key, target in targets.items():
+                target.copy_(staged[key])
+
+    def export_adapter_bundle(self, path, *, model_id, revision, metrics=None):
+        """Persist this adapter as an identity-bound best_params.pt bundle."""
+        from ..train.checkpointing import save_adapter_bundle
+        return save_adapter_bundle(path, self.adapter_state_dict(),
+                                   model_id=model_id, revision=revision,
+                                   metrics=metrics)
+
+    def load_adapter_bundle(self, path, *, model_id, revision):
+        """Load an identity-bound bundle with full prevalidation."""
+        from ..train.checkpointing import load_adapter_bundle
+        state = load_adapter_bundle(path, model_id=model_id, revision=revision)
+        self.load_adapter_state(state)
