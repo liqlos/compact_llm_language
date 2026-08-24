@@ -90,11 +90,44 @@ class OptimizerStateInspectionError(FatalRunInvalidError):
     """Optimizer state was not a standard inspectable topology (fail-stop)."""
 
 
+class GuardedStepFaultError(FatalRunInvalidError):
+    """Operational fault INSIDE a guarded operation.
+
+    Distinct from NonFiniteTrainingStateError (a detected non-finite
+    state): this is raised when a clipping kernel, optimizer step,
+    parameter postcheck or optimizer-state inspection itself raises.
+    Both are fatal; the run must terminate and never emit artifacts.
+    """
+
+
 BUNDLE_KIND = "latent_lab.adapter_bundle"
 BUNDLE_FORMAT_VERSION = 2
 
-RECIPE_KEYS = ("interval", "max_k", "lora_r", "lora_alpha", "mode",
-               "suite_sha256")
+# Every training-semantic field is canonically bound into the recipe.
+# Missing/extra/invalid fields are rejected — never defaulted — so two
+# materially different trainings can never share an identity.
+RECIPE_KEYS = (
+    "mode",            # D-full / E-localized / F-control
+    "interval",        # [lo, hi) localized layers
+    "k",               # latent steps used at train/eval time
+    "max_k",           # step-clock horizon
+    "lora_r",
+    "lora_alpha",
+    "lr",
+    "steps",           # training steps
+    "seed",
+    "optimizer",       # optimizer name
+    "weight_decay",
+    "lr_schedule",     # constant | cosine
+    "warmup",
+    "clip",
+    "detach_z0",
+    "grad_checkpoint",
+    "suite_sha256",    # exact suite manifest digest
+    "config_sha256",   # canonical digest over the normalized config above
+)
+
+_LR_SCHEDULES = ("constant", "cosine")
 
 _PINNED_REVISION_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
@@ -209,9 +242,74 @@ def write_train_generation(out_dir, *, manifest: dict,
     return manifest
 
 
+RUN_MANIFEST_REQUIRED_KEYS = (
+    "kind", "status", "report_sha256", "checkpoint_sha256",
+    "checkpoint_content_digest", "identity", "recipe", "suite_sha256",
+    "seed", "argv", "dependencies",
+)
+
+
+def _read_json_file(path) -> tuple[dict, str]:
+    p = Path(path)
+    try:
+        raw = p.read_bytes()
+    except OSError as e:
+        raise CheckpointError(f"{p}: unreadable artifact: {e}") from e
+    digest = hashlib.sha256(raw).hexdigest()
+    try:
+        return json.loads(raw), digest
+    except Exception as e:  # noqa: BLE001 - unreadable JSON fails closed
+        raise CheckpointError(f"{p}: invalid JSON: {e}") from e
+
+
+def verify_manifest_schema(manifest, *, where: str = "manifest") -> dict:
+    """Require the full run-manifest schema, kind and complete status."""
+    if not isinstance(manifest, dict):
+        raise CheckpointError(f"{where}: not a JSON object")
+    missing = [k for k in RUN_MANIFEST_REQUIRED_KEYS if k not in manifest]
+    if missing:
+        raise CheckpointError(
+            f"{where}: missing required fields {missing}; refusing a "
+            "partial manifest as evidence")
+    if manifest.get("kind") != "latent_lab.train_generation":
+        raise CheckpointError(
+            f"{where}: kind {manifest.get('kind')!r} is not "
+            "'latent_lab.train_generation'")
+    if manifest.get("status") != "complete":
+        raise CheckpointError(
+            f"{where}: status {manifest.get('status')!r} is not 'complete'")
+    for key in ("report_sha256", "checkpoint_sha256",
+                "checkpoint_content_digest"):
+        v = manifest.get(key)
+        if not isinstance(v, str) or not _SHA256_RE.fullmatch(v):
+            raise CheckpointError(f"{where}: {key} is not a 64-hex sha256")
+    ident = manifest.get("identity")
+    if not isinstance(ident, dict) \
+            or not isinstance(ident.get("model_id"), str) \
+            or not ident["model_id"].strip() \
+            or not isinstance(ident.get("revision"), str):
+        raise CheckpointError(f"{where}: identity must bind model_id+revision")
+    require_pinned_revision(ident["revision"], name="manifest revision")
+    suite = manifest.get("suite_sha256")
+    if not isinstance(suite, str) or not _SHA256_RE.fullmatch(suite):
+        raise CheckpointError(f"{where}: suite_sha256 is not 64-hex")
+    seed = manifest.get("seed")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise CheckpointError(f"{where}: seed must be an int")
+    argv = manifest.get("argv")
+    if not isinstance(argv, list) or not argv \
+            or any(not isinstance(a, str) or not a for a in argv):
+        raise CheckpointError(f"{where}: argv must be a non-empty str list")
+    deps = manifest.get("dependencies")
+    if not isinstance(deps, dict) or not deps:
+        raise CheckpointError(f"{where}: dependencies must be a non-empty dict")
+    validate_recipe(manifest.get("recipe"))
+    return manifest
+
+
 def verify_generation(adapter_dir) -> dict:
     """Fail closed unless report/checkpoint/manifest form one coherent,
-    digest-linked generation of a COMPLETE run."""
+    digest-linked generation of a COMPLETE run under the FULL schema."""
     adapter_dir = Path(adapter_dir)
     require_complete_run(adapter_dir)
     manifest_path = adapter_dir / RUN_MANIFEST_FILE
@@ -219,11 +317,18 @@ def verify_generation(adapter_dir) -> dict:
         raise CheckpointError(
             f"{adapter_dir}: no {RUN_MANIFEST_FILE}; refusing unverified "
             "checkpoint generation")
+    manifest, _ = _read_json_file(manifest_path)
     try:
-        manifest = json.loads(manifest_path.read_text())
-    except Exception as e:  # noqa: BLE001 - unreadable manifest fails closed
+        verify_manifest_schema(manifest, where=f"{adapter_dir}: manifest")
+    except AdapterBundleSchemaError as e:
+        raise AdapterBundleIdentityError(
+            f"{adapter_dir}: manifest recipe is not a valid canonical "
+            f"recipe: {e}") from e
+    except CheckpointError:
+        raise
+    except Exception as e:  # noqa: BLE001 - schema faults fail closed
         raise CheckpointError(
-            f"{adapter_dir}: unreadable {RUN_MANIFEST_FILE}: {e}") from e
+            f"{adapter_dir}: manifest failed schema verification: {e}") from e
     report_path = adapter_dir / TRAIN_REPORT_FILE
     ckpt_path = adapter_dir / CHECKPOINT_FILE
     for name, path in (("report", report_path), ("checkpoint", ckpt_path)):
@@ -380,8 +485,120 @@ def _require_identity(value, name: str) -> str:
     return normalized
 
 
+def _recipe_int(v, name: str, *, minimum: int) -> int:
+    if isinstance(v, bool) or not isinstance(v, int) or v < minimum:
+        raise AdapterBundleSchemaError(
+            f"recipe.{name} must be an int >= {minimum}; got {v!r}")
+    return v
+
+
+def _recipe_float(v, name: str, *, minimum_exclusive=None,
+                  minimum=None) -> float:
+    if isinstance(v, bool) or not isinstance(v, (int, float)) \
+            or not math.isfinite(float(v)):
+        raise AdapterBundleSchemaError(
+            f"recipe.{name} must be a finite number; got {v!r}")
+    f = float(v)
+    if minimum_exclusive is not None and not f > minimum_exclusive:
+        raise AdapterBundleSchemaError(
+            f"recipe.{name} must be > {minimum_exclusive}; got {f!r}")
+    if minimum is not None and not f >= minimum:
+        raise AdapterBundleSchemaError(
+            f"recipe.{name} must be >= {minimum}; got {f!r}")
+    return f
+
+
+def canonical_config_digest(normalized_cfg: dict) -> str:
+    """sha256 over the canonical JSON of a normalized semantic config."""
+    payload = json.dumps(normalized_cfg, sort_keys=True,
+                         separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def recipe_from_config(cfg: dict, suite_sha256: str) -> dict:
+    """The exact training-semantic identity a config implies (validated).
+
+    Every field is REQUIRED — missing fields are rejected, never
+    defaulted. The returned recipe is the canonical normalized form; its
+    ``config_sha256`` binds all training-semantic fields at once so that
+    any K/LR/steps/seed/optimizer/schedule/clip/detach change produces a
+    materially different identity.
+    """
+    if not isinstance(cfg, dict):
+        raise AdapterBundleSchemaError("config must be a dict")
+    _SEMANTIC_CFG_KEYS = ("mode", "interval", "k", "max_k", "lora_r",
+                          "lora_alpha", "lr", "steps", "seed", "optimizer",
+                          "weight_decay", "lr_schedule", "warmup", "clip",
+                          "detach_z0", "grad_checkpoint")
+    missing = [k for k in _SEMANTIC_CFG_KEYS if k not in cfg]
+    if missing:
+        raise AdapterBundleSchemaError(
+            f"config is missing training-semantic fields {missing}; "
+            "refusing to default the training identity")
+    mode = cfg["mode"]
+    if not isinstance(mode, str) or not mode.strip():
+        raise AdapterBundleSchemaError("config.mode must be a non-empty string")
+    interval = cfg["interval"]
+    if (not isinstance(interval, (list, tuple)) or len(interval) != 2
+            or any(isinstance(x, bool) or not isinstance(x, int)
+                   for x in interval)):
+        raise AdapterBundleSchemaError("config.interval must be [lo, hi] ints")
+    lo, hi = interval
+    if not (0 <= lo < hi):
+        raise AdapterBundleSchemaError(
+            f"config.interval must satisfy 0<=lo<hi; got {[lo, hi]}")
+    detach_z0 = cfg["detach_z0"]
+    grad_checkpoint = cfg["grad_checkpoint"]
+    for name, v in (("detach_z0", detach_z0), ("grad_checkpoint",
+                                               grad_checkpoint)):
+        if not isinstance(v, bool):
+            raise AdapterBundleSchemaError(f"config.{name} must be a bool")
+    schedule = cfg["lr_schedule"]
+    if schedule not in _LR_SCHEDULES:
+        raise AdapterBundleSchemaError(
+            f"config.lr_schedule must be one of {_LR_SCHEDULES}; "
+            f"got {schedule!r}")
+    optimizer = cfg["optimizer"]
+    if not isinstance(optimizer, str) or not optimizer.strip():
+        raise AdapterBundleSchemaError(
+            "config.optimizer must be a non-empty string")
+    seed = cfg["seed"]
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise AdapterBundleSchemaError(f"config.seed must be an int")
+    normalized = {
+        "mode": mode.strip(),
+        "interval": [int(lo), int(hi)],
+        "k": _recipe_int(cfg["k"], "k", minimum=0),
+        "max_k": _recipe_int(cfg["max_k"], "max_k", minimum=1),
+        "lora_r": _recipe_int(cfg["lora_r"], "lora_r", minimum=1),
+        "lora_alpha": _recipe_float(cfg["lora_alpha"], "lora_alpha",
+                                    minimum_exclusive=0.0),
+        "lr": _recipe_float(cfg["lr"], "lr", minimum_exclusive=0.0),
+        "steps": _recipe_int(cfg["steps"], "steps", minimum=1),
+        "seed": seed,
+        "optimizer": optimizer.strip(),
+        "weight_decay": _recipe_float(cfg["weight_decay"], "weight_decay",
+                                      minimum=0.0),
+        "lr_schedule": schedule,
+        "warmup": _recipe_int(cfg["warmup"], "warmup", minimum=0),
+        "clip": _recipe_float(cfg["clip"], "clip", minimum_exclusive=0.0),
+        "detach_z0": detach_z0,
+        "grad_checkpoint": grad_checkpoint,
+    }
+    normalized["config_sha256"] = canonical_config_digest(normalized)
+    normalized["suite_sha256"] = suite_sha256
+    # the built recipe must itself pass the strict schema it will be
+    # verified against on every load/resume
+    return validate_recipe(normalized)
+
+
 def validate_recipe(recipe) -> dict:
-    """Strictly validate the recurrence/training recipe bound into bundles."""
+    """Strictly validate the recurrence/training recipe bound into bundles.
+
+    The key set must match RECIPE_KEYS exactly (missing AND extra keys are
+    rejected), every field must be valid, and ``config_sha256`` must be
+    the exact canonical digest of the other semantic fields.
+    """
     if not isinstance(recipe, dict):
         raise AdapterBundleSchemaError("recipe must be a dict")
     if set(recipe) != set(RECIPE_KEYS):
@@ -397,29 +614,63 @@ def validate_recipe(recipe) -> dict:
     if not (0 <= lo < hi):
         raise AdapterBundleSchemaError(f"recipe.interval must satisfy 0<=lo<hi; "
                                        f"got {[lo, hi]}")
-    for key in ("max_k", "lora_r"):
-        v = recipe[key]
-        if isinstance(v, bool) or not isinstance(v, int) or v < 1:
-            raise AdapterBundleSchemaError(f"recipe.{key} must be a positive int")
-    alpha = recipe["lora_alpha"]
-    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) \
-            or not math.isfinite(float(alpha)) or float(alpha) <= 0:
-        raise AdapterBundleSchemaError("recipe.lora_alpha must be positive finite")
     mode = recipe["mode"]
     if not isinstance(mode, str) or not mode.strip():
         raise AdapterBundleSchemaError("recipe.mode must be a non-empty string")
+    optimizer = recipe["optimizer"]
+    if not isinstance(optimizer, str) or not optimizer.strip():
+        raise AdapterBundleSchemaError(
+            "recipe.optimizer must be a non-empty string")
+    schedule = recipe["lr_schedule"]
+    if schedule not in _LR_SCHEDULES:
+        raise AdapterBundleSchemaError(
+            f"recipe.lr_schedule must be one of {_LR_SCHEDULES}; got "
+            f"{schedule!r}")
+    for name in ("detach_z0", "grad_checkpoint"):
+        if not isinstance(recipe[name], bool):
+            raise AdapterBundleSchemaError(f"recipe.{name} must be a bool")
+    seed = recipe["seed"]
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise AdapterBundleSchemaError("recipe.seed must be an int")
     suite = recipe["suite_sha256"]
     if not isinstance(suite, str) or not _SHA256_RE.fullmatch(suite):
         raise AdapterBundleSchemaError(
             "recipe.suite_sha256 must be a 64-hex suite manifest digest")
     out = {
-        "interval": [int(lo), int(hi)],
-        "max_k": int(recipe["max_k"]),
-        "lora_r": int(recipe["lora_r"]),
-        "lora_alpha": float(alpha),
         "mode": mode.strip(),
+        "interval": [int(lo), int(hi)],
+        "k": _recipe_int(recipe["k"], "k", minimum=0),
+        "max_k": _recipe_int(recipe["max_k"], "max_k", minimum=1),
+        "lora_r": _recipe_int(recipe["lora_r"], "lora_r", minimum=1),
+        "lora_alpha": _recipe_float(recipe["lora_alpha"], "lora_alpha",
+                                    minimum_exclusive=0.0),
+        "lr": _recipe_float(recipe["lr"], "lr", minimum_exclusive=0.0),
+        "steps": _recipe_int(recipe["steps"], "steps", minimum=1),
+        "seed": seed,
+        "optimizer": optimizer.strip(),
+        "weight_decay": _recipe_float(recipe["weight_decay"],
+                                      "weight_decay", minimum=0.0),
+        "lr_schedule": schedule,
+        "warmup": _recipe_int(recipe["warmup"], "warmup", minimum=0),
+        "clip": _recipe_float(recipe["clip"], "clip",
+                              minimum_exclusive=0.0),
+        "detach_z0": recipe["detach_z0"],
+        "grad_checkpoint": recipe["grad_checkpoint"],
         "suite_sha256": suite.lower(),
     }
+    digest = recipe["config_sha256"]
+    if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
+        raise AdapterBundleSchemaError(
+            "recipe.config_sha256 must be a 64-hex canonical config digest")
+    expected = canonical_config_digest({
+        k: out[k] for k in RECIPE_KEYS if k not in
+        ("suite_sha256", "config_sha256")})
+    if digest.lower() != expected:
+        raise AdapterBundleIdentityError(
+            f"recipe.config_sha256 mismatch: bound {digest.lower()!r}, "
+            f"but semantic fields canonically hash to {expected!r}; the "
+            "recipe is internally inconsistent")
+    out["config_sha256"] = digest.lower()
     return out
 
 
@@ -510,15 +761,15 @@ def save_adapter_bundle(path, state, *, model_id, revision, recipe,
     return bundle
 
 
-def load_adapter_bundle(path, *, model_id, revision, recipe) -> dict:
-    """Load + fully prevalidate a v2 bundle before returning any tensor.
+def _decode_and_verify_bundle(path, *, model_id, revision,
+                              recipe) -> dict:
+    """Decode + fully prevalidate a v2 bundle; return the raw bundle dict.
 
     Validation order (all fail-closed, nothing outside is mutated):
       decode -> version/kind -> identity (model_id/revision) ->
       recipe equality -> content digest (detects ANY tampering including
       finite value edits) -> metric finiteness -> per-tensor
-      shape/dtype/digest/finiteness.
-    Returned tensors are fresh clones on CPU.
+      shape/dtype/digest/finiteness before anything is returned.
     """
     _require_torch()
     mid = _require_identity(model_id, "model_id")
@@ -619,8 +870,34 @@ def load_adapter_bundle(path, *, model_id, revision, recipe) -> dict:
         if (data.is_floating_point() or data.is_complex()) \
                 and not bool(torch.isfinite(data).all()):
             raise NonFiniteStateError(f"tensor {name!r} has non-finite values")
-        out[name] = data.clone()
-    return out
+    return bundle
+
+
+def load_adapter_bundle(path, *, model_id, revision, recipe) -> dict:
+    """Load + fully prevalidate a v2 bundle before returning any tensor.
+
+    Returned tensors are fresh clones on CPU.
+    """
+    bundle = _decode_and_verify_bundle(path, model_id=model_id,
+                                       revision=revision, recipe=recipe)
+    return {name: entry["data"].clone()
+            for name, entry in bundle["tensors"].items()}
+
+
+def inspect_adapter_bundle(path, *, model_id, revision, recipe) -> dict:
+    """Fully verify a bundle and return its METADATA (no tensor payloads).
+
+    Runs the exact same fail-closed validation as load_adapter_bundle
+    (decode/version/kind/identity/recipe/content digest/metrics/
+    per-tensor byte digests + finiteness) for artifact validators that
+    must prove a checkpoint is a genuine identity-bound bundle without
+    materializing it into a runtime.
+    """
+    bundle = _decode_and_verify_bundle(path, model_id=model_id,
+                                       revision=revision, recipe=recipe)
+    meta = {k: v for k, v in bundle.items() if k != "tensors"}
+    meta["tensor_names"] = sorted(bundle["tensors"])
+    return meta
 
 
 # ---------------------------------------------------------------------------
@@ -630,20 +907,73 @@ def load_adapter_bundle(path, *, model_id, revision, recipe) -> dict:
 _SCALAR_OK = (int, float, type(None))
 
 
-def _all_finite_fused(tensors: list) -> bool:
-    """One fused multi-tensor reduction for a whole finiteness domain.
+def _acc_dtype_for(device: torch.device) -> torch.dtype:
+    """Accumulation dtype for a bucket's device-local reduction.
 
-    A non-finite entry necessarily produces a non-finite fused norm
-    (NaN/Inf survive squared-sum reductions), so a single scalar check
-    validates arbitrarily many tensors with minimal launches.
+    float64 wherever the backend supports it (CPU/CUDA); backends without
+    float64 (e.g. MPS) accumulate in float32 — the same fail-closed
+    bias as before (overflow still implies non-finite-scale state).
+    """
+    if getattr(device, "type", "") == "mps":
+        return torch.float32
+    return torch.float64
+
+
+def _bucket_sq_accumulators(tensors: list) -> dict:
+    """One device-local fused squared-norm accumulator per (device, dtype).
+
+    Tensors are grouped by their exact ``(device, dtype)`` bucket; each
+    bucket is reduced with a single ``torch._foreach_norm`` pass into an
+    accumulator CREATED ON THAT BUCKET'S DEVICE (in that device's
+    supported accumulation dtype). No CPU or device-unspecified
+    accumulator ever touches accelerator norms, and the host reads at
+    most one scalar per bucket — never one per tensor/parameter.
+    NaN/Inf survive squared-sum reductions, so a non-finite accumulator
+    implies some input was non-finite.
     """
     if not tensors:
-        return True
-    total_sq = torch.zeros((), dtype=torch.float32)
-    for n in torch._foreach_norm(tensors):
-        n32 = n.to(torch.float32)
-        total_sq = total_sq + n32 * n32
-    return math.isfinite(float(total_sq.sqrt()))
+        return {}
+    groups: dict = {}
+    for t in tensors:
+        if not torch.is_tensor(t):
+            raise GuardedStepFaultError(
+                f"non-tensor {type(t).__name__} in fused reduction domain")
+        groups.setdefault((str(t.device), str(t.dtype)), []).append(t)
+    accs = {}
+    for key, group in groups.items():
+        dev = group[0].device
+        acc_dtype = _acc_dtype_for(dev)
+        acc = torch.zeros((), device=dev, dtype=acc_dtype)
+        for n in torch._foreach_norm(group):
+            n_up = n.to(acc_dtype)
+            acc = acc + n_up * n_up
+        accs[key] = acc
+    return accs
+
+
+def _all_finite_fused(tensors: list) -> bool:
+    """Finiteness of arbitrarily many tensors across devices/dtypes.
+
+    Bounded synchronization contract: at most ONE host decision per
+    (device, dtype) bucket; the reduction itself is fully device-local.
+    """
+    for acc in _bucket_sq_accumulators(tensors).values():
+        if not math.isfinite(float(acc.sqrt())):  # single host read/bucket
+            return False
+    return True
+
+
+def _fused_total_norm(tensors: list) -> float:
+    """Global L2 norm across every device/dtype bucket.
+
+    Mirrors clip_grad_norm_'s squared-sum computation while keeping the
+    host read bounded at one per bucket. A non-finite input necessarily
+    yields a non-finite total.
+    """
+    total = 0.0
+    for acc in _bucket_sq_accumulators(tensors).values():
+        total += float(acc)  # single host read per bucket
+    return math.sqrt(total)
 
 
 def _inspect_state_tree(obj, where: str, seen: set[int],
@@ -699,25 +1029,37 @@ def validate_optimizer_state_standard_and_finite(optimizer) -> None:
 
     Topology must be the standard mappings/sequences/scalars/tensors
     layout (anything else is fatal fail-stop); finiteness of all floating
-    state tensors is verified in ONE fused reduction.
+    state tensors is verified in ONE device-bucketed fused reduction.
+    ANY exception raised by the inspection itself surfaces as
+    OptimizerStateInspectionError (a fatal subclass) preserving cause —
+    a faulting inspection can never leak a raw foreign exception.
     """
     _require_torch()
-    state = getattr(optimizer, "state", None)
-    if state is None:
-        raise OptimizerStateInspectionError("optimizer has no .state mapping")
-    if not isinstance(state, dict):
-        raise OptimizerStateInspectionError(
-            f"optimizer.state is {type(state).__name__}, not a dict")
-    float_tensors: list = []
-    for p, entry in state.items():
-        if not torch.is_tensor(p) and not hasattr(p, "grad"):
+    try:
+        state = getattr(optimizer, "state", None)
+        if state is None:
             raise OptimizerStateInspectionError(
-                f"optimizer.state keyed by non-parameter {p!r}")
-        # one walk enforces the standard topology AND collects leaves
-        _inspect_state_tree(entry, f"state[{id(p):#x}]", set(), float_tensors)
-    if not _all_finite_fused(float_tensors):
-        raise NonFiniteTrainingStateError(
-            "non-finite optimizer-state tensor after optimizer.step")
+                "optimizer has no .state mapping")
+        if not isinstance(state, dict):
+            raise OptimizerStateInspectionError(
+                f"optimizer.state is {type(state).__name__}, not a dict")
+        float_tensors: list = []
+        for p, entry in state.items():
+            if not torch.is_tensor(p) and not hasattr(p, "grad"):
+                raise OptimizerStateInspectionError(
+                    f"optimizer.state keyed by non-parameter {p!r}")
+            # one walk enforces the standard topology AND collects leaves
+            _inspect_state_tree(entry, f"state[{id(p):#x}]", set(),
+                                float_tensors)
+        if not _all_finite_fused(float_tensors):
+            raise NonFiniteTrainingStateError(
+                "non-finite optimizer-state tensor after optimizer.step")
+    except FatalRunInvalidError:
+        raise
+    except Exception as e:  # noqa: BLE001 - inspection faults are fatal
+        raise OptimizerStateInspectionError(
+            f"optimizer-state inspection faulted "
+            f"({type(e).__name__}: {e}); fail-stop") from e
 
 
 # ---------------------------------------------------------------------------
@@ -752,18 +1094,35 @@ def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
     Cheap fail-stop contract (deliberately NO snapshot/rollback):
       PRE-STEP (nothing mutated yet): finite loss tensor, positive finite
       clip norm, finite owned parameters (union of optimizer groups and
-      the caller's iterable), and ONE fused gradient-norm pass whose
-      non-finite result implies some gradient (or the norm itself) is
-      non-finite — NaN/Inf cannot survive a squared-sum reduction.
-      CLIP: gradients scaled at most once (single pass), then rechecked.
+      the caller's iterable), and ONE device-bucketed gradient-norm pass
+      whose non-finite result implies some gradient (or the norm itself)
+      is non-finite — NaN/Inf cannot survive a squared-sum reduction.
+      CLIP: gradients scaled at most once (single fused pass), then
+      rechecked with the same bounded helper (<=1 host decision per
+      device/dtype bucket, never one per gradient).
       STEP: optimizer.step(); any exception is fatal.
       POST: every owned parameter AND all standard optimizer-state tensors
-      rechecked for finiteness.
-    Any failure raises FatalRunInvalidError (or a subclass): the caller
-    must terminate the run, must not retry this optimizer, and must not
-    write success artifacts from the possibly mutated in-memory state.
+      rechecked for finiteness through the same bounded helper.
+    ANY clipping, step, parameter-postcheck, optimizer-state-inspection or
+    helper fault after the guarded operation begins surfaces as
+    FatalRunInvalidError (or an explicit fatal subclass) preserving the
+    original cause. The caller must terminate the run, must not retry this
+    optimizer, and must not write success artifacts from the possibly
+    mutated in-memory state.
     """
     _require_torch()
+    try:
+        _guarded_step_checked(optimizer, loss, params, clip_norm)
+    except FatalRunInvalidError:
+        raise
+    except Exception as e:  # noqa: BLE001 - any guarded-op fault is fatal
+        raise GuardedStepFaultError(
+            f"guarded optimizer step faulted ({type(e).__name__}: {e}); "
+            "run invalid, no rollback attempted") from e
+
+
+def _guarded_step_checked(optimizer, loss, params, clip_norm) -> None:
+    """guarded_optimizer_step body; every raise here is fatal."""
     # -- pre-step validation: nothing has been mutated yet -------------------
     if loss is None or not torch.is_tensor(loss) \
             or not bool(torch.isfinite(loss.detach()).all()):
@@ -785,7 +1144,7 @@ def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
         if not torch.is_tensor(p):
             raise NonFiniteTrainingStateError(
                 "refusing optimizer.step: non-parameter in owned set")
-    # ONE fused reduction validates every owned parameter
+    # ONE device-bucketed reduction validates every owned parameter
     if not _all_finite_fused([p.detach() for p in owned]):
         raise NonFiniteTrainingStateError(
             "refusing optimizer.step: non-finite parameter")
@@ -794,14 +1153,11 @@ def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
     if not grads:
         raise NonFiniteTrainingStateError(
             "refusing optimizer.step: no gradients attached (call backward)")
-    # ONE fused reduction: a non-finite gradient necessarily produces a
-    # non-finite total norm, so this single pass validates grads + norm.
-    # Mirrors clip_grad_norm_'s own computation, so no second pass is due.
-    total_sq = torch.zeros((), dtype=torch.float32)
-    for n in torch._foreach_norm(grads):
-        n32 = n.to(torch.float32)
-        total_sq = total_sq + n32 * n32
-    total_norm = float(total_sq.sqrt())
+    # ONE device-bucketed reduction: a non-finite gradient necessarily
+    # produces a non-finite total norm, so this single pass validates
+    # grads + norm. Mirrors clip_grad_norm_'s own computation, so no
+    # second pass is due; host reads stay bounded per device/dtype bucket.
+    total_norm = _fused_total_norm(grads)
     if not math.isfinite(total_norm):
         raise NonFiniteTrainingStateError(
             "refusing optimizer.step: non-finite gradient or gradient norm "
@@ -812,11 +1168,11 @@ def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
     if clip_coef < 1.0:
         torch._foreach_mul_(grads, clip_coef)
         # scaling finite tensors by <1 cannot create NaN/Inf, but the
-        # recheck is contract-mandated evidence against hostile grad impls
-        for g in grads:
-            if not bool(torch.isfinite(g).all()):
-                raise NonFiniteTrainingStateError(
-                    "gradients became non-finite after clipping")
+        # recheck is contract-mandated evidence against hostile grad impls;
+        # it uses the SAME bounded bucketed helper (no per-gradient sync)
+        if not _all_finite_fused(grads):
+            raise NonFiniteTrainingStateError(
+                "gradients became non-finite after clipping")
 
     # -- step (no snapshot is taken; recovery is from the committed bundle) --
     try:

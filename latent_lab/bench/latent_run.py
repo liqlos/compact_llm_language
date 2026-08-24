@@ -226,16 +226,17 @@ def _dependency_versions() -> dict:
 
 
 def recipe_from_config(cfg: dict, suite_sha256: str) -> dict:
-    """The exact recurrence/training recipe a config implies (validated)."""
-    from latent_lab.train.checkpointing import validate_recipe
-    return validate_recipe({
-        "interval": list(cfg["interval"]),
-        "max_k": int(cfg["max_k"]),
-        "lora_r": int(cfg["lora_r"]),
-        "lora_alpha": float(cfg.get("lora_alpha", 16.0)),
-        "mode": str(cfg["mode"]),
-        "suite_sha256": suite_sha256,
-    })
+    """Canonical exact-identity recipe implied by cfg (re-exported)."""
+    from latent_lab.train.checkpointing import recipe_from_config
+    return recipe_from_config(cfg, suite_sha256)
+
+
+def _mark_run_fatal(out: Path, e: BaseException) -> None:
+    """Atomically mark the run fatal; no success artifact may follow."""
+    from latent_lab.train.checkpointing import write_run_status
+    write_run_status(out, "fatal",
+                     command=" ".join(sys.argv),
+                     error_type=type(e).__name__, error=str(e))
 
 
 def cmd_train(args):
@@ -254,9 +255,13 @@ def cmd_train(args):
         _train_inner(args, out, device, revision)
     except FatalRunInvalidError as e:
         # explicit fatal status; NO success artifact may exist afterwards
-        write_run_status(out, "fatal",
-                         command=" ".join(sys.argv),
-                         error_type=type(e).__name__, error=str(e))
+        _mark_run_fatal(out, e)
+        raise
+    except Exception as e:
+        # an unexpected crash must never leave the run marked 'running'
+        # (which readers could confuse with an active/incomplete run);
+        # it is marked fatal atomically and re-raised unchanged
+        _mark_run_fatal(out, e)
         raise
     write_run_status(out, "complete",
                      command=" ".join(sys.argv))
@@ -279,7 +284,11 @@ def _train_inner(args, out: Path, device: str, revision: str):
                               grad_checkpoint=True)
     rec.clock.to(device)
     params = [p for p in rec.trainable_parameters()]
-    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.01)
+    if args.optimizer != "adamw":
+        raise ValueError(f"unsupported optimizer {args.optimizer!r}; "
+                         "supported: ['adamw']")
+    opt = torch.optim.AdamW(params, lr=args.lr,
+                            weight_decay=args.weight_decay)
 
     suite = build_suite()
     train = SuiteTensors(tok, list(suite.train))
@@ -342,6 +351,7 @@ def _train_inner(args, out: Path, device: str, revision: str):
 
     mode = ("D-full" if args.interval == "full"
             else "F-control" if args.k == 0 else "E-localized")
+    suite_sha = suite.manifest()["sha256"]
     cfg = {
         "mode": mode,
         "model": args.model, "revision": revision,
@@ -349,10 +359,15 @@ def _train_inner(args, out: Path, device: str, revision: str):
         "lora_r": args.lora_r, "lora_alpha": args.lora_alpha,
         "lr": args.lr, "steps": args.steps,
         "seed": args.seed, "max_k": args.max_k,
-        "detach_z0": args.detach_z0, "device": device,
-        "train_examples": len(train), "grad_checkpoint": True,
+        "optimizer": args.optimizer, "weight_decay": args.weight_decay,
+        "lr_schedule": args.lr_schedule, "warmup": args.warmup,
+        "clip": args.clip, "detach_z0": args.detach_z0,
+        "grad_checkpoint": True,
+        "device": device,
+        "train_examples": len(train),
+        "label": getattr(args, "label", None),
+        "suite_sha256": suite_sha,
     }
-    suite_sha = suite.manifest()["sha256"]
     recipe = recipe_from_config(cfg, suite_sha)
 
     # reload the SELECTED BEST before reporting/saving — final state is
@@ -361,7 +376,7 @@ def _train_inner(args, out: Path, device: str, revision: str):
     bundle_path = out / "best_params.pt"
     bundle = rec.export_adapter_bundle(
         bundle_path, model_id=args.model, revision=revision,
-        suite_sha256=suite_sha, mode=mode,
+        config=cfg,
         metrics={"best_val_acc": tracker.best_score})
     report = {
         "config": cfg,
@@ -393,6 +408,7 @@ def _train_inner(args, out: Path, device: str, revision: str):
         "dependencies": _dependency_versions(),
         "precision": report["precision"],
         "seed": args.seed,
+        "label": getattr(args, "label", None),
         "identity": {"model_id": args.model, "revision": revision},
         "recipe": recipe,
         "suite_sha256": suite_sha,
@@ -433,9 +449,12 @@ def cmd_eval(args):
     from latent_lab.bench.suite import build_suite
     from latent_lab.train.checkpointing import (
         AdapterBundleError,
+        AdapterBundleIdentityError,
         atomic_write_json,
         load_adapter_bundle,
+        recipe_from_config,
         require_pinned_revision,
+        verify_generation,
     )
 
     torch.manual_seed(args.seed)
@@ -462,8 +481,38 @@ def cmd_eval(args):
     # Identity-validate + digest-verify the on-disk generation and bundle
     # BEFORE any model/tokenizer load: a tampered adapter must never
     # trigger an arbitrary model fetch prior to rejection.
-    verify_generation(args.adapter)
+    manifest = verify_generation(args.adapter)
+    report_recipe = report.get("recipe")
     recipe = recipe_from_config(cfg, suite_sha)
+    if report_recipe != recipe:
+        raise AdapterBundleIdentityError(
+            f"adapter {args.adapter}: train_report recipe {report_recipe} "
+            f"is not the canonical recipe of its own config "
+            f"(config_sha256 {recipe['config_sha256']}); refusing to "
+            "evaluate")
+    if manifest.get("recipe") != recipe:
+        raise AdapterBundleIdentityError(
+            f"adapter {args.adapter}: run_manifest recipe "
+            f"{manifest.get('recipe')} disagrees with the canonical "
+            f"recipe (config_sha256 {recipe['config_sha256']}); refusing "
+            "to evaluate")
+    if manifest.get("suite_sha256") != suite_sha:
+        raise AdapterBundleIdentityError(
+            f"adapter {args.adapter}: manifest suite_sha256 "
+            f"{manifest.get('suite_sha256')!r} != current suite "
+            f"{suite_sha!r}; refusing to evaluate")
+    m_ident = manifest.get("identity") or {}
+    if m_ident.get("model_id") != model_id \
+            or require_pinned_revision(m_ident.get("revision")) != revision:
+        raise AdapterBundleIdentityError(
+            f"adapter {args.adapter}: manifest identity {m_ident} "
+            f"disagrees with the report identity ({model_id!r}, "
+            f"{revision!r})")
+    m_seed = manifest.get("seed")
+    if m_seed != cfg.get("seed"):
+        raise AdapterBundleIdentityError(
+            f"adapter {args.adapter}: manifest seed {m_seed!r} != config "
+            f"seed {cfg.get('seed')!r}")
     state = load_adapter_bundle(Path(args.adapter) / "best_params.pt",
                                 model_id=model_id, revision=revision,
                                 recipe=recipe)
@@ -534,8 +583,13 @@ def main():
     tr.add_argument("--warmup", type=int, default=30)
     tr.add_argument("--lr-schedule", default="constant",
                     choices=["constant", "cosine"])
+    tr.add_argument("--optimizer", default="adamw")
+    tr.add_argument("--weight-decay", type=float, default=0.01)
     tr.add_argument("--clip", type=float, default=0.5)
     tr.add_argument("--detach-z0", action="store_true")
+    tr.add_argument("--label", default=None,
+                    help="preregistered run label (bound into evidence; "
+                    "never derived from output path)")
     tr.add_argument("--device", default="mps")
     tr.add_argument("--model", default=DEFAULT_MODEL_ID)
     tr.add_argument("--revision", default=DEFAULT_REVISION)
