@@ -14,13 +14,15 @@ Three responsibilities live here:
     gradients and the clip norm are all finite, with rechecks after
     clipping and after the update; any post-step corruption rolls the
     parameters, the complete optimizer state (every tensor's values AND
-    its exact shape/dtype/device/layout/stride metadata, structurally
-    exact) and the full param-group topology (the original outer list
-    object, group count/order, fields, per-group Parameter identities
-    and order) back bit-exactly, without ever masking or replacing the
-    original step exception. The transaction set is derived from the
-    optimizer's own groups, so Parameters omitted by the caller stay
-    covered.
+    its exact shape/dtype/device/layout/stride/storage-offset metadata
+    PLUS the full reachable storage graph — shared-storage alias
+    relationships between leaves, views with non-zero offsets or
+    non-dense strides, and repeated tensor objects) and the full
+    param-group topology (the original outer list object, group
+    count/order, fields, per-group Parameter identities and order) back
+    bit-exactly, without ever masking or replacing the original step
+    exception. The transaction set is derived from the optimizer's own
+    groups, so Parameters omitted by the caller stay covered.
 """
 
 from __future__ import annotations
@@ -326,7 +328,13 @@ def load_adapter_bundle(path, *, model_id, revision) -> dict:
 # ---------------------------------------------------------------------------
 
 def _deep_clone_tree(obj):
-    """Exact deep copy of a tensor tree (optimizer state shapes)."""
+    """Exact deep copy of a tensor tree (values; metadata of dense leaves).
+
+    Retained for non-transactional callers; the optimizer transaction uses
+    the storage-graph-exact snapshot/restore pair below instead, because
+    ``detach().clone()`` normalizes storage offsets to 0, re-homes views
+    into their own compacted storages and severs shared-storage alias
+    relationships between state leaves."""
     if torch.is_tensor(obj):
         return obj.detach().clone()
     if isinstance(obj, dict):
@@ -336,6 +344,305 @@ def _deep_clone_tree(obj):
     if isinstance(obj, tuple):
         return tuple(_deep_clone_tree(v) for v in obj)
     return obj
+
+
+class _StateStorageSlot:
+    """One reachable untyped storage behind the optimizer-state tree.
+
+    ``raw`` is a byte-exact clone of the FULL storage (a flat uint8
+    tensor owning its own storage), so every view over it — whatever its
+    storage offset or strides — can be reconstructed bit-exactly, and
+    leaves that shared this storage at snapshot time can be re-homed onto
+    one common restored storage afterwards."""
+
+    __slots__ = ("raw", "nbytes", "device")
+
+    def __init__(self, raw, nbytes, device):
+        self.raw = raw
+        self.nbytes = nbytes
+        self.device = device
+
+
+class _StateTensorLeaf:
+    """Snapshot record of one distinct tensor object in the state tree.
+
+    Strided leaves are recorded as (storage slot, dtype, size, stride,
+    storage offset, requires_grad); any leaf whose layout cannot be
+    rebuilt over raw storage bytes falls back to an opaque detached
+    clone. Repeated references to the same object share one leaf node,
+    so restore reproduces the reference graph, not just values."""
+
+    __slots__ = ("slot", "dtype", "size", "stride", "offset",
+                 "requires_grad", "opaque")
+
+    def __init__(self, *, slot=None, dtype=None, size=None, stride=None,
+                 offset=0, requires_grad=False, opaque=None):
+        self.slot = slot
+        self.dtype = dtype
+        self.size = size
+        self.stride = stride
+        self.offset = offset
+        self.requires_grad = requires_grad
+        self.opaque = opaque
+
+
+class _OptimizerStateSnapshot:
+    """Structurally complete snapshot of ``optimizer.state``: the tree of
+    containers/tensor-leaf nodes/original non-tensor objects plus every
+    distinct reachable storage slot with its full raw bytes."""
+
+    __slots__ = ("slots", "slot_leaves", "tree")
+
+    def __init__(self):
+        self.slots = []
+        self.slot_leaves = []
+        self.tree = None
+
+
+def _full_storage_bytes(tensor, storage, nbytes):
+    """Byte-exact owned copy of the whole storage behind ``tensor``."""
+    if nbytes == 0:
+        return None
+    src = torch.empty(0, dtype=torch.uint8, device=tensor.device)
+    src = src.set_(storage, 0, (nbytes,), (1,))
+    return src.clone()
+
+
+def _snapshot_state_tree(state) -> _OptimizerStateSnapshot:
+    """Capture the FULL reachable storage graph of ``optimizer.state``.
+
+    Every distinct tensor object becomes one leaf node carrying its exact
+    dtype/device/layout/shape/strides/storage_offset/requires_grad plus
+    the index of its underlying storage slot; each slot keeps a byte
+    clone of the complete storage. Views (offset/non-dense strides),
+    shared-storage aliases between different leaves and repeated
+    references to one object are therefore all preserved exactly, which
+    ``detach().clone()`` per leaf cannot do."""
+    snap = _OptimizerStateSnapshot()
+    slot_of_ptr = {}
+    leaf_of_obj = {}
+
+    def capture_leaf(t, path):
+        node = leaf_of_obj.get(id(t))
+        if node is not None:
+            if node.slot is not None:
+                snap.slot_leaves[node.slot].append((path, node))
+            return node
+        rg = bool(t.requires_grad)
+        slot_idx = None
+        if t.layout == torch.strided:
+            try:
+                ust = t.untyped_storage()
+                ptr, nbytes, dev = ust.data_ptr(), ust.nbytes(), ust.device
+            except Exception:  # noqa: BLE001 - exotic tensor: opaque below
+                ust = None
+            if ust is not None:
+                slot_idx = slot_of_ptr.get(ptr)
+                if slot_idx is None:
+                    snap.slots.append(_StateStorageSlot(
+                        _full_storage_bytes(t, ust, nbytes), nbytes, dev))
+                    slot_idx = len(snap.slots) - 1
+                    slot_of_ptr[ptr] = slot_idx
+                    snap.slot_leaves.append([])
+        if slot_idx is not None:
+            node = _StateTensorLeaf(
+                slot=slot_idx, dtype=t.dtype, size=tuple(t.shape),
+                stride=tuple(t.stride()), offset=t.storage_offset(),
+                requires_grad=rg)
+            snap.slot_leaves[slot_idx].append((path, node))
+        else:
+            node = _StateTensorLeaf(
+                dtype=t.dtype, requires_grad=rg,
+                opaque=t.detach().clone())
+        leaf_of_obj[id(t)] = node
+        return node
+
+    def walk(obj, path):
+        if torch.is_tensor(obj):
+            return capture_leaf(obj, path)
+        if isinstance(obj, dict):
+            return {k: walk(v, path + (k,)) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [walk(v, path + (i,)) for i, v in enumerate(obj)]
+        if isinstance(obj, tuple):
+            return tuple(walk(v, path + (i,))
+                         for i, v in enumerate(obj))
+        return obj
+
+    snap.tree = walk(state, ())
+    return snap
+
+
+def _lookup_live_path(root, path):
+    """Resolve a snapshot path through the LIVE tree; None on any
+    structural mismatch (missing key/index, wrong container type)."""
+    cur = root
+    for seg in path:
+        if isinstance(seg, str):
+            if not isinstance(cur, dict) or seg not in cur:
+                return None
+            cur = cur[seg]
+        else:
+            if not isinstance(cur, (list, tuple)) or seg >= len(cur):
+                return None
+            cur = cur[seg]
+    return cur if torch.is_tensor(cur) else None
+
+
+def _leaf_matches_live(live, leaf, slot) -> bool:
+    """True when restoring THROUGH ``live`` cannot change observable
+    metadata and its storage still spans exactly the snapshotted bytes."""
+    if live.layout != torch.strided or live.dtype != leaf.dtype \
+            or tuple(live.shape) != leaf.size \
+            or tuple(live.stride()) != leaf.stride \
+            or live.storage_offset() != leaf.offset \
+            or live.device != slot.device:
+        return False
+    try:
+        ust = live.untyped_storage()
+    except Exception:  # noqa: BLE001 - exotic live tensor: force rebuild
+        return False
+    return ust.nbytes() == slot.nbytes and ust.device == slot.device
+
+
+def _plan_state_slot_restore(state, snap) -> list:
+    """Decide, per storage slot, how rollback restores it.
+
+    A slot restores IN PLACE through the live objects only when EVERY
+    referencing leaf still exists at its path with bit-identical
+    metadata and all of them still share ONE live storage of exactly the
+    snapshotted size/device, uniquely claimed by this slot. Then the
+    pristine bytes are copied back wholesale — live tensor objects and
+    their aliasing stay untouched. Any structural divergence (replaced
+    leaf, swapped metadata, broken/merged/split sharing, missing entry)
+    forces a REBUILD: fresh storage from the raw byte clone, every leaf
+    re-homed onto it with its exact metadata."""
+    plans = [("rebuild", None) for _ in snap.slots]
+    claimed = set()
+    for idx, slot in enumerate(snap.slots):
+        live_map = {}
+        ok = True
+        for path, leaf in snap.slot_leaves[idx]:
+            live = _lookup_live_path(state, path)
+            if live is None or not _leaf_matches_live(live, leaf, slot):
+                ok = False
+                break
+            live_map[path] = live
+        if not ok:
+            continue
+        ptrs = {live.untyped_storage().data_ptr()
+                for live in live_map.values()}
+        if len(ptrs) != 1:
+            continue
+        ptr = next(iter(ptrs))
+        if ptr in claimed:
+            continue
+        plans[idx] = ("inplace", live_map)
+        claimed.add(ptr)
+    with torch.no_grad():
+        for idx, (kind, _) in enumerate(plans):
+            if kind != "inplace":
+                continue
+            some = next(iter(plans[idx][1].values()))
+            dst = torch.empty(0, dtype=torch.uint8, device=snap.slots[idx].device)
+            dst = dst.set_(some.untyped_storage(), 0,
+                           (snap.slots[idx].nbytes,), (1,))
+            if snap.slots[idx].nbytes:
+                dst.copy_(snap.slots[idx].raw)
+    return plans
+
+
+class _StateRestoreContext:
+    """Lazy per-rollback resources: one freshly materialized storage per
+    rebuilt slot and memoized rebuilds so repeated references materialize
+    back into ONE object."""
+
+    def __init__(self, snap, plans):
+        self.snap = snap
+        self.plans = plans
+        self.storages = {}
+        self.memo = {}
+
+    def fresh_storage(self, idx):
+        if idx not in self.storages:
+            slot = self.snap.slots[idx]
+            holder = torch.empty(slot.nbytes, dtype=torch.uint8,
+                                 device=slot.device)
+            if slot.nbytes:
+                holder.copy_(slot.raw)
+            self.storages[idx] = holder.untyped_storage()
+        return self.storages[idx]
+
+    def rebuild(self, leaf):
+        if id(leaf) not in self.memo:
+            t = torch.empty(0, dtype=leaf.dtype,
+                            device=self.snap.slots[leaf.slot].device)
+            t = t.set_(self.fresh_storage(leaf.slot), leaf.offset,
+                       leaf.size, leaf.stride)
+            if leaf.requires_grad:
+                t.requires_grad_(True)
+            self.memo[id(leaf)] = t
+        return self.memo[id(leaf)]
+
+
+def _materialize_state_node(node, ctx, path):
+    """Rebuild a snapshot subtree as concrete objects: in-place slots
+    yield the (byte-restored) LIVE tensor objects, rebuild slots yield
+    storage-faithful reconstructions over one fresh shared storage,
+    non-tensor originals are rebound by identity."""
+    if isinstance(node, _StateTensorLeaf):
+        if node.slot is None:      # opaque layout: rebind a fresh clone
+            if id(node) not in ctx.memo:
+                ctx.memo[id(node)] = (
+                    node.opaque.detach().clone()
+                    if torch.is_tensor(node.opaque) else node.opaque)
+            return ctx.memo[id(node)]
+        kind, live_map = ctx.plans[node.slot]
+        if kind == "inplace":
+            return live_map[path]
+        return ctx.rebuild(node)
+    if isinstance(node, dict):
+        return {k: _materialize_state_node(v, ctx, path + (k,))
+                for k, v in node.items()}
+    if isinstance(node, list):
+        return [_materialize_state_node(v, ctx, path + (i,))
+                for i, v in enumerate(node)]
+    if isinstance(node, tuple):
+        return tuple(_materialize_state_node(v, ctx, path + (i,))
+                     for i, v in enumerate(node))
+    return node
+
+
+def _restore_optimizer_state(optimizer, snap) -> None:
+    """Roll ``optimizer.state`` back to the snapshot exactly.
+
+    Values AND the full storage graph are restored: every tensor's
+    dtype/device/layout/shape/strides/storage_offset, shared-storage
+    alias relationships among leaves, repeated tensor objects (one
+    object stays one object) and all non-tensor fields by original
+    identity. Hostilely injected keys are dropped; hostile removals and
+    replacements are overwritten with the snapshot reconstruction.
+    Restoration never routes a mismatched copy through ``Tensor.copy_``:
+    incompatible subtrees are rebound wholesale, so rollback itself
+    cannot raise a shape/dtype/size error."""
+    state = optimizer.state
+    for key in list(state.keys()):
+        if key not in snap.tree:
+            del state[key]
+    plans = _plan_state_slot_restore(state, snap)
+    ctx = _StateRestoreContext(snap, plans)
+    for key, node in snap.tree.items():
+        live_entry = state.get(key) if hasattr(state, "get") else None
+        if not isinstance(live_entry, dict) or \
+                not isinstance(node, dict):
+            state[key] = _materialize_state_node(node, ctx, (key,))
+            continue
+        for name in list(live_entry.keys()):
+            if name not in node:
+                del live_entry[name]
+        for name, child in node.items():
+            live_entry[name] = _materialize_state_node(
+                child, ctx, (key, name))
 
 
 def _tree_is_finite(obj) -> bool:
@@ -360,39 +667,6 @@ def _inplace_exact_restore_possible(live, snap) -> bool:
             and live.device == snap.device
             and tuple(live.stride()) == tuple(snap.stride())
             and live.storage_offset() == snap.storage_offset())
-
-
-def _restore_optimizer_state(optimizer, snap) -> None:
-    """Roll optimizer.state back to the snapshot bit-exactly, in place.
-
-    A snapshot leaf is restored through its live tensor object ONLY when
-    that object is structurally compatible (same shape, dtype, device,
-    layout, strides, storage offset), so in-place restoration is exact;
-    every other leaf — replaced objects, mismatched metadata, non-tensor
-    values, injected fields — is rebound to a fresh clone of the pristine
-    snapshot. ``Tensor.copy_`` therefore can never cast dtypes, coerce
-    shapes or fail with a size mismatch during rollback."""
-    state = optimizer.state
-    for key in list(state.keys()):
-        if key not in snap:
-            del state[key]
-    for key, snap_entry in snap.items():
-        live_entry = state.get(key) if hasattr(state, "get") else None
-        if not isinstance(live_entry, dict) or \
-                not isinstance(snap_entry, dict):
-            state[key] = _deep_clone_tree(snap_entry)
-            continue
-        for name in list(live_entry.keys()):
-            if name not in snap_entry:
-                del live_entry[name]
-        for name, val in snap_entry.items():
-            live_val = live_entry.get(name)
-            if torch.is_tensor(val) and torch.is_tensor(live_val) and \
-                    _inplace_exact_restore_possible(live_val, val):
-                with torch.no_grad():
-                    live_val.copy_(val)
-            else:
-                live_entry[name] = _deep_clone_tree(val)
 
 
 def _optimizer_owned_params(optimizer) -> list:
@@ -488,22 +762,25 @@ def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
       * Gradients are rechecked after clipping; a post-clip rejection also
         restores the pre-clip gradients.
       * Every trainable parameter, every pre-clip gradient (including the
-        ``None`` versus tensor distinction and exact bytes), a deep exact
-        copy of the optimizer state and the complete ``param_groups``
-        topology (the original outer list object, group count/order,
-        every group field, and each group's live Parameter identities in
-        exact order) are snapshotted before ``optimizer.step()``. If the
-        step raises, or any post-step parameter or optimizer-state tensor
-        is non-finite, all of it — parameters, gradients, complete
-        optimizer state including injected fields with every tensor's
-        exact shape/dtype/device/layout/stride metadata, and the full
-        param-group structure down to outer-list identity — is restored
-        exactly while keeping the live Parameter identities; a state leaf
-        whose metadata was swapped mid-step is rebound from the pristine
-        snapshot rather than copied through, so rollback itself can never
-        raise a size/dtype mismatch. The original step exception is then
-        re-raised intact (rollback failures chain onto it as __cause__,
-        never replacing it). The optimizer remains usable after rollback.
+        ``None`` versus tensor distinction and exact bytes), a
+        storage-graph-exact snapshot of the optimizer state and the
+        complete ``param_groups`` topology (the original outer list
+        object, group count/order, every group field, and each group's
+        live Parameter identities in exact order) are snapshotted before
+        ``optimizer.step()``. If the step raises, or any post-step
+        parameter or optimizer-state tensor is non-finite, all of it —
+        parameters, gradients, complete optimizer state with every
+        tensor's exact shape/dtype/device/layout/stride/storage-offset
+        metadata, shared-storage alias relationships between state
+        leaves, repeated tensor objects, injected fields removed — and
+        the full param-group structure down to outer-list identity are
+        restored exactly while keeping the live Parameter identities; a
+        state leaf whose metadata was swapped mid-step is rebound from
+        the pristine snapshot rather than copied through, so rollback
+        itself can never raise a size/dtype mismatch. The original step
+        exception is then re-raised intact (rollback failures chain onto
+        it as __cause__, never replacing it). The optimizer remains
+        usable after rollback.
       * The caller-supplied ``params`` iterable is never trusted as
         exhaustive: the authoritative transaction/finite-check set is the
         deterministic first-occurrence union of the supplied Parameters
@@ -568,7 +845,7 @@ def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
 
     # -- transaction: snapshot everything the step may corrupt ---------------
     param_snap = [p.detach().clone() for p in params]
-    state_snap = _deep_clone_tree(optimizer.state)
+    state_snap = _snapshot_state_tree(optimizer.state)
     groups_snap = _snapshot_param_groups(optimizer)
 
     def restore_params() -> None:

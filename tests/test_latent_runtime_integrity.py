@@ -1186,6 +1186,250 @@ def test_adversarial_outer_param_groups_list_identity_restored():
 
 
 # ---------------------------------------------------------------------------
+# storage-graph-exact optimizer-state rollback (alias/view regression)
+# ---------------------------------------------------------------------------
+
+_ALIAS_KEYS = ("alias_base", "alias_view", "alias_trans",
+               "alias_repeat", "alias_far")
+
+
+def _install_alias_state(opt, ps, seed):
+    """Install an aliased state topology on ps[0]: a base tensor plus an
+    offset view, a transposed strided view, a repeated reference to the
+    SAME object and a far offset view — all sharing ONE storage."""
+    w = ps[0]
+    g = torch.Generator().manual_seed(seed)
+    base = torch.rand(8, generator=g) * 0.5 - 0.25
+    st = opt.state[w]
+    st["alias_base"] = base
+    st["alias_view"] = base[1:5]              # dense view, storage_offset=1
+    st["alias_trans"] = base[:6].view(2, 3).t()   # strides (1, 3), offset 0
+    st["alias_repeat"] = base                 # repeated tensor OBJECT
+    st["alias_far"] = base[7:]                # storage_offset=7
+    return base.clone()                       # lossless: base itself is dense
+
+
+def _assert_alias_state_exact(st, expected_base):
+    """Metadata + alias + value exactness of the installed topology,
+    verified against the explicitly captured dense base (never via a
+    per-leaf clone helper)."""
+    assert set(_ALIAS_KEYS) <= set(st.keys())
+    b = st["alias_base"]
+    v = st["alias_view"]
+    t = st["alias_trans"]
+    r = st["alias_repeat"]
+    f = st["alias_far"]
+
+    def _meta(x, shape, stride, offset):
+        return (tuple(x.shape) == shape and x.stride() == stride
+                and x.storage_offset() == offset and x.dtype == torch.float32
+                and x.device.type == "cpu" and x.layout == torch.strided)
+
+    assert _meta(b, (8,), (1,), 0), "base metadata drifted"
+    assert _meta(v, (4,), (1,), 1), \
+        f"offset view lost its storage_offset (got {v.storage_offset()})"
+    assert _meta(t, (3, 2), (1, 3), 0), "transposed view metadata drifted"
+    assert _meta(f, (1,), (1,), 7), "far view metadata drifted"
+    assert bool(torch.equal(b, expected_base)), "base values not restored"
+    assert bool(torch.equal(v, expected_base[1:5])), "view values not restored"
+    assert bool(torch.equal(
+        t, expected_base[:6].view(2, 3).t())), "transposed values not restored"
+    assert bool(torch.equal(f, expected_base[7:])), "far values not restored"
+
+    # shared-storage proof: one storage behind every leaf, full size kept
+    ptrs = {x.untyped_storage().data_ptr()
+            for x in (b, v, t, r, f)}
+    assert len(ptrs) == 1 and 0 not in ptrs, \
+        "alias leaves do not share one storage"
+    assert v.untyped_storage().nbytes() == 32, \
+        "view was re-homed into its own compacted storage"
+    assert r is b, "repeated state reference was split into two objects"
+
+    # behavioral alias proof (writes through base must show up in the
+    # views; the pristine bytes are put back afterwards)
+    with torch.no_grad():
+        b.fill_(-777.0)
+        visible = bool(torch.all(v == -777.0)) and \
+            bool(torch.all(f == -777.0))
+        b.copy_(expected_base)
+    assert visible, \
+        "writes through the base are not visible through the views"
+    assert bool(torch.equal(b, expected_base)), \
+        "behavioral probe did not restore the base bytes"
+
+
+class _AliasCorruptSGD(torch.optim.SGD):
+    """Performs a REAL update, corrupts the aliased state THROUGH the
+    shared storage, replaces/deletes/injects entries, corrupts params,
+    gradients and group topology, then raises."""
+
+    def __init__(self, params, lr):
+        super().__init__(params, lr=lr, momentum=0.9)
+        self.armed = False
+        self.foreign = torch.nn.Parameter(torch.zeros(1))
+
+    def step(self, closure=None):
+        super().step(closure)
+        if not self.armed:
+            return
+        w = self.param_groups[0]["params"][0]
+        b = self.param_groups[0]["params"][1]
+        st = self.state[w]
+        with torch.no_grad():
+            st["alias_base"].add_(13.0)       # corruption via shared storage
+            st["alias_view"].mul_(-2.0)       # ...and via the view
+            w.add_(7.0)
+            if b.grad is not None:
+                b.grad.fill_(99.0)            # hostile gradient rewrite
+            for group in self.param_groups:
+                group["lr"] = 123.0
+                group["injected_meta"] = {"evil": [1]}
+        st["alias_base"] = torch.full((2,), -5.0)          # wrong shape
+        st["alias_view"] = torch.zeros(3, dtype=torch.float16)  # wrong dtype
+        del st["alias_trans"]                              # hostile removal
+        st["poison_flag"] = "corrupted"                    # hostile injection
+        g = self.param_groups[0]                           # topology rewrite
+        g["params"].reverse()
+        g["params"].append(self.foreign)
+        raise RuntimeError("alias-adversarial failure")
+
+
+def _alias_pair(seed, adv_cls=None):
+    """Candidate + independent control with IDENTICAL initial parameters,
+    momentum state and aliased state topology."""
+    if adv_cls is None:
+        adv_cls = _AliasCorruptSGD
+    torch.manual_seed(seed)
+    m_adv = torch.nn.Linear(4, 4)
+    m_ctl = torch.nn.Linear(4, 4)
+    m_ctl.load_state_dict(m_adv.state_dict())
+    x = torch.randn(8, 4)
+    ps_adv = list(m_adv.parameters())
+    ps_ctl = list(m_ctl.parameters())
+    opt_adv = adv_cls(ps_adv, lr=0.05)
+    opt_ctl = torch.optim.SGD(ps_ctl, lr=0.05, momentum=0.9)
+
+    def fresh_grads(m):
+        m.zero_grad(set_to_none=True)
+        loss = (m(x) ** 2).mean()
+        loss.backward()
+        return loss
+
+    def ctl_step():
+        fresh_grads(m_ctl)
+        torch.nn.utils.clip_grad_norm_(ps_ctl, 1.0)
+        opt_ctl.step()
+
+    guarded_optimizer_step(opt_adv, fresh_grads(m_adv).detach(), ps_adv, 1.0)
+    ctl_step()
+    exp_adv = _install_alias_state(opt_adv, ps_adv, seed + 100)
+    exp_ctl = _install_alias_state(opt_ctl, ps_ctl, seed + 100)
+    assert bool(torch.equal(exp_adv, exp_ctl))
+    return (m_adv, m_ctl, x, ps_adv, ps_ctl, opt_adv, opt_ctl,
+            fresh_grads, ctl_step, exp_adv)
+
+
+def test_adversarial_alias_state_rollback_is_storage_graph_exact():
+    (m_adv, m_ctl, x, ps_adv, ps_ctl, opt_adv, opt_ctl,
+     fresh_grads, ctl_step, expected_base) = _alias_pair(41)
+    w_a, b_a = ps_adv
+
+    opt_adv.armed = True
+    fresh_grads(m_adv)
+    pre_params = _snapshot(ps_adv)
+    pre_grads = {id(p): p.grad.detach().clone() for p in ps_adv}
+    pre_ids = _param_group_param_ids(opt_adv)
+
+    with pytest.raises(RuntimeError,
+                       match="alias-adversarial failure") as e:
+        guarded_optimizer_step(opt_adv, torch.tensor(0.5), ps_adv, 1.0)
+    assert type(e.value) is RuntimeError, \
+        "original step exception was masked by a rollback failure"
+
+    assert _unchanged(ps_adv, pre_params), "parameter corruption survived"
+    for p in ps_adv:
+        assert p.grad is not None and \
+            bool(torch.equal(p.grad, pre_grads[id(p)])), \
+            "pre-step gradients were not restored bit-exactly"
+    assert [g["lr"] for g in opt_adv.param_groups] == [0.05], \
+        "mutated LR was not rolled back"
+    assert all("injected_meta" not in g for g in opt_adv.param_groups), \
+        "injected group field survived the rollback"
+    assert _param_group_param_ids(opt_adv) == pre_ids, \
+        "per-group Parameter identity/order not restored"
+
+    st = opt_adv.state[w_a]
+    assert set(st.keys()) == {"momentum_buffer", *_ALIAS_KEYS}, \
+        "hostilely injected/removed state fields survived rollback"
+    assert st["momentum_buffer"].dtype == torch.float32
+    _assert_alias_state_exact(st, expected_base)
+
+    # -- disarmed retry of the SAME update vs independent control ----------
+    opt_adv.armed = False
+    fresh_grads(m_adv)
+    guarded_optimizer_step(opt_adv, (m_adv(x) ** 2).mean(), ps_adv, 1.0)
+    ctl_step()
+
+    assert bool(torch.equal(w_a.detach(), ps_ctl[0].detach())) and \
+        bool(torch.equal(b_a.detach(), ps_ctl[1].detach())), \
+        "post-retry trajectory diverges from the clean control"
+    assert bool(torch.equal(opt_adv.state[w_a]["momentum_buffer"],
+                            opt_ctl.state[ps_ctl[0]]["momentum_buffer"])), \
+        "optimizer state diverges from the clean control after retry"
+    st_ctl = opt_ctl.state[ps_ctl[0]]
+    for key in _ALIAS_KEYS:
+        assert bool(torch.equal(st[key], st_ctl[key])), \
+            f"aliased field {key} diverged from the clean control"
+
+
+class _AliasInfPoisonSGD(torch.optim.SGD):
+    """Performs a REAL update, then poisons the state THROUGH the shared
+    storage so the post-step finiteness check must trigger rollback
+    WITHOUT any exception inside ``optimizer.step``."""
+
+    def __init__(self, params, lr):
+        super().__init__(params, lr=lr, momentum=0.9)
+        self.armed = False
+
+    def step(self, closure=None):
+        super().step(closure)
+        if self.armed:
+            with torch.no_grad():
+                self.state[self.param_groups[0]["params"][0]][
+                    "alias_far"].mul_(float("inf"))
+
+
+def test_poststep_nonfinite_alias_poison_rolls_back_storage_graph():
+    (m_adv, m_ctl, x, ps_adv, ps_ctl, opt_adv, opt_ctl,
+     fresh_grads, ctl_step, expected_base) = _alias_pair(
+        43, adv_cls=_AliasInfPoisonSGD)
+    w_a = ps_adv[0]
+
+    opt_adv.armed = True
+    fresh_grads(m_adv)
+    pre_params = _snapshot(ps_adv)
+    with pytest.raises(NonFiniteTrainingStateError):
+        guarded_optimizer_step(opt_adv, (m_adv(x) ** 2).mean(), ps_adv, 1.0)
+
+    st = opt_adv.state[w_a]
+    assert set(st.keys()) == {"momentum_buffer", *_ALIAS_KEYS}
+    _assert_alias_state_exact(st, expected_base)
+    assert _unchanged(ps_adv, pre_params), \
+        "parameters were not rolled back after state poisoning"
+    assert _param_group_param_ids(opt_adv) == [[id(p) for p in ps_adv]]
+
+    # -- disarmed retry vs control ------------------------------------------
+    opt_adv.armed = False
+    fresh_grads(m_adv)
+    guarded_optimizer_step(opt_adv, (m_adv(x) ** 2).mean(), ps_adv, 1.0)
+    ctl_step()
+    assert bool(torch.equal(w_a.detach(), ps_ctl[0].detach()))
+    st_ctl = opt_ctl.state[ps_ctl[0]]
+    for key in _ALIAS_KEYS:
+        assert bool(torch.equal(st[key], st_ctl[key]))
+
+
+# ---------------------------------------------------------------------------
 # fp32 trainables over a lower-precision backbone
 # ---------------------------------------------------------------------------
 
