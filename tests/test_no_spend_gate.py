@@ -1,13 +1,31 @@
 """Focused tests for the bounded no-spend integrity gate.
 
 Covers the acceptance properties that must hold BEFORE any GPU spend:
-corrected gold-aware scorer invariances, deterministic corrected checkpoint
-selection, artifact discovery/hash/duplicate detection, train-report schema
-blockers (missing fields are blockers, not defaults), safe checkpoint
-classification through the project loader, rescore-eligibility honesty
-(NON_RESCORABLE_MISSING_RAW_PREDICTION), 4B quarantine duplication
-detection, canonical byte-stability across reruns, and driver exit
-semantics (0 READY / 1 NOT_READY / 2 execution error).
+
+* corrected gold-aware scorer FAIL-CLOSED contract: exactly one raw
+  representation, full unique permutations only, finite real scores
+  (NaN/Inf invalid, never sunk to -inf), top-score ties between different
+  candidates ambiguous (array position never decides), duplicated candidate
+  sets invalid, record flags/status preserved through aggregation;
+* deterministic corrected checkpoint selection with non-negative integer
+  steps and finite metrics;
+* artifact discovery/hash/duplicate detection;
+* train-report schema blockers (missing/non-finite fields are blockers,
+  not defaults) and strict JSON everywhere (NaN literals fail closed);
+* safe identity-bound checkpoint classification with FP32 validated from
+  the bundle PAYLOAD (bf16 bundles must NOT READY);
+* symmetric discovery: orphan checkpoints / orphan eval files /
+  duplicate checkpoint bindings are explicit blockers;
+* eval->checkpoint joins: exact model/revision/suite binding and FULL
+  test_id + test_ood coverage per retained loadable checkpoint; one
+  unrelated eval proves nothing;
+* 4B quarantine completeness: any known-invalid or byte-duplicate live
+  artifact blocks READY even when a sibling file differs; marker-only
+  empty quarantine proves nothing;
+* integrity: --out/input-root overlap rejection before writing, streaming
+  before/after source fingerprints proving inputs unchanged, exit codes
+  (0 READY / 1 NOT_READY / 2 execution error), canonical byte-stability
+  without wall-clock values.
 """
 
 from __future__ import annotations
@@ -21,9 +39,14 @@ import pytest
 
 from latent_lab.bench import no_spend_gate as g
 from latent_lab.bench.corrected_scoring import (
+    FLAG_AMBIGUOUS_TIE,
+    FLAG_CONFLICTING_INPUTS,
     FLAG_DUPLICATE_CANDIDATES,
+    FLAG_GOLD_ABSENT,
     FLAG_NONFINITE_SCORES,
     FLAG_NORMALIZED_MATCH,
+    FLAG_ORDER_NOT_PERMUTATION,
+    INVALID_RECORDS,
     MISSING_RAW_PREDICTION,
     corrected_score,
     normalize_answer,
@@ -43,19 +66,19 @@ def _strict_loads(blob: bytes) -> object:
 
 
 # ---------------------------------------------------------------------------
-# corrected scorer invariances
+# corrected scorer fail-closed contract
 # ---------------------------------------------------------------------------
 
 class TestCorrectedScorer:
     def test_gold_not_at_index_zero_top_rank_is_correct(self):
         cands = ("a", "b", "gold", "c")
         cs = corrected_score(cands, "gold", order=[2, 0, 3, 1])
-        assert cs.correct and cs.rank_of_gold == 0
+        assert cs.valid and cs.correct and cs.rank_of_gold == 0
 
     def test_gold_not_at_index_zero_other_ranked_first_incorrect(self):
         cands = ("a", "b", "gold", "c")
         cs = corrected_score(cands, "gold", order=[0, 2, 3, 1])
-        assert not cs.correct and cs.rank_of_gold == 1
+        assert cs.valid and not cs.correct and cs.rank_of_gold == 1
 
     def test_permutation_invariance_with_scores_attached_to_content(self):
         cands = ("a", "b", "gold", "c")
@@ -65,6 +88,7 @@ class TestCorrectedScorer:
         pc = [cands[i] for i in perm]
         ps = [scores[i] for i in perm]
         moved = corrected_score(pc, "gold", scores=ps)
+        assert base.valid and moved.valid
         assert base.correct == moved.correct
         assert base.rank_of_gold == moved.rank_of_gold == 0
         # and a losing permutation of the same mapping stays losing
@@ -72,39 +96,80 @@ class TestCorrectedScorer:
         lost = corrected_score(cands, "gold", scores=scores2)
         assert not lost.correct and lost.rank_of_gold == 2
 
-    def test_duplicate_candidates_flagged_not_silently_scored(self):
+    def test_conflicting_order_and_scores_rejected(self):
+        cs = corrected_score(("a", "gold"), "gold",
+                             order=[1, 0], scores=[0.1, 0.9])
+        assert not cs.valid
+        assert FLAG_CONFLICTING_INPUTS in cs.flags
+
+    def test_missing_representation_invalid_not_exception(self):
+        cs = corrected_score(("a", "gold"), "gold")
+        assert not cs.valid
+
+    def test_duplicate_candidates_invalid_never_silently_scored(self):
         cands = ("gold", "b", "gold", "c")
-        cs = corrected_score(cands, "gold", order=[2, 0, 3, 1])
-        assert FLAG_DUPLICATE_CANDIDATES in cs.flags
-        assert cs.correct  # best-ranked gold occurrence is rank 0 here
-        cs2 = corrected_score(cands, "gold", order=[1, 2, 3, 0])
-        assert FLAG_DUPLICATE_CANDIDATES in cs2.flags
-        assert cs2.rank_of_gold == 1
+        for order in ([2, 0, 3, 1], [1, 2, 3, 0]):
+            cs = corrected_score(cands, "gold", order=order)
+            assert not cs.valid, order
+            assert FLAG_DUPLICATE_CANDIDATES in cs.flags
+            assert not cs.correct and cs.rank_of_gold == -1
+
+    def test_nonfinite_scores_invalid_never_sunk_to_minus_inf(self):
+        nan, inf = float("nan"), float("inf")
+        for bad in ([nan, 0.5], [0.5, inf], [-inf, 0.5]):
+            cs = corrected_score(("a", "gold"), "gold", scores=bad)
+            assert not cs.valid, bad
+            assert FLAG_NONFINITE_SCORES in cs.flags
+            assert not cs.correct and cs.rank_of_gold == -1
+
+    def test_top_tie_between_different_candidates_ambiguous_regardless_of_position(
+            self):
+        # equal top score on two different candidates: array position must
+        # NEVER decide — both permutations are invalid.
+        cs1 = corrected_score(("a", "gold"), "gold", scores=[0.7, 0.7])
+        cs2 = corrected_score(("gold", "a"), "gold", scores=[0.7, 0.7])
+        for cs in (cs1, cs2):
+            assert not cs.valid
+            assert FLAG_AMBIGUOUS_TIE in cs.flags
+            assert not cs.correct and cs.rank_of_gold == -1
+
+    def test_three_way_tie_also_invalid(self):
+        cs = corrected_score(("x", "y", "z"), "y", scores=[1.0, 1.0, 1.0])
+        assert not cs.valid and FLAG_AMBIGUOUS_TIE in cs.flags
+
+    def test_scores_length_mismatch_invalid(self):
+        cs = corrected_score(("a", "gold"), "gold", scores=[1.0])
+        assert not cs.valid and not cs.correct
+
+    def test_scores_must_be_real_numbers_not_bools_or_strings(self):
+        for junk in (["true", 0.5], ["0.9", 0.1], [None, 0.5],
+                     [True, False]):
+            cs = corrected_score(("a", "gold"), "gold", scores=junk)
+            assert not cs.valid, junk
+
+    def test_partial_or_unknown_order_invalid_not_raised(self):
+        for order in ([0, 0], [0, 1, 2], [0], [5, 1], [0, True],
+                      "01", [0.0, 1.0]):
+            cs = corrected_score(("a", "b"), "a", order=order)
+            assert not cs.valid, order
+            assert FLAG_ORDER_NOT_PERMUTATION in cs.flags
 
     def test_whitespace_parser_normalization(self):
         assert normalize_answer(" 42 ") == normalize_answer("42")
         assert normalize_answer("new\t york") == "new york"
         cs = corrected_score((" 42", "43"), "42", order=[0, 1])
-        assert cs.correct and cs.rank_of_gold == 0
+        assert cs.valid and cs.correct and cs.rank_of_gold == 0
         # internal-whitespace parser difference still matches the gold and
         # is explicitly flagged rather than silently absorbed
         cs2 = corrected_score(("new  york", "boston"), "new\tyork",
                               order=[1, 0])
-        assert not cs2.correct
+        assert cs2.valid and not cs2.correct
         assert FLAG_NORMALIZED_MATCH in cs2.flags
 
-    def test_gold_absent_from_candidates(self):
+    def test_gold_absent_from_candidates_is_decisive_incorrect(self):
         cs = corrected_score(("a", "b"), "zzz", order=[0, 1])
-        assert not cs.correct and cs.rank_of_gold == -1
-
-    def test_nonfinite_scores_sink_and_flag(self):
-        nan = float("nan")
-        cs = corrected_score(("a", "gold"), "gold", scores=[nan, 0.5])
-        assert FLAG_NONFINITE_SCORES in cs.flags and cs.correct
-
-    def test_order_must_be_permutation(self):
-        with pytest.raises(ValueError):
-            corrected_score(("a", "b"), "a", order=[0, 0])
+        assert cs.valid and not cs.correct and cs.rank_of_gold == -1
+        assert FLAG_GOLD_ABSENT in cs.flags
 
 
 class TestSelectBestCheckpoint:
@@ -127,6 +192,20 @@ class TestSelectBestCheckpoint:
         assert select_best_checkpoint(
             [{"step": 1, "accuracy": nan}, {"step": 2, "accuracy": nan}]
         ) is None
+
+    def test_bool_float_and_negative_steps_are_rejected_not_coerced(self):
+        hist = [{"step": True, "accuracy": 1.0},
+                {"step": 100.5, "accuracy": 1.0},
+                {"step": -3, "accuracy": 1.0},
+                {"step": 200, "accuracy": 0.4}]
+        sel = select_best_checkpoint(hist)
+        assert sel.step == 200
+        assert sel.n_rejected_nonfinite == 3
+
+    def test_bool_metric_rejected(self):
+        sel = select_best_checkpoint([{"step": 1, "accuracy": True},
+                                      {"step": 2, "accuracy": 0.5}])
+        assert sel.step == 2 and sel.n_rejected_nonfinite == 1
 
     def test_empty_history(self):
         assert select_best_checkpoint([]) is None
@@ -151,6 +230,55 @@ class TestRescoreEligibility:
         assert out.status == "RESCORED_CORRECTED"
         assert out.corrected_accuracy == pytest.approx(0.5)
 
+    def test_nan_score_record_makes_whole_file_INVALID_RECORDS(self):
+        recs = [
+            {"ex_id": "e0", "candidate_scores": [0.1, 0.2, 0.9]},
+            {"ex_id": "e0", "candidate_scores": [float("nan"), 0.2, 0.1]},
+        ]
+        out = rescore_records(recs, {"e0": self.EX})
+        assert out.status == INVALID_RECORDS
+        assert out.flag_counts.get(FLAG_NONFINITE_SCORES) == 1
+        assert out.corrected_accuracy is None
+
+    def test_conflicting_representations_within_record_invalid(self):
+        recs = [{"ex_id": "e0", "candidate_scores": [0.1, 0.2, 0.9],
+                 "ranked_candidates": ["gold", "a", "b"]}]
+        out = rescore_records(recs, {"e0": self.EX})
+        assert out.status == INVALID_RECORDS
+        assert FLAG_CONFLICTING_INPUTS in (out.flag_counts or {})
+
+    def test_ranked_candidates_partial_unknown_duplicate_invalid(self):
+        good_by_norm = ["gold", "a", "b"]
+        cases = {
+            "partial": ["gold", "a"],
+            "unknown": ["gold", "a", "zzz"],
+            "duplicate": ["gold", "gold", "a"],
+            "not_a_list": "gold",
+        }
+        for name, rc in cases.items():
+            recs = [{"ex_id": "e0", "ranked_candidates": rc}]
+            out = rescore_records(recs, {"e0": self.EX})
+            assert out.status == INVALID_RECORDS, name
+            assert out.corrected_accuracy is None
+
+    def test_valid_ranked_candidates_rescore(self):
+        recs = [{"ex_id": "e0", "ranked_candidates": ["b", "gold", "a"]}]
+        out = rescore_records(recs, {"e0": self.EX})
+        assert out.status == "RESCORED_CORRECTED"
+        assert out.corrected_accuracy == pytest.approx(0.0)
+
+    def test_non_dict_records_fail_closed(self):
+        out = rescore_records(["nope"], {"e0": self.EX})
+        assert out.status == INVALID_RECORDS
+        out = rescore_records("records", {"e0": self.EX})
+        assert out.status == INVALID_RECORDS
+
+    def test_flags_preserved_through_aggregation(self):
+        recs = [{"ex_id": "e0", "predicted_answer": " gold "}]
+        out = rescore_records(recs, {"e0": self.EX})
+        assert out.status == "RESCORED_CORRECTED"
+        assert out.corrected_accuracy == 1.0
+
     def test_missing_example_blocks_whole_file(self):
         out = rescore_records([{"ex_id": "nope",
                                 "candidate_scores": [1, 2, 3]}],
@@ -163,6 +291,7 @@ class TestRescoreEligibility:
 # ---------------------------------------------------------------------------
 
 PINNED_REV_2B = "15852e8c16360a2fea060d615a32b45270f8a8fc"
+REV_4B = "8" * 40
 
 
 def _valid_report(**over) -> dict:
@@ -196,31 +325,43 @@ def _valid_report(**over) -> dict:
     return rep
 
 
-def _derived_only_eval(adapter="runs/E_k4_s0") -> dict:
+def _suite_ex(prefix="ti-"):
+    from latent_lab.bench.no_spend_gate import suite_examples_by_id
+
+    for ex_id, ex in suite_examples_by_id().items():
+        if ex_id.startswith(prefix):
+            return ex
+    raise AssertionError(f"no {prefix} example")
+
+
+def _eval_for(adapter, split, records) -> dict:
     return {
-        "adapter": adapter, "split": "test_id",
+        "adapter": adapter, "split": split,
         "model": "Qwen/Qwen3.5-2B", "revision": PINNED_REV_2B,
         "suite_sha256": g.current_suite_sha256(),
         "results": {"clean": {
-            "tag": "t", "ablate": {}, "k_steps": 4, "n": 1,
+            "tag": "t", "ablate": {}, "k_steps": 4, "n": len(records),
             "accuracy": 1.0, "by_depth": {}, "by_family": {},
             "seconds": 1.0,
-            "records": [
-                {"ex_id": _suite_ex().ex_id, "family": _suite_ex().family,
-                 "depth": _suite_ex().depth, "correct": 1.0,
-                 "rank_of_gold": 0, "n_candidates": len(_suite_ex().candidates)},
-            ],
+            "records": records,
         }},
     }
 
 
-def _suite_ex():
-    from latent_lab.bench.no_spend_gate import suite_examples_by_id
+def _raw_record(ex, *, hit=True) -> dict:
+    n = len(ex.candidates)
+    scores = [0.01 * i for i in range(n)]
+    scores[list(ex.candidates).index(ex.answer)] = 9.0 if hit else -9.0
+    return {"ex_id": ex.ex_id, "candidate_scores": scores}
 
-    for ex_id, ex in suite_examples_by_id().items():
-        if ex_id.startswith("ti-"):
-            return ex
-    raise AssertionError("no test_id example")
+
+def _derived_only_eval(adapter="runs/E_k4_s0") -> dict:
+    ex = _suite_ex()
+    return _eval_for(adapter, "test_id", [
+        {"ex_id": ex.ex_id, "family": ex.family,
+         "depth": ex.depth, "correct": 1.0,
+         "rank_of_gold": 0, "n_candidates": len(ex.candidates)},
+    ])
 
 
 @pytest.fixture()
@@ -258,7 +399,7 @@ def corpus(tmp_path):
         d = r4b / top / "E4_k1_s0"
         d.mkdir(parents=True)
         rep = _valid_report(model="Qwen/Qwen3.5-4B",
-                            revision="8" * 40)
+                            revision=REV_4B)
         rep["final_train_loss"] = float("nan")
         rep["best_val_acc"] = 1.0
         (d / "train_report.json").write_text(json.dumps(rep))
@@ -333,7 +474,8 @@ class TestGateEndToEnd:
         assert q["rejected_runs_with_nan_final_loss"] == ["E4_k1_s0"]
         assert q["live_vs_rejected_differing_files"] == []
 
-    def test_strict_bundle_from_project_loader_is_LOADABLE(self, corpus):
+    def test_strict_fp32_bundle_from_project_loader_is_LOADABLE(
+            self, corpus):
         import torch
 
         from latent_lab.train.checkpointing import save_adapter_bundle
@@ -354,6 +496,35 @@ class TestGateEndToEnd:
         ck = rv["checkpoint"]
         assert ck["classification"] == "loadable"
         assert "strict_project_loader_passed" in ck["reasons"]
+        assert "payload_floating_tensors_all_fp32" in ck["reasons"]
+
+    def test_bf16_bundle_payload_blocks_READY_even_when_report_claims_fp32(
+            self, corpus):
+        """Negative control for the audit repro 'bf16_bundle_and_report'."""
+        import torch
+
+        from latent_lab.train.checkpointing import save_adapter_bundle
+
+        r2b, _ = corpus
+        run = r2b / "runs" / "bf16_run"
+        run.mkdir()
+        save_adapter_bundle(run / "best_params.pt",
+                            {"lora.A": torch.eye(2, dtype=torch.bfloat16)},
+                            model_id="Qwen/Qwen3.5-2B",
+                            revision=PINNED_REV_2B,
+                            metrics={"best_score": 0.5, "best_step": 200})
+        rep = _valid_report()
+        rep["trainable_precision"] = "fp32"   # lying report string
+        (run / "train_report.json").write_text(json.dumps(rep))
+
+        res = self.run_gate(corpus)
+        rv = [r for r in res.artifact_verdicts["runs"]
+              if r["run_id"] == "bf16_run"][0]
+        assert rv["checkpoint"]["classification"] == "non-fp32-payload"
+        codes = {b["code"] for b in res.gate_verdict["blockers"]}
+        assert "TRAINABLES_NOT_FP32_IN_RETAINED_CHECKPOINTS" in codes
+        assert res.gate_verdict["prerequisites"] and \
+            res.verdict == "NOT_READY"
 
     def test_identity_conflict_between_bundle_and_report_invalid(
             self, corpus):
@@ -373,18 +544,283 @@ class TestGateEndToEnd:
               if r["run_id"] == "conflict_run"][0]
         assert rv["checkpoint"]["classification"] == "invalid"
 
-    def test_rescorable_records_get_RESCORED_CORRECTED(self, corpus):
+    # ---- negative controls mirroring the independent audit -----------------
+
+    def test_eval_suite_hash_mismatch_is_NOT_READY(self, corpus):
+        p = corpus[0] / "results" / "ev_E_k4_s0_test_id_clean.json"
+        ev = json.loads(p.read_text())
+        ev["suite_sha256"] = "0" * 64
+        p.write_text(json.dumps(ev))
+        res = self.run_gate(corpus)
+        entry = res.artifact_verdicts["evaluations"][0]
+        assert entry["status"] == "suite_mismatch"
+        codes = {b["code"] for b in res.gate_verdict["blockers"]}
+        assert "EVAL_FILE_INVALID" in codes
+        assert res.verdict == "NOT_READY"
+
+    def test_eval_no_records_is_NOT_READY(self, corpus):
+        p = corpus[0] / "results" / "ev_E_k4_s0_test_id_clean.json"
+        ev = json.loads(p.read_text())
+        ev["results"] = {}
+        p.write_text(json.dumps(ev))
+        res = self.run_gate(corpus)
+        assert res.artifact_verdicts["evaluations"][0][
+            "status"] == "invalid_metadata"
+        assert res.verdict == "NOT_READY"
+
+    def test_eval_unreadable_json_is_NOT_READY(self, corpus):
+        p = corpus[0] / "results" / "ev_E_k4_s0_test_id_clean.json"
+        p.write_text("{broken-json")
+        res = self.run_gate(corpus)
+        ev = [e for e in res.artifact_verdicts["evaluations"]
+              if e["file"] == "ev_E_k4_s0_test_id_clean.json"][0]
+        assert ev["status"] == "malformed_json"
+        assert ev["bound_run"] is None
+        codes = {b["code"] for b in res.gate_verdict["blockers"]}
+        assert "EVAL_FILE_INVALID" in codes and "ORPHAN_EVAL_FILE" in codes
+        assert res.verdict == "NOT_READY"
+
+    def test_eval_all_nan_scores_fails_at_strict_parse_never_rescored(
+            self, corpus):
+        """The audit wrote literal NaN tokens; strict JSON must reject the
+        whole file before any rescoring can silently sink them to -inf."""
         ex = _suite_ex()
-        gold_pos = list(ex.candidates).index(ex.answer)
         n = len(ex.candidates)
-        good = [0.01 * i for i in range(n)]
-        good[gold_pos] = 9.0
-        bad = [0.01 * i for i in range(n)]
-        bad[gold_pos] = -9.0
         ev = _derived_only_eval()
         ev["results"]["clean"]["records"] = [
-            {"ex_id": ex.ex_id, "candidate_scores": good},
-            {"ex_id": ex.ex_id, "candidate_scores": bad},
+            {"ex_id": ex.ex_id, "candidate_scores":
+                [float("nan")] * n}]
+        p = corpus[0] / "results" / "ev_E_k4_s0_test_id_clean.json"
+        p.write_text(json.dumps(ev))     # emits literal NaN tokens
+        res = self.run_gate(corpus)
+        entry = res.artifact_verdicts["evaluations"][0]
+        assert entry["status"] == "malformed_json"
+        assert "corrected_accuracy" not in entry
+        codes = {b["code"] for b in res.gate_verdict["blockers"]}
+        assert "EVAL_FILE_INVALID" in codes
+        assert res.verdict == "NOT_READY"
+
+    def test_eval_with_nan_literal_json_fails_closed(self, corpus):
+        p = corpus[0] / "results" / "ev_E_k4_s0_test_id_clean.json"
+        p.write_text('{"adapter": "runs/E_k4_s0", "loss": NaN}')
+        res = self.run_gate(corpus)
+        entry = [e for e in res.artifact_verdicts["evaluations"]
+                 if e["file"] == "ev_E_k4_s0_test_id_clean.json"][0]
+        assert entry["status"] == "malformed_json"
+        assert res.verdict == "NOT_READY"
+
+    def test_second_loadable_checkpoint_without_eval_coverage_blocks(
+            self, corpus):
+        import torch
+
+        from latent_lab.train.checkpointing import save_adapter_bundle
+
+        r2b, _ = corpus
+        run = r2b / "runs" / "runB"
+        run.mkdir()
+        rep = _valid_report()
+        rep["config"]["scorer"] = "corrected-gold-aware-v1"
+        rep["trainable_precision"] = "fp32"
+        (run / "train_report.json").write_text(json.dumps(rep))
+        save_adapter_bundle(run / "best_params.pt",
+                            {"lora.A": torch.eye(2)},
+                            model_id="Qwen/Qwen3.5-2B",
+                            revision=PINNED_REV_2B,
+                            metrics={"best_score": 0.5, "best_step": 200})
+        res = self.run_gate(corpus)
+        codes = {b["code"] for b in res.gate_verdict["blockers"]}
+        assert "EVAL_SPLIT_COVERAGE_MISSING" in codes
+        detail = [b["detail"] for b in res.gate_verdict["blockers"]
+                  if b["code"] == "EVAL_SPLIT_COVERAGE_MISSING"][0]
+        assert "2b/runs/runB" in detail
+        assert res.verdict == "NOT_READY"
+
+    def test_single_split_coverage_is_insufficient(self, corpus):
+        """One ID-split eval cannot prove the global prerequisite."""
+        import shutil
+        import torch
+
+        from latent_lab.train.checkpointing import save_adapter_bundle
+
+        r2b, r4b = corpus
+        shutil.rmtree(r4b / "runs")           # clean quarantine side
+        shutil.rmtree(r2b / "runs" / "legacy_run")
+        run = r2b / "runs" / "E_k4_s0"
+        rep = _valid_report()
+        rep["config"]["scorer"] = "corrected-gold-aware-v1"
+        rep["trainable_precision"] = "fp32"
+        (run / "train_report.json").write_text(json.dumps(rep))
+        os.remove(run / "best_params.pt")
+        save_adapter_bundle(run / "best_params.pt",
+                            {"lora.A": torch.eye(2)},
+                            model_id="Qwen/Qwen3.5-2B",
+                            revision=PINNED_REV_2B,
+                            metrics={"best_score": 0.5, "best_step": 200})
+        ex_ti = _suite_ex("ti-")
+        (r2b / "results" / "ev_E_k4_s0_test_id_clean.json").write_text(
+            json.dumps(_eval_for("runs/E_k4_s0", "test_id",
+                                 [_raw_record(ex_ti)])))
+        # NO test_ood eval at all.
+        res = g.run_gate(r2b, r4b, repo_root=None, skip_proof_tests=True,
+                         proof_result=PROOF_OK)
+        codes = {b["code"] for b in res.gate_verdict["blockers"]}
+        assert "EVAL_SPLIT_COVERAGE_MISSING" in codes
+        detail = [b["detail"] for b in res.gate_verdict["blockers"]
+                  if b["code"] == "EVAL_SPLIT_COVERAGE_MISSING"][0]
+        assert "test_ood" in detail
+        assert res.verdict == "NOT_READY"
+
+    def test_orphan_corrupt_checkpoint_is_explicit_blocker(self, corpus):
+        import torch
+
+        r2b, _ = corpus
+        orphan = r2b / "runs" / "orphan"
+        orphan.mkdir()
+        torch.save({"w": torch.tensor([float("nan")])},
+                   orphan / "best_params.pt")   # no train_report.json
+        res = self.run_gate(corpus)
+        orphans = res.artifact_verdicts["orphan_checkpoints"]
+        assert [o["id"] for o in orphans] == ["2b/runs/orphan/best_params.pt"]
+        assert orphans[0]["classification"] == "corrupt"
+        codes = {b["code"] for b in res.gate_verdict["blockers"]}
+        assert "ORPHAN_CHECKPOINT" in codes
+        assert res.verdict == "NOT_READY"
+
+    def test_live_4b_partial_duplicate_still_blocks(self, corpus):
+        """A differing best_params.pt must not mask the byte-identical
+        quarantined train_report.json left in the LIVE tree."""
+        import shutil
+
+        import torch
+
+        from latent_lab.train.checkpointing import save_adapter_bundle
+
+        _, r4b = corpus
+        rejected = r4b / "_rejected_nan_batch" / "E4_k1_s0"
+        live = r4b / "runs" / "E4_k1_s0"      # already exists in corpus
+        shutil.copy2(rejected / "train_report.json",
+                     live / "train_report.json")   # identical bytes
+        save_adapter_bundle(live / "best_params.pt", {"lora.A": torch.eye(2)},
+                            model_id="Qwen/Qwen3.5-4B", revision=REV_4B,
+                            metrics={"best_score": 1.0, "best_step": 200})
+        res = self.run_gate(corpus)
+        q = res.artifact_verdicts["quarantine_4b"]
+        assert q["live_vs_rejected_identical_files"] == \
+            ["E4_k1_s0/train_report.json"]
+        assert q["live_vs_rejected_differing_files"] == \
+            ["E4_k1_s0/best_params.pt"]
+        assert q["live_tree_duplicates_quarantine"] is True
+        assert q["live_invalid_runs"] == ["E4_k1_s0"]  # NaN loss report live
+        codes = {b["code"] for b in res.gate_verdict["blockers"]}
+        assert "LIVE_4B_DUPLICATES_REJECTED_NAN_BATCH" in codes
+        assert "LIVE_INVALID_4B_ARTIFACTS" in codes
+        assert res.verdict == "NOT_READY"
+
+    def test_marker_only_empty_quarantine_proves_nothing(self, corpus):
+        import shutil
+
+        _, r4b = corpus
+        shutil.rmtree(r4b / "_rejected_nan_batch")
+        (r4b / "_rejected_nan_batch").mkdir()
+        (r4b / "_rejected_nan_batch" / "REJECTED.md").write_text("# R\n")
+        res = self.run_gate(corpus)
+        q = res.artifact_verdicts["quarantine_4b"]
+        assert q["marker_only_empty_quarantine"] is True
+        assert q["rejected_batch_empty"] is True
+        codes = {b["code"] for b in res.gate_verdict["blockers"]}
+        assert "QUARANTINE_BATCH_EMPTY" in codes
+        statuses = {p["id"]: p["status"]
+                    for p in res.gate_verdict["prerequisites"]}
+        assert statuses[g.PREREQ_QUARANTINE] == "FAILED"
+        assert res.verdict == "NOT_READY"
+
+    def test_duplicate_checkpoint_binding_across_runs_blocks(self, corpus):
+        import shutil
+        import torch
+
+        from latent_lab.train.checkpointing import save_adapter_bundle
+
+        r2b, _ = corpus
+        shutil.rmtree(r2b / "runs" / "legacy_run")
+        run_a = r2b / "runs" / "dup_a"
+        run_b = r2b / "runs" / "dup_b"
+        for d in (run_a, run_b):
+            d.mkdir()
+            (d / "train_report.json").write_text(json.dumps(_valid_report()))
+            save_adapter_bundle(d / "best_params.pt",
+                                {"lora.A": torch.eye(2)},
+                                model_id="Qwen/Qwen3.5-2B",
+                                revision=PINNED_REV_2B,
+                                metrics={"best_score": 0.5, "best_step": 200})
+        # make them byte-identical
+        (run_b / "best_params.pt").write_bytes(
+            (run_a / "best_params.pt").read_bytes())
+        res = self.run_gate(corpus)
+        codes = {b["code"] for b in res.gate_verdict["blockers"]}
+        assert "DUPLICATE_CHECKPOINT_BINDING" in codes
+        groups = res.artifact_verdicts["duplicate_checkpoint_bindings"]
+        # one group for our dup_a/dup_b pair; the corpus also carries the
+        # byte-identical live/rejected 4B checkpoint pair
+        dup_pair = [grp for grp in groups
+                    if any(m.endswith("dup_a/best_params.pt")
+                           for m in grp["members"])]
+        assert len(dup_pair) == 1 and len(dup_pair[0]["members"]) == 2
+        assert res.verdict == "NOT_READY"
+
+    def test_malformed_train_report_fails_closed_not_crash(self, corpus):
+        p = corpus[0] / "runs" / "legacy_run" / "train_report.json"
+        p.write_text("{not json at all")
+        res = self.run_gate(corpus)      # must not raise
+        rv = [r for r in res.artifact_verdicts["runs"]
+              if r["run_id"] == "legacy_run"][0]
+        assert rv["report_problems"] == ["train_report:malformed_json"]
+        assert res.verdict == "NOT_READY"
+
+    def test_report_schema_negative_steps_and_bad_step_types_block(
+            self, corpus):
+        """JSON-expressible schema violations hit the granular checks."""
+        p = corpus[0] / "runs" / "E_k4_s0" / "train_report.json"
+        rep = _valid_report()
+        rep["config"]["steps"] = -800
+        rep["best_step"] = 200.5            # float step rejected
+        p.write_text(json.dumps(rep))
+        res = self.run_gate(corpus)         # must not crash
+        rv = [r for r in res.artifact_verdicts["runs"]
+              if r["run_id"] == "E_k4_s0"][0]
+        joined = ",".join(rv["report_problems"])
+        assert "config.steps:negative" in joined
+        assert "best_step:type" in joined
+        assert res.verdict == "NOT_READY"
+
+    def test_report_nonfinite_metrics_rejected_by_validator(self):
+        """NaN/Inf metric values are schema violations (unit level)."""
+        rep = _valid_report()
+        rep["best_val_acc"] = float("nan")
+        rep["val_history"][0]["accuracy"] = float("inf")
+        rep["final_train_loss"] = float("nan")
+        check = g.validate_train_report(rep)
+        joined = ",".join(check["problems"])
+        assert "best_val_acc:type_or_nonfinite" in joined
+        assert "val_history:bad_entries[0]" in joined
+        assert "final_train_loss:type_or_nonfinite" in joined
+
+    def test_report_bool_steps_and_metrics_are_rejected_not_coerced(self):
+        rep = _valid_report()
+        rep["config"]["steps"] = True
+        rep["best_step"] = False
+        rep["val_history"][0]["step"] = True
+        check = g.validate_train_report(rep)
+        joined = ",".join(check["problems"])
+        assert "config.steps:type" in joined
+        assert "best_step:type" in joined
+        assert "val_history:bad_entries[0]" in joined
+
+    def test_rescorable_records_get_RESCORED_CORRECTED(self, corpus):
+        ex = _suite_ex()
+        ev = _derived_only_eval()
+        ev["results"]["clean"]["records"] = [
+            _raw_record(ex, hit=True),
+            _raw_record(ex, hit=False),
         ]
         r2b, _ = corpus
         p = r2b / "results" / "ev_raw_test_id_clean.json"
@@ -396,20 +832,19 @@ class TestGateEndToEnd:
         assert entry["status"] == "RESCORED_CORRECTED"
         assert entry["corrected_accuracy"] == pytest.approx(0.5)
 
-    def test_READY_positive_control_exit0_path(self, corpus, tmp_path):
+    def test_READY_positive_control_exit0_path(self, corpus):
         """Every prerequisite satisfiable offline IS provable — proves the
-        gate is not rigged to permanent NOT_READY."""
+        gate is not rigged to permanent NOT_READY. The positive control
+        uses a VERIFIED fp32 bundle payload and full ID+OOD raw-score
+        coverage bound to the checkpoint's identity."""
+        import shutil
+
         import torch
 
         from latent_lab.train.checkpointing import save_adapter_bundle
 
         r2b, r4b = corpus
-        # clean quarantine: live tree holds nothing invalid
-        import shutil
-
-        shutil.rmtree(r4b / "runs")
-        # one fully-pinned run: corrected-scorer history + fp32 bundle +
-        # trainable_precision field + raw-score eval
+        shutil.rmtree(r4b / "runs")           # live 4B tree holds nothing
         run = r2b / "runs" / "E_k4_s0"
         rep = _valid_report()
         rep["config"]["scorer"] = "corrected-gold-aware-v1"
@@ -417,21 +852,21 @@ class TestGateEndToEnd:
         (run / "train_report.json").write_text(json.dumps(rep))
         os.remove(run / "best_params.pt")
         save_adapter_bundle(run / "best_params.pt",
-                            {"lora.0.A": torch.eye(2, dtype=torch.float32)},
+                            {"lora.A": torch.eye(2, dtype=torch.float32)},
                             model_id="Qwen/Qwen3.5-2B",
                             revision=PINNED_REV_2B,
                             metrics={"best_score": 0.5, "best_step": 200})
-        ev = _derived_only_eval()
-        ex = _suite_ex()
-        gold_pos = list(ex.candidates).index(ex.answer)
-        scores = [0.01 * i for i in range(len(ex.candidates))]
-        scores[gold_pos] = 9.0
-        ev["results"]["clean"]["records"] = [
-            {"ex_id": ex.ex_id, "candidate_scores": scores}]
-        (r2b / "results" / "ev_E_k4_s0_test_id_clean.json").write_text(
-            json.dumps(ev))
         # remove legacy_run's schema-violating report tree entirely
         shutil.rmtree(r2b / "runs" / "legacy_run")
+
+        ex_ti = _suite_ex("ti-")
+        ex_to = _suite_ex("to-")
+        (r2b / "results" / "ev_E_k4_s0_test_id_clean.json").write_text(
+            json.dumps(_eval_for("runs/E_k4_s0", "test_id",
+                                 [_raw_record(ex_ti)])))
+        (r2b / "results" / "ev_E_k4_s0_test_ood_clean.json").write_text(
+            json.dumps(_eval_for("runs/E_k4_s0", "test_ood",
+                                 [_raw_record(ex_to)])))
 
         res = g.run_gate(r2b, r4b, repo_root=None, skip_proof_tests=True,
                          proof_result=PROOF_OK)
@@ -440,6 +875,9 @@ class TestGateEndToEnd:
         statuses = {p["id"]: p["status"] for p in v["prerequisites"]}
         assert all(s == "PROVEN" for s in statuses.values())
         assert v["blockers"] == []
+        assert v["inputs"]["source_fingerprints"]["unchanged_during_gate"]
+        fp = v["inputs"]["source_fingerprints"]["results_2b"]["files"]
+        assert fp == 4
         assert g._exit_for("READY") == 0
 
     def test_canonical_outputs_byte_stable_and_timestamp_free(
@@ -470,13 +908,23 @@ class TestGateEndToEnd:
                 doc = _strict_loads((outs[0] / name).read_bytes())
                 assert isinstance(doc, dict)
 
-    def test_dry_run_skips_payload_loading_but_still_hash(self, corpus):
+    def test_source_fingerprint_detects_input_mutation(self, corpus):
+        r2b, r4b = corpus
+        fp1 = g.source_fingerprint(r2b)
+        (r2b / "results" / "ev_E_k4_s0_test_id_clean.json").write_text("{}")
+        fp2 = g.source_fingerprint(r2b)
+        assert fp1 != fp2
+        assert fp1["merkle_sha256"] != fp2["merkle_sha256"]
+
+    def test_dry_run_skips_payload_loading_but_still_hashes(self, corpus):
         res = self.run_gate(corpus, dry_run=True)
         runs = res.artifact_verdicts["runs"]
         ck = [r["checkpoint"] for r in runs if r.get("checkpoint")]
         assert all(c["classification"] == "unproven" for c in ck)
         assert res.gate_verdict["counts"]["files_scanned"] == 10
         assert res.gate_verdict["counts"]["eval_files_checked"] == 0
+        # dry-run can never be READY: payload-dependent prereqs UNPROVEN
+        assert res.verdict == "NOT_READY"
 
 
 # ---------------------------------------------------------------------------
@@ -490,12 +938,94 @@ class TestExitSemantics:
         with pytest.raises(ValueError):
             g._exit_for("SOMETHING_ELSE")
 
+    def test_paths_overlap_helper(self, tmp_path):
+        a = tmp_path / "in"
+        b = tmp_path / "in" / "sub"
+        c = tmp_path / "other"
+        assert g.paths_overlap(a, a)
+        assert g.paths_overlap(a, b) and g.paths_overlap(b, a)
+        assert not g.paths_overlap(a, c)
+
+    def test_out_equal_to_input_root_rejected_before_writing(
+            self, corpus, capsys):
+        r2b, r4b = corpus
+        before = sorted(str(p) for p in r2b.rglob("*"))
+        rc = g.main(["--results-2b", str(r2b), "--results-4b", str(r4b),
+                     "--out", str(r2b), "--skip-proof-tests",
+                     "--no-telemetry"])
+        assert rc == 2
+        assert "overlaps an input root" in capsys.readouterr().err
+        assert sorted(str(p) for p in r2b.rglob("*")) == before
+
+    def test_out_inside_input_root_rejected(self, corpus, tmp_path, capsys):
+        r2b, r4b = corpus
+        rc = g.main(["--results-2b", str(r2b), "--results-4b", str(r4b),
+                     "--out", str(r2b / "results" / "gate_out"),
+                     "--skip-proof-tests", "--no-telemetry"])
+        assert rc == 2
+        assert not (r2b / "results" / "gate_out").exists()
+
+    def test_out_containing_input_root_rejected(self, corpus, tmp_path,
+                                                capsys):
+        r2b, r4b = corpus
+        # tmp_path itself CONTAINS both input roots -> must be refused
+        rc = g.main(["--results-2b", str(r2b), "--results-4b", str(r4b),
+                     "--out", str(tmp_path),
+                     "--skip-proof-tests", "--no-telemetry"])
+        assert rc == 2
+        assert "overlaps" in capsys.readouterr().err
+        assert not (tmp_path / "gate_verdict.json").exists()
+
     def test_missing_input_roots_is_execution_error(self, tmp_path, capsys):
         rc = g.main(["--results-2b", str(tmp_path / "nope"),
                      "--results-4b", str(tmp_path / "nada"),
                      "--out", str(tmp_path / "o"), "--no-telemetry"])
         assert rc == 2
         assert "execution error" in capsys.readouterr().err
+
+    def test_unreadable_scan_file_is_execution_error_exit2(
+            self, corpus, tmp_path, monkeypatch, capsys):
+        r2b, r4b = corpus
+        calls = {"n": 0}
+        real_sha = g.sha256_file
+
+        def flaky(path):
+            calls["n"] += 1
+            if calls["n"] == 3:      # first fingerprint pass hits file 3
+                raise OSError("permission denied (simulated)")
+            return real_sha(path)
+
+        monkeypatch.setattr(g, "sha256_file", flaky)
+        rc = g.main(["--results-2b", str(r2b), "--results-4b", str(r4b),
+                     "--out", str(tmp_path / "o1"),
+                     "--skip-proof-tests", "--no-telemetry"])
+        assert rc == 2
+        assert "execution error" in capsys.readouterr().err
+
+    def test_inputs_modified_mid_gate_is_execution_error(
+            self, corpus, monkeypatch, capsys, tmp_path):
+        r2b, r4b = corpus
+        real_fp = g.source_fingerprint
+        state = {"n": 0}
+
+        def mutating_fp(root):
+            state["n"] += 1
+            if state["n"] == 3:
+                # second pass, first root: mutate just before re-hashing so
+                # the after-fingerprint diverges from the before-fingerprint
+                (root / "results" / "ev_E_k4_s0_test_id_clean.json") \
+                    .write_text('{"adapter": "runs/E_k4_s0", "split": '
+                                '"test_id", "model": "m", "revision": "r", '
+                                '"suite_sha256": "s", "results": {}}')
+            return real_fp(root)
+
+        monkeypatch.setattr(g, "source_fingerprint", mutating_fp)
+        rc = g.main(["--results-2b", str(r2b), "--results-4b", str(r4b),
+                     "--out", str(tmp_path / "o2"),
+                     "--skip-proof-tests", "--no-telemetry"])
+        assert rc == 2
+        assert "changed while the gate was running" in \
+            capsys.readouterr().err
 
     def test_main_end_to_end_not_ready_writes_artifacts(
             self, corpus, tmp_path, capsys):
@@ -533,6 +1063,12 @@ class TestExitSemantics:
     def test_math_domain_no_nan_leaks_into_canonical_json(self, corpus):
         r2b, r4b = corpus
         res = g.run_gate(r2b, r4b, repo_root=None, skip_proof_tests=True)
+        for doc in (res.inventory, res.artifact_verdicts,
+                    res.gate_verdict):
+            # strict parser raises on any bare NaN/Infinity literal
+            assert isinstance(_strict_loads(g.canonical_json_bytes(doc)),
+                              dict)
         blob = g.canonical_json_bytes(res.artifact_verdicts)
-        assert b"NaN" not in blob and b"Infinity" not in blob
+        assert b": NaN" not in blob and b": Infinity" not in blob \
+            and b": -Infinity" not in blob
         assert math.isfinite(1.0)  # sanity on import side-effects-free use

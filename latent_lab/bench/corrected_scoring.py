@@ -1,17 +1,31 @@
 """Corrected gold-aware scoring + deterministic checkpoint selection.
 
 Offline, stdlib-only primitives used by the no-spend integrity gate and by
-future eval drivers:
+future eval drivers. FAIL-CLOSED contract:
 
 * ``normalize_answer`` / ``gold_indices`` — whitespace/parser-tolerant gold
-  alignment that never assumes candidate zero is gold and never silently
-  scores ambiguous (duplicated) candidate sets.
-* ``corrected_score`` — rank-of-gold from an explicit ranking order or from
-  per-candidate scores; deterministic under candidate permutation when the
-  score-to-candidate mapping is preserved.
-* ``rescore_records`` — recompute corrected accuracy ONLY where raw scorer
-  inputs were retained; anything less is reported as
-  ``NON_RESCORABLE_MISSING_RAW_PREDICTION``, never relabelled as a rescore.
+  alignment that never assumes candidate zero is gold.
+* ``corrected_score`` — rank-of-gold from exactly ONE unambiguous raw
+  prediction representation. Any evidence defect makes the verdict
+  INVALID (``valid=False`` plus a machine-readable reason) instead of
+  raising or silently scoring:
+    - conflicting inputs (both ``order`` and ``scores``);
+    - missing representation;
+    - non-permutation / unknown / partial ``order`` lists;
+    - scores that are not finite real numbers (NaN/Inf never sink to -inf);
+    - a top-score tie between DIFFERENT candidates (array position is
+      never used as a tiebreaker, so candidate permutation cannot change
+      correctness);
+    - duplicated (ambiguous) candidate sets.
+  Gold absent from the ranking is a decisive, unambiguous INCORRECT — it
+  stays a valid verdict flagged ``GOLD_ABSENT``.
+* ``rescore_records`` — recompute corrected accuracy ONLY where every
+  record retained exactly one usable raw representation; any malformed,
+  ambiguous or invalid record fails the WHOLE file as
+  ``INVALID_RECORDS``, and derived-only files stay
+  ``NON_RESCORABLE_MISSING_RAW_PREDICTION``. Record-level flags are
+  aggregated into ``flag_counts`` and can never be lost; no aggregation
+  of invalid records can yield ``RESCORED_CORRECTED``.
 * ``select_best_checkpoint`` — recompute the best step from a validation
   history with finite-metric enforcement and earliest-step tie-breaking,
   ignoring any stored/poisoned ``best_val_acc``/``best_step`` fields.
@@ -23,18 +37,28 @@ import math
 from dataclasses import dataclass, field
 
 MISSING_RAW_PREDICTION = "NON_RESCORABLE_MISSING_RAW_PREDICTION"
+INVALID_RECORDS = "INVALID_RECORDS"
+NO_RECORDS = "NO_RECORDS"
+RESCORED_CORRECTED = "RESCORED_CORRECTED"
 
 FLAG_DUPLICATE_CANDIDATES = "DUPLICATE_CANDIDATES"
 FLAG_GOLD_ABSENT = "GOLD_ABSENT"
 FLAG_ORDER_NOT_PERMUTATION = "ORDER_NOT_PERMUTATION"
 FLAG_NONFINITE_SCORES = "NONFINITE_SCORES"
 FLAG_NORMALIZED_MATCH = "NORMALIZED_MATCH"
+FLAG_AMBIGUOUS_TIE = "AMBIGUOUS_TOP_TIE"
+FLAG_CONFLICTING_INPUTS = "CONFLICTING_REPRESENTATIONS"
+FLAG_NO_RAW_INPUTS = "NO_RAW_PREDICTION"
+FLAG_SCORE_TYPE = "SCORE_NOT_A_REAL_NUMBER"
+FLAG_SCORES_LENGTH = "SCORES_LENGTH_MISMATCH"
 
 RAW_SCORER_FIELDS = (
     "candidate_scores",       # aligned per-candidate log-probs/scores
     "ranked_candidates",      # candidate contents in ranked order
     "predicted_answer",       # decoded answer string
 )
+
+MAX_DETAIL_PROBLEMS = 8
 
 
 def normalize_answer(value: object) -> str:
@@ -55,119 +79,199 @@ def gold_indices(candidates, answer) -> tuple[int, ...]:
 @dataclass(frozen=True)
 class CorrectedScore:
     correct: bool
-    rank_of_gold: int          # -1 when gold absent from the ranking
+    rank_of_gold: int          # -1 when gold absent or verdict invalid
     flags: tuple[str, ...] = field(default=())
+    valid: bool = True         # False => evidence defect, NEVER count this
+    invalid_reason: str | None = None
+
+
+def _invalid(reason: str, flags: tuple[str, ...]) -> CorrectedScore:
+    return CorrectedScore(correct=False, rank_of_gold=-1,
+                          flags=tuple(sorted(set(flags))),
+                          valid=False, invalid_reason=reason)
 
 
 def corrected_score(candidates, answer, *, order=None, scores=None) -> CorrectedScore:
     """Gold-aware exact ranking score for one example.
 
-    Exactly one of ``order``/``scores`` must be given. ``order`` is a
-    candidate-index ranking (best first). ``scores`` are per-candidate
-    values mapped BY POSITION IN ``candidates``; the effective order is
-    ``sorted(range(n), key=(-score, index))`` after finiteness enforcement,
-    which makes the verdict invariant to input permutation as long as each
-    score stays attached to its candidate content.
+    Exactly one of ``order``/``scores`` must be supplied. Evidence defects
+    return an INVALID CorrectedScore (``valid=False``); they never raise
+    and never silently score. ``scores`` are per-candidate values mapped BY
+    POSITION IN ``candidates``; a top-score tie between different
+    candidates is ambiguous and invalid rather than resolved by index.
     """
     n = len(candidates)
-    flags: list[str] = []
-    gidx = gold_indices(candidates, answer)
-    if len(gidx) > 1:
-        flags.append(FLAG_DUPLICATE_CANDIDATES)
-    if not gidx:
-        return CorrectedScore(correct=False, rank_of_gold=-1,
-                              flags=(FLAG_GOLD_ABSENT,))
+    if n == 0:
+        return _invalid("empty_candidate_set", ())
+    norm = [normalize_answer(c) for c in candidates]
+    if len(set(norm)) != n:
+        return _invalid("duplicate_candidates", (FLAG_DUPLICATE_CANDIDATES,))
+    if scores is not None and order is not None:
+        return _invalid("conflicting_representations",
+                        (FLAG_CONFLICTING_INPUTS,))
 
+    gidx = gold_indices(candidates, answer)
+
+    eff_order: list[int]
     if scores is not None:
-        if len(scores) != n:
-            raise ValueError("scores length != candidates length")
+        if not isinstance(scores, (list, tuple)) or len(scores) != n:
+            return _invalid("scores_length_mismatch", (FLAG_SCORES_LENGTH,))
         vals: list[float] = []
+        flags: list[str] = []
         for s in scores:
+            if isinstance(s, bool) or not isinstance(s, (int, float)):
+                flags.append(FLAG_SCORE_TYPE)
+                continue
             f = float(s)
             if not math.isfinite(f):
                 flags.append(FLAG_NONFINITE_SCORES)
-                f = -math.inf     # deterministic sink, never wins ties by value
             vals.append(f)
+        if flags:
+            primary = ("score_not_a_real_number" if FLAG_SCORE_TYPE in flags
+                       else "nonfinite_score")
+            return _invalid(primary, tuple(flags))
+        top = max(vals)
+        leaders = [i for i in range(n) if vals[i] == top]
+        if len(leaders) > 1:
+            # distinct candidates share the top score -> ambiguous no
+            # matter what array position says; permutation-invariant.
+            return _invalid("ambiguous_top_tie", (FLAG_AMBIGUOUS_TIE,))
         eff_order = sorted(range(n), key=lambda i: (-vals[i], i))
-    else:
-        if order is None:
-            raise ValueError("exactly one of order/scores is required")
-        if sorted(order) != list(range(n)):
-            raise ValueError("order is not a permutation of candidate indices")
+    elif order is not None:
+        if (not isinstance(order, (list, tuple))
+                or len(order) != n
+                or any(isinstance(i, bool) or not isinstance(i, int)
+                       for i in order)
+                or sorted(order) != list(range(n))):
+            return _invalid("order_not_permutation",
+                            (FLAG_ORDER_NOT_PERMUTATION,))
         eff_order = list(order)
+    else:
+        return _invalid("no_raw_prediction", (FLAG_NO_RAW_INPUTS,))
 
-    # With duplicated candidates the ambiguity is flagged; conservatively
-    # use the best-ranked gold occurrence.
+    if not gidx:
+        return CorrectedScore(correct=False, rank_of_gold=-1,
+                              flags=(FLAG_GOLD_ABSENT,), valid=True)
+
     rank = min(eff_order.index(g) for g in gidx)
-    if any(normalize_answer(candidates[i]) != str(answer).strip()
-           and normalize_answer(candidates[i]) == normalize_answer(answer)
+    out_flags = set()
+    if any(norm[i] == normalize_answer(answer)
+           and str(candidates[i]).strip() != str(answer).strip()
            for i in gidx):
-        flags.append(FLAG_NORMALIZED_MATCH)
+        out_flags.add(FLAG_NORMALIZED_MATCH)
     return CorrectedScore(correct=(rank == 0), rank_of_gold=rank,
-                          flags=tuple(sorted(set(flags))))
+                          flags=tuple(sorted(out_flags)), valid=True)
 
 
 @dataclass(frozen=True)
 class RescoreOutcome:
-    status: str                       # RESCORED_CORRECTED | MISSING_RAW_PREDICTION | NO_RECORDS
+    status: str       # RESCORED_CORRECTED | MISSING_RAW_PREDICTION |
+                      # NO_RECORDS | INVALID_RECORDS
     n_records: int = 0
     corrected_accuracy: float | None = None
     detail: str | None = None
+    flag_counts: dict | None = None   # flag -> occurrences across records
 
 
-def _record_raw_inputs(record: dict, candidates) -> bool:
-    """True iff this record retained enough raw evidence to re-run the
-    corrected scorer (per-candidate scores aligned to the example's
-    candidates, or the ranked candidate strings, or a decoded answer)."""
-    if "candidate_scores" in record:
-        cs = record["candidate_scores"]
-        return isinstance(cs, (list, tuple)) and len(cs) == len(candidates)
-    if "ranked_candidates" in record:
-        rc = record["ranked_candidates"]
-        return isinstance(rc, (list, tuple)) and len(rc) > 0
-    return "predicted_answer" in record
+class _RecordError(Exception):
+    pass
 
 
 def rescore_records(records, examples_by_id) -> RescoreOutcome:
     """Recompute corrected accuracy over retained records.
 
-    Any record missing raw prediction inputs makes the whole file
-    NON_RESCORABLE_MISSING_RAW_PREDICTION — partial rescores would silently
-    bias the aggregate.
+    Fail-closed aggregation: ANY record that is malformed, references an
+    unknown example, lacks a raw prediction, carries conflicting raw
+    representations, or yields an invalid scorer verdict fails the whole
+    file — a partial aggregate is never emitted, so invalid records can
+    never produce ``RESCORED_CORRECTED``. Record-level flags survive into
+    ``flag_counts``.
     """
+    if not isinstance(records, (list, tuple)):
+        return RescoreOutcome(status=INVALID_RECORDS,
+                              detail="records container is not a list")
     if not records:
-        return RescoreOutcome(status="NO_RECORDS")
+        return RescoreOutcome(status=NO_RECORDS)
+
     hits = 0
-    for rec in records:
-        ex = examples_by_id.get(rec.get("ex_id"))
-        if ex is None:
-            return RescoreOutcome(
-                status=MISSING_RAW_PREDICTION, n_records=len(records),
-                detail=f"example {rec.get('ex_id')!r} absent from suite")
-        cands = tuple(ex["candidates"]) if isinstance(ex, dict) \
-            else tuple(ex.candidates)
-        ans = ex["answer"] if isinstance(ex, dict) else ex.answer
-        if not _record_raw_inputs(rec, cands):
-            return RescoreOutcome(
-                status=MISSING_RAW_PREDICTION, n_records=len(records),
-                detail="records carry only derived correct/rank_of_gold")
-        if "candidate_scores" in rec:
-            cs = corrected_score(cands, ans, scores=rec["candidate_scores"])
-        elif "ranked_candidates" in rec:
-            by_norm = {}
-            for i, c in enumerate(cands):
-                by_norm.setdefault(normalize_answer(c), i)
-            order = [by_norm[normalize_answer(x)]
-                     for x in rec["ranked_candidates"]]
-            cs = corrected_score(cands, ans, order=order)
-        else:
-            pred = normalize_answer(rec["predicted_answer"])
-            cs = CorrectedScore(correct=(pred == normalize_answer(ans)),
-                                rank_of_gold=-1)
-        hits += int(cs.correct)
-    return RescoreOutcome(status="RESCORED_CORRECTED",
+    flag_counts: dict[str, int] = {}
+    problems: list[str] = []
+
+    def note_flag(f: str) -> None:
+        flag_counts[f] = flag_counts.get(f, 0) + 1
+
+    def fail_invalid(reason: str) -> RescoreOutcome:
+        shown = problems[:MAX_DETAIL_PROBLEMS]
+        detail = "; ".join(shown + ([reason] if reason else []))
+        return RescoreOutcome(status=INVALID_RECORDS,
+                              n_records=len(records),
+                              detail=detail or None,
+                              flag_counts=dict(flag_counts))
+
+    for idx, rec in enumerate(records):
+        try:
+            if not isinstance(rec, dict):
+                raise _RecordError("record is not an object")
+            ex_id = rec.get("ex_id")
+            ex = examples_by_id.get(ex_id) if isinstance(ex_id, str) else None
+            if ex is None:
+                return RescoreOutcome(
+                    status=MISSING_RAW_PREDICTION, n_records=len(records),
+                    detail=f"example {ex_id!r} absent from suite")
+            cands = tuple(ex["candidates"]) if isinstance(ex, dict) \
+                else tuple(ex.candidates)
+            ans = ex["answer"] if isinstance(ex, dict) else ex.answer
+
+            reps = [name for name in ("candidate_scores",
+                                      "ranked_candidates") if name in rec]
+            if len(reps) > 1:
+                note_flag(FLAG_CONFLICTING_INPUTS)
+                raise _RecordError(
+                    f"conflicting raw representations {sorted(reps)}")
+            if "candidate_scores" in rec:
+                cs = corrected_score(cands, ans, scores=rec["candidate_scores"])
+            elif "ranked_candidates" in rec:
+                rc = rec["ranked_candidates"]
+                if not isinstance(rc, (list, tuple)):
+                    raise _RecordError("ranked_candidates is not a list")
+                by_norm: dict[str, int] = {}
+                for i, c in enumerate(cands):
+                    by_norm.setdefault(normalize_answer(c), i)
+                order: list[int] = []
+                for x in rc:
+                    key = normalize_answer(x)
+                    if key not in by_norm:
+                        raise _RecordError(
+                            f"ranked candidate {x!r} not in candidate set")
+                    order.append(by_norm[key])
+                cs = corrected_score(cands, ans, order=order)
+            elif "predicted_answer" in rec:
+                pred = normalize_answer(rec["predicted_answer"])
+                cs = CorrectedScore(correct=(pred == normalize_answer(ans)),
+                                    rank_of_gold=-1)
+            else:
+                return RescoreOutcome(
+                    status=MISSING_RAW_PREDICTION, n_records=len(records),
+                    detail="records carry only derived correct/rank_of_gold")
+            if not cs.valid:
+                for f in cs.flags:
+                    note_flag(f)
+                raise _RecordError(
+                    f"invalid scorer verdict: {cs.invalid_reason}")
+            for f in cs.flags:
+                note_flag(f)
+            hits += int(cs.correct)
+        except _RecordError as e:
+            problems.append(f"record[{idx}]: {e}")
+        except Exception as e:  # noqa: BLE001 — any surprise is invalidity
+            problems.append(f"record[{idx}]: {type(e).__name__}: {e}")
+
+    if problems:
+        return fail_invalid("")
+    return RescoreOutcome(status=RESCORED_CORRECTED,
                           n_records=len(records),
-                          corrected_accuracy=round(hits / len(records), 6))
+                          corrected_accuracy=round(hits / len(records), 6),
+                          flag_counts=dict(flag_counts) or None)
 
 
 @dataclass(frozen=True)
@@ -183,21 +287,30 @@ def select_best_checkpoint(history, *, metric_key: str = "accuracy") -> Selectio
     """Deterministically re-select the best validation entry.
 
     Ignores stored best_* fields entirely (they may be poisoned by a broken
-    scorer); rejects non-finite metrics instead of skipping silently;
-    breaks accuracy ties toward the EARLIEST step so later training cannot
-    win on noise. Returns None when nothing finite remains.
+    scorer); rejects entries whose metric is not a finite real number or
+    whose step is not a non-negative integer (bool/float steps are
+    rejected, never coerced); breaks accuracy ties toward the EARLIEST
+    step so later training cannot win on noise. Returns None when nothing
+    valid remains.
     """
     considered, rejected = [], 0
     for h in history or ():
-        try:
-            v = float(h[metric_key])
-        except (KeyError, TypeError, ValueError):
+        if not isinstance(h, dict):
             rejected += 1
             continue
+        step = h.get("step")
+        if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+            rejected += 1
+            continue
+        raw = h.get(metric_key)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            rejected += 1
+            continue
+        v = float(raw)
         if not math.isfinite(v):
             rejected += 1
             continue
-        considered.append((v, int(h["step"])))
+        considered.append((v, step))
     if not considered:
         return None
     best_v = max(v for v, _ in considered)

@@ -29,7 +29,46 @@ uv run python -m latent_lab.bench.no_spend_gate --dry-run
 |---|---|
 | `0` | READY — every mandatory prerequisite PROVEN |
 | `1` | NOT_READY — evidence-backed negative verdict; see `blockers` |
-| `2` | execution error — missing inputs or crash; no verdict inferable |
+| `2` | execution error — bad invocation (`--out` overlapping an input root), missing/unreadable inputs, inputs modified mid-run, unwritable outputs, or crash; NO verdict is inferable |
+
+## Integrity guarantees (fail-closed)
+
+- **Strict JSON everywhere.** Reports and eval files are parsed with
+  NaN/Infinity literals rejected; a malformed file is an explicit blocker,
+  never skipped, truncated, or silently coerced.
+- **One unambiguous raw representation per record.** Conflicting
+  `candidate_scores` + `ranked_candidates` are INVALID; ranked lists must
+  be full unique permutations of the candidate set (duplicates / unknown /
+  partial entries are INVALID, never uncaught exceptions); scores must be
+  finite real numbers (NaN/Inf never sink to `-inf`); a top-score tie
+  between different candidates is ambiguous instead of being decided by
+  array position, so candidate permutation cannot change correctness;
+  record flags/status are preserved through aggregation and invalid
+  records can never yield `RESCORED_CORRECTED`.
+- **Payload-verified FP32 trainables.** Retained checkpoints must load
+  through the identity-bound bundle loader AND their returned payload
+  tensors must be floating-point-fp32; report strings alone prove nothing.
+  A bf16 bundle classifies `non-fp32-payload` and blocks READY.
+- **Symmetric discovery.** Orphan checkpoints (no owning discovered run),
+  orphan eval files (adapter resolving to no run), byte-duplicate
+  checkpoints bound to more than one run directory, and unreadable
+  artifacts are explicit blockers — discovery does not start and stop at
+  reports.
+- **Per-checkpoint eval joins.** Every retained loadable 2B checkpoint
+  needs valid rescored raw-score evidence bound to it by adapter path +
+  exact model id + pinned revision + current suite hash, covering BOTH
+  required splits (`test_id` AND `test_ood`). One unrelated or one-split
+  eval proves nothing globally.
+- **Quarantine completeness.** The rejected 4B batch must be nonempty,
+  markered, and fully contained: ANY known-invalid or byte-duplicate 4B
+  artifact left in any live tree blocks READY even when sibling files
+  differ; a marker-only empty quarantine proves nothing.
+- **Input immutability proof.** Bounded streaming SHA-256 Merkle
+  fingerprints of both input roots are recorded before and after gating;
+  any change aborts with exit 2 and embeds the fingerprints in
+  `gate_verdict.json`. `--out` equal to, inside, or containing either
+  input root is rejected before anything is written, so the gate can
+  never self-inventory its outputs.
 
 ## Outputs (`--out`, default `.rcc_work/no_spend_gate_20260824/`)
 
@@ -52,16 +91,24 @@ strings, never `NaN` tokens).
 
 ## What READY requires (all PROVEN, else NOT_READY)
 
-1. `inventory_hashed_complete` — every discovered file hashed.
-2. `train_reports_schema_identity_and_pins` — model id, pinned immutable
-   revision, suite hash, mode/interval/K/seed/steps, trainable precision.
-   Missing fields are blockers, never defaults.
-3. `checkpoints_strict_loadable_identity_bound` — every retained candidate
-   checkpoint loads through the project's identity-bound bundle loader.
-4. `retained_evals_rescored_with_corrected_scorer` — raw per-candidate
-   scores were retained, so corrected gold-aware rescoring actually ran.
-   Records holding only derived `correct`/`rank_of_gold` are marked
-   `NON_RESCORABLE_MISSING_RAW_PREDICTION`, never relabelled as a rescore.
+1. `inventory_hashed_complete` — every discovered file hashed; streaming
+   input fingerprints taken before and after the gate and matched.
+2. `train_reports_schema_identity_and_pins` — nonempty model id, pinned
+   immutable revision, current suite hash, mode/interval/K/seed/steps
+   (steps a non-negative integer, never bool), finite `best_val_acc` /
+   `final_train_loss`, per-entry integer steps and finite accuracies in
+   `val_history`, trainable precision present. Missing or non-finite
+   fields are blockers, never defaults.
+3. `checkpoints_strict_loadable_identity_bound_fp32_payload` — every
+   retained candidate checkpoint loads through the project's identity-bound
+   bundle loader with fp32 verified from the payload tensors; no orphan,
+   no ambiguous duplicate binding.
+4. `retained_evals_rescored_with_corrected_scorer` — every retained
+   loadable checkpoint has valid raw-score eval evidence for BOTH required
+   splits, exactly identity-bound; records holding only derived
+   `correct`/`rank_of_gold` are marked
+   `NON_RESCORABLE_MISSING_RAW_PREDICTION`; malformed/empty/
+   invalid-score/conflicting eval files are `EVAL_FILE_INVALID`.
 5. `checkpoint_selection_uses_corrected_metric` — best-step selection
    reproducible from histories produced under the corrected scorer
    (`config.scorer == "corrected-gold-aware-v1"`); stored historical
@@ -69,9 +116,12 @@ strings, never `NaN` tokens).
 6. `runtime_integrity_regressions_pass` — adapter strict metadata +
    roundtrip, fp32 trainables over bf16 backbone, non-finite rejection,
    cached-recurrence equivalence, gold-position scoring invariance.
-7. `invalid_4b_quarantined_not_live` — rejected NaN batch fully contained
-   in `_rejected_nan_batch/` with marker, nothing invalid left live, and
-   no byte-duplication between live `runs/` and the quarantine tree.
+7. `invalid_4b_quarantined_not_live` — rejected batch nonempty + markered;
+   nothing byte-duplicating it remains live, no known-invalid artifact in
+   any live tree, no marker-only empty quarantine.
+
+A dry run leaves 3/4/6 UNPROVEN by construction, so dry runs can never
+emit READY.
 
 ## Trust boundary
 
@@ -84,10 +134,16 @@ cloud, GPU, training, or paid service is touched by design.
 
 ## Result on this evidence set (2026-08-24)
 
-NOT_READY — see the committed gate code for the checks and the uncommitted
-`.rcc_work/no_spend_gate_20260824/GATE_REPORT.md` for the full blocker list
-(legacy-unbound bf16 checkpoints, unrescorable derived-only eval records,
-missing trainable-precision fields, poisoned selection provenance, live-tree
-duplication of the rejected NaN batch). The gate was NOT weakened to produce
-READY; a positive-control test inside the suite proves the READY path fires
-when every prerequisite genuinely holds.
+NOT_READY — evidence-backed, never hardcoded: an in-suite positive control
+(`tests/test_no_spend_gate.py::...READY_positive_control_exit0_path`)
+proves READY fires when every prerequisite genuinely holds, and the
+verdict for any given tree is recomputed from its artifacts on every run.
+On the retained snapshot the gate reports blockers such as
+legacy-unbound bf16 checkpoints, unrescorable derived-only eval records
+(no raw per-candidate scores), missing trainable-precision fields,
+poisoned selection provenance, live-tree duplication of the rejected NaN
+batch, and missing per-split eval coverage/identity bindings — see the
+generated `GATE_REPORT.md` for the exact current list. The gate was NOT
+weakened to produce READY; 45 negative controls (audit-reproduced
+fail-opens) now fail closed and each is pinned by a test that fails on
+the pre-fix commit `3774569`.
