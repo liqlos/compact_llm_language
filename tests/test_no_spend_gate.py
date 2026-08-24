@@ -294,17 +294,42 @@ PINNED_REV_2B = "15852e8c16360a2fea060d615a32b45270f8a8fc"
 REV_4B = "8" * 40
 
 
+def _semantic_config() -> dict:
+    """Full training-semantic config (exactly what recipe_from_config
+    requires — nothing defaulted)."""
+    return {
+        "mode": "E-localized", "interval": [12, 18], "k": 4,
+        "lora_r": 8, "lora_alpha": 16.0, "lr": 0.0001, "steps": 800,
+        "seed": 0, "max_k": 16, "optimizer": "adamw",
+        "weight_decay": 0.01, "lr_schedule": "constant", "warmup": 20,
+        "clip": 1.0, "detach_z0": False, "grad_checkpoint": True,
+    }
+
+
+def _semantic_config_over(**over) -> dict:
+    return {**_semantic_config(), **over}
+
+
+def _canonical_recipe(cfg=None) -> dict:
+    from latent_lab.train.checkpointing import recipe_from_config
+
+    return recipe_from_config(cfg if cfg is not None else _semantic_config(),
+                              g.current_suite_sha256())
+
+
 def _valid_report(**over) -> dict:
     rep = {
         "config": {
-            "mode": "E-localized", "interval": [12, 18], "k": 4,
-            "lora_r": 8, "lr": 0.0001, "steps": 800, "seed": 0,
-            "max_k": 16, "detach_z0": False, "device": "cuda",
-            "train_examples": 490, "grad_checkpoint": True,
+            **_semantic_config(),
+            "device": "cuda",
+            "train_examples": 490,
         },
         "model": "Qwen/Qwen3.5-2B",
         "revision": PINNED_REV_2B,
         "suite_sha256": g.current_suite_sha256(),
+        # The report's recipe must equal the canonical derivation of its
+        # own config + suite hash (the gate re-derives it; never trusts).
+        "recipe": None,
         "best_val_acc": 0.5,
         "best_step": 200,
         "val_history": [
@@ -322,6 +347,7 @@ def _valid_report(**over) -> dict:
         "platform": "test",
     }
     rep.update(over)
+    rep["recipe"] = _canonical_recipe(rep["config"])
     return rep
 
 
@@ -393,6 +419,7 @@ def _clean_retained_evidence(corpus):
                         {"lora.A": torch.eye(2, dtype=torch.float32)},
                         model_id="Qwen/Qwen3.5-2B",
                         revision=PINNED_REV_2B,
+                        recipe=rep["recipe"],
                         metrics={"best_score": 0.5, "best_step": 200})
     for p in r2b.glob("results/ev_*.json"):
         os.remove(p)
@@ -519,11 +546,13 @@ class TestGateEndToEnd:
         run = r2b / "runs" / "bound_run"
         run.mkdir()
         state = {"lora.0.A": torch.eye(2, dtype=torch.float32)}
+        rep = _valid_report()
         save_adapter_bundle(run / "best_params.pt", state,
                             model_id="Qwen/Qwen3.5-2B",
                             revision=PINNED_REV_2B,
+                            recipe=rep["recipe"],
                             metrics={"best_score": 0.5, "best_step": 200})
-        (run / "train_report.json").write_text(json.dumps(_valid_report()))
+        (run / "train_report.json").write_text(json.dumps(rep))
 
         res = self.run_gate(corpus)
         rv = [r for r in res.artifact_verdicts["runs"]
@@ -532,6 +561,8 @@ class TestGateEndToEnd:
         assert ck["classification"] == "loadable"
         assert "strict_project_loader_passed" in ck["reasons"]
         assert "payload_floating_tensors_all_fp32" in ck["reasons"]
+        assert "bundle_recipe_equals_independently_derived_report_recipe" \
+            in ck["reasons"]
 
     def test_bf16_bundle_payload_blocks_READY_even_when_report_claims_fp32(
             self, corpus):
@@ -543,12 +574,13 @@ class TestGateEndToEnd:
         r2b, _ = corpus
         run = r2b / "runs" / "bf16_run"
         run.mkdir()
+        rep = _valid_report()
         save_adapter_bundle(run / "best_params.pt",
                             {"lora.A": torch.eye(2, dtype=torch.bfloat16)},
                             model_id="Qwen/Qwen3.5-2B",
                             revision=PINNED_REV_2B,
+                            recipe=rep["recipe"],
                             metrics={"best_score": 0.5, "best_step": 200})
-        rep = _valid_report()
         rep["trainable_precision"] = "fp32"   # lying report string
         (run / "train_report.json").write_text(json.dumps(rep))
 
@@ -572,12 +604,201 @@ class TestGateEndToEnd:
         run.mkdir()
         save_adapter_bundle(run / "best_params.pt",
                             {"lora.0.A": torch.eye(2)},
-                            model_id="other/model", revision="b" * 40)
+                            model_id="other/model", revision="b" * 40,
+                            recipe=_valid_report()["recipe"])
         (run / "train_report.json").write_text(json.dumps(_valid_report()))
         res = self.run_gate(corpus)
         rv = [r for r in res.artifact_verdicts["runs"]
               if r["run_id"] == "conflict_run"][0]
         assert rv["checkpoint"]["classification"] == "invalid"
+
+    # ---- canonical-recipe binding (recipe_from_config integration) ---------
+
+    def test_bundle_recipe_cannot_substitute_for_derived_report_recipe(
+            self, corpus):
+        """The bundle's own recipe is NEVER trusted: a checkpoint saved
+        under a different training recipe than the one independently
+        derived from its validated sidecar report config must fail closed
+        as invalid — even though its raw in-bundle recipe is internally
+        valid and self-consistent."""
+        import torch
+
+        from latent_lab.train.checkpointing import save_adapter_bundle
+
+        r2b, _ = corpus
+        run = r2b / "runs" / "recipe_swap_run"
+        run.mkdir()
+        rep = _valid_report()
+        rep["config"]["scorer"] = "corrected-gold-aware-v1"
+        rep["trainable_precision"] = "fp32"
+        (run / "train_report.json").write_text(json.dumps(rep))
+        # Bundle is byte-valid but trained under a DIFFERENT recipe
+        # (different lr/steps) than the report's config implies.
+        divergent_cfg = _semantic_config_over(lr=0.002, steps=900)
+        save_adapter_bundle(run / "best_params.pt",
+                            {"lora.A": torch.eye(2, dtype=torch.float32)},
+                            model_id="Qwen/Qwen3.5-2B",
+                            revision=PINNED_REV_2B,
+                            recipe=_canonical_recipe(divergent_cfg),
+                            metrics={"best_score": 0.5, "best_step": 200})
+
+        res = self.run_gate(corpus)
+        rv = [r for r in res.artifact_verdicts["runs"]
+              if r["run_id"] == "recipe_swap_run"][0]
+        ck = rv["checkpoint"]
+        assert ck["classification"] == "invalid"
+        assert any("identity_error" in str(r) or "recipe" in str(r)
+                   for r in ck["reasons"])
+        assert "strict_project_loader_passed" not in ck["reasons"]
+        codes = {b["code"] for b in res.gate_verdict["blockers"]}
+        assert "CKPT_INVALID_IDENTITY" in codes
+        assert res.verdict == "NOT_READY"
+
+    def test_tampered_report_recipe_fails_closed(self, corpus):
+        """A report whose declared recipe differs from the canonical
+        derivation of its own validated config + suite hash is a schema
+        blocker, yields NO trusted recipe, and cannot make its checkpoint
+        loadable."""
+        import torch
+
+        from latent_lab.train.checkpointing import save_adapter_bundle
+
+        r2b, _ = corpus
+        run = r2b / "runs" / "tampered_recipe_run"
+        run.mkdir()
+        rep = _valid_report()
+        rep["config"]["scorer"] = "corrected-gold-aware-v1"
+        rep["trainable_precision"] = "fp32"
+        tampered = dict(rep["recipe"])
+        tampered["lr"] = 9.9          # hand-edited recipe field
+        rep["recipe"] = tampered
+        (run / "train_report.json").write_text(json.dumps(rep))
+        save_adapter_bundle(run / "best_params.pt",
+                            {"lora.A": torch.eye(2, dtype=torch.float32)},
+                            model_id="Qwen/Qwen3.5-2B",
+                            revision=PINNED_REV_2B,
+                            recipe=_canonical_recipe(),   # true recipe
+                            metrics={"best_score": 0.5, "best_step": 200})
+
+        check = g.validate_train_report(rep)
+        assert "recipe:mismatch_with_derived_canonical" in check["problems"]
+        assert check["identity"]["recipe"] is None
+
+        res = self.run_gate(corpus)
+        rv = [r for r in res.artifact_verdicts["runs"]
+              if r["run_id"] == "tampered_recipe_run"][0]
+        joined = ",".join(rv["report_problems"])
+        assert "recipe:mismatch_with_derived_canonical" in joined
+        assert rv["checkpoint"]["classification"] == "invalid"
+        codes = {b["code"] for b in res.gate_verdict["blockers"]}
+        assert "REPORT_RECIPE_NOT_CANONICAL" in codes
+        detail = [b["detail"] for b in res.gate_verdict["blockers"]
+                  if b["code"] == "REPORT_RECIPE_NOT_CANONICAL"][0]
+        assert "tampered_recipe_run" in detail
+        statuses = {p["id"]: p["status"]
+                    for p in res.gate_verdict["prerequisites"]}
+        assert statuses[g.PREREQ_REPORTS] == "FAILED"
+        assert res.verdict == "NOT_READY"
+
+    def test_underivable_config_recipe_blocks_report_and_checkpoint(
+            self, corpus):
+        """A report whose config cannot yield a canonical recipe at all
+        (missing training-semantic fields) fails closed on BOTH fronts:
+        no trusted recipe and an unloadable checkpoint."""
+        import torch
+
+        from latent_lab.train.checkpointing import save_adapter_bundle
+
+        r2b, _ = corpus
+        run = r2b / "runs" / "thin_config_run"
+        run.mkdir()
+        rep = _valid_report()
+        del rep["config"]["optimizer"]    # semantic field now missing
+        del rep["recipe"]                 # and nothing to verify against
+        rep["config"]["scorer"] = "corrected-gold-aware-v1"
+        rep["trainable_precision"] = "fp32"
+        (run / "train_report.json").write_text(json.dumps(rep))
+        save_adapter_bundle(run / "best_params.pt",
+                            {"lora.A": torch.eye(2, dtype=torch.float32)},
+                            model_id="Qwen/Qwen3.5-2B",
+                            revision=PINNED_REV_2B,
+                            recipe=_canonical_recipe(),
+                            metrics={"best_score": 0.5, "best_step": 200})
+
+        res = self.run_gate(corpus)
+        rv = [r for r in res.artifact_verdicts["runs"]
+              if r["run_id"] == "thin_config_run"][0]
+        joined = ",".join(rv["report_problems"])
+        assert "recipe:not_derivable_from_validated_config_and_suite" \
+            in joined
+        assert rv["checkpoint"]["classification"] == "invalid"
+        codes = {b["code"] for b in res.gate_verdict["blockers"]}
+        assert "REPORT_RECIPE_NOT_CANONICAL" in codes
+        assert res.verdict == "NOT_READY"
+
+    def test_orphan_identity_bound_bundle_fails_closed_without_recipe(
+            self, corpus):
+        """An orphan IDENTITY-BOUND bundle (valid bytes, fp32 payload) has
+        no owning report, so no canonical recipe can be derived; it must
+        classify invalid — never loadable on its own in-bundle claims."""
+        import torch
+
+        from latent_lab.train.checkpointing import save_adapter_bundle
+
+        r2b, _ = corpus
+        orphan = r2b / "runs" / "orphan_bound"
+        orphan.mkdir()
+        save_adapter_bundle(orphan / "best_params.pt",
+                            {"lora.A": torch.eye(2, dtype=torch.float32)},
+                            model_id="Qwen/Qwen3.5-2B",
+                            revision=PINNED_REV_2B,
+                            recipe=_canonical_recipe(),
+                            metrics={"best_score": 0.5, "best_step": 200})
+        # deliberately NO train_report.json sibling
+
+        res = self.run_gate(corpus)
+        o = [x for x in res.artifact_verdicts["orphan_checkpoints"]
+             if x["id"] == "2b/runs/orphan_bound/best_params.pt"][0]
+        assert o["classification"] == "invalid"
+        assert any("bundle_unverifiable_without_derived_report_recipe"
+                   in str(r) for r in o["reasons"])
+        codes = {b["code"] for b in res.gate_verdict["blockers"]}
+        assert "ORPHAN_CHECKPOINT" in codes
+        assert res.verdict == "NOT_READY"
+
+    def test_matching_recipes_positive_control_loadable(self, corpus):
+        """Positive matching control: when the report recipe EQUALS the
+        canonical derivation AND the bundle was saved against exactly that
+        recipe, the strict loader accepts it (loadable) — proving the
+        negative controls above fail because of real mismatches, not
+        because loading is impossible."""
+        import torch
+
+        from latent_lab.train.checkpointing import save_adapter_bundle
+
+        r2b, _ = corpus
+        run = r2b / "runs" / "matching_recipe_run"
+        run.mkdir()
+        rep = _valid_report()
+        rep["config"]["scorer"] = "corrected-gold-aware-v1"
+        rep["trainable_precision"] = "fp32"
+        (run / "train_report.json").write_text(json.dumps(rep))
+        save_adapter_bundle(run / "best_params.pt",
+                            {"lora.A": torch.eye(2, dtype=torch.float32)},
+                            model_id="Qwen/Qwen3.5-2B",
+                            revision=PINNED_REV_2B,
+                            recipe=rep["recipe"],
+                            metrics={"best_score": 0.5, "best_step": 200})
+
+        res = self.run_gate(corpus)
+        rv = [r for r in res.artifact_verdicts["runs"]
+              if r["run_id"] == "matching_recipe_run"][0]
+        ck = rv["checkpoint"]
+        assert ck["classification"] == "loadable"
+        assert "bundle_recipe_equals_independently_derived_report_recipe" \
+            in ck["reasons"]
+        assert not any(str(p).startswith("recipe:")
+                       for p in rv["report_problems"])
 
     # ---- negative controls mirroring the independent audit -----------------
 
@@ -661,6 +882,7 @@ class TestGateEndToEnd:
                             {"lora.A": torch.eye(2)},
                             model_id="Qwen/Qwen3.5-2B",
                             revision=PINNED_REV_2B,
+                            recipe=rep["recipe"],
                             metrics={"best_score": 0.5, "best_step": 200})
         res = self.run_gate(corpus)
         codes = {b["code"] for b in res.gate_verdict["blockers"]}
@@ -690,6 +912,7 @@ class TestGateEndToEnd:
                             {"lora.A": torch.eye(2)},
                             model_id="Qwen/Qwen3.5-2B",
                             revision=PINNED_REV_2B,
+                            recipe=rep["recipe"],
                             metrics={"best_score": 0.5, "best_step": 200})
         ex_ti = _suite_ex("ti-")
         (r2b / "results" / "ev_E_k4_s0_test_id_clean.json").write_text(
@@ -772,6 +995,7 @@ class TestGateEndToEnd:
         save_adapter_bundle(live / "best_params.pt",
                             {"lora.A": torch.ones(2, dtype=torch.float32)},
                             model_id="Qwen/Qwen3.5-4B", revision=REV_4B,
+                            recipe=rep["recipe"],
                             metrics={"best_score": 0.4, "best_step": 200})
         res = self.run_gate(corpus)
         codes = {b["code"] for b in res.gate_verdict["blockers"]}
@@ -816,6 +1040,9 @@ class TestGateEndToEnd:
                      live / "train_report.json")   # identical bytes
         save_adapter_bundle(live / "best_params.pt", {"lora.A": torch.eye(2)},
                             model_id="Qwen/Qwen3.5-4B", revision=REV_4B,
+                            recipe=_valid_report(
+                                model="Qwen/Qwen3.5-4B",
+                                revision=REV_4B)["recipe"],
                             metrics={"best_score": 1.0, "best_step": 200})
         res = self.run_gate(corpus)
         q = res.artifact_verdicts["quarantine_4b"]
@@ -865,6 +1092,7 @@ class TestGateEndToEnd:
                                 {"lora.A": torch.eye(2)},
                                 model_id="Qwen/Qwen3.5-2B",
                                 revision=PINNED_REV_2B,
+                                recipe=_valid_report()["recipe"],
                                 metrics={"best_score": 0.5, "best_step": 200})
         # make them byte-identical
         (run_b / "best_params.pt").write_bytes(
@@ -969,6 +1197,7 @@ class TestGateEndToEnd:
                             {"lora.A": torch.eye(2, dtype=torch.float32)},
                             model_id="Qwen/Qwen3.5-2B",
                             revision=PINNED_REV_2B,
+                            recipe=rep["recipe"],
                             metrics={"best_score": 0.5, "best_step": 200})
         # remove legacy_run's schema-violating report tree entirely
         shutil.rmtree(r2b / "runs" / "legacy_run")

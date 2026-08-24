@@ -16,6 +16,14 @@ FAIL-CLOSED contract (every known fail-open is a blocker, never a skip):
 * Checkpoints must be identity-bound bundles whose PAYLOAD tensors are
   verified FP32 for every floating trainable; report strings alone prove
   nothing. bf16 payloads classify ``non-fp32-payload`` and block READY.
+* The canonical training recipe is DERIVED, never trusted: only a
+  schema-valid train report config plus its separately validated
+  suite_sha256 yield the canonical recipe via
+  ``checkpointing.recipe_from_config``, and the report's own
+  ``recipe`` field must EQUAL that derivation. The raw in-bundle
+  recipe proves nothing; bundles load strictly against the
+  independently derived recipe. A bundle or report whose canonical
+  recipe cannot be derived/verified fails closed (never loadable).
 * Discovery is symmetric: orphan checkpoints, orphan eval files,
   byte-duplicate checkpoints bound to more than one run directory, and
   unreadable artifacts are explicit blockers.
@@ -151,8 +159,13 @@ BLOCKER_ACTIONS = {
         "report pins the recomputed behavioral-v2 digest; never edit the "
         "hash by hand.",
     "REPORT_TRAINABLE_PRECISION_MISSING":
-        "Add explicit trainable dtype/precision fields to the training "
+        "Add explicit trainable dtype/precision fields to the train "
         "report schema and regenerate reports on the next supervised smoke.",
+    "REPORT_RECIPE_NOT_CANONICAL":
+        "Re-emit each listed train_report.json through the current driver "
+        "so its recipe equals checkpointing.recipe_from_config(config, "
+        "suite_sha256) exactly; never hand-edit or copy a recipe, and "
+        "never accept an in-bundle recipe as a substitute.",
     "CKPT_LEGACY_UNBOUND_IDENTITY":
         "Rebuild identity-bound bundles via save_adapter_bundle ONLY after "
         "weight-provenance verification; otherwise retire the weights into "
@@ -520,6 +533,29 @@ def validate_train_report(report: dict) -> dict:
     elif not isinstance(prec, str) or not prec.strip():
         problems.append("trainable_precision:type")
 
+    # Canonical recipe: derived ONLY from this validated config plus its
+    # separately validated 64-hex suite digest; the report's own
+    # "recipe" field must equal the derivation. Never trusted verbatim.
+    declared_recipe = report.get("recipe")
+    if declared_recipe is None:
+        problems.append("recipe:missing")
+    elif not isinstance(declared_recipe, dict):
+        problems.append("recipe:type")
+    derived_recipe = None
+    if isinstance(suite, str) and _SUITE_SHA_RE.fullmatch(suite):
+        from ..train.checkpointing import AdapterBundleSchemaError, \
+            recipe_from_config
+
+        try:
+            derived_recipe = recipe_from_config(config, suite)
+        except AdapterBundleSchemaError:
+            problems.append(
+                "recipe:not_derivable_from_validated_config_and_suite")
+        else:
+            if isinstance(declared_recipe, dict) \
+                    and declared_recipe != derived_recipe:
+                problems.append("recipe:mismatch_with_derived_canonical")
+
     selection = None
     if isinstance(hist, list) and hist:
         sel = select_best_checkpoint(hist)
@@ -550,6 +586,15 @@ def validate_train_report(report: dict) -> dict:
             "model_id": model if isinstance(model, str) else None,
             "revision": rev if _is_pinned_revision(rev) else None,
             "suite_sha256": suite if isinstance(suite, str) else None,
+            # The canonical recipe ONLY when it was derived from the
+            # validated config + validated suite hash AND the report's
+            # declared recipe equals it; otherwise None (fail closed).
+            "recipe": derived_recipe if (
+                derived_recipe is not None
+                and isinstance(declared_recipe, dict)
+                and declared_recipe == derived_recipe
+                and not any(p.startswith("recipe:") for p in problems))
+            else None,
         },
         "selection_check": selection,
     }
@@ -557,11 +602,13 @@ def validate_train_report(report: dict) -> dict:
 # Regression proofs the gate executes (hardware-free, CPU-only) unless
 # skipped. These pin the runtime-integrity prerequisites.
 PROOF_TEST_NODES = (
-    "tests/test_latent_runtime_integrity.py::test_exact_save_load_roundtrip_and_persisted_metrics",
+    # Node ids track the CURRENT integrated runtime suite; stale ids would
+    # make pytest exit with rc=4 and the prerequisite forever unprovable.
+    "tests/test_latent_runtime_integrity.py::test_bundle_v2_roundtrip_digest_and_persisted_metrics",
     "tests/test_latent_runtime_integrity.py::test_bundle_identity_mismatch_rejected",
     "tests/test_latent_runtime_integrity.py::test_lora_and_clock_trainables_are_fp32_over_bf16_backbone",
     "tests/test_latent_runtime_integrity.py::test_recurrence_clock_is_fp32_regardless_of_default_dtype",
-    "tests/test_latent_runtime_integrity.py::test_nan_metric_and_nan_state_rejected",
+    "tests/test_latent_runtime_integrity.py::test_nan_metric_and_bad_step_schema_rejected",
     "tests/test_latent_runtime_integrity.py::test_cached_localized_full_equivalence_across_fp32_roundtrip",
     "tests/test_latent_run.py",
 )
@@ -587,8 +634,16 @@ def _load_raw_payload(path: Path):
 
 
 def classify_checkpoint(path: Path, *, report_identity: dict | None,
-                        dry_run: bool) -> dict:
-    """Classify one .pt payload. Read-only; never mutates anything."""
+                        report_recipe: dict | None, dry_run: bool) -> dict:
+    """Classify one .pt payload. Read-only; never mutates anything.
+
+    ``report_recipe`` is the CANONICAL recipe derived from a validated
+    train report (config + separately validated suite hash); bundles are
+    strictly loaded against it. Without it — orphan bundles, or reports
+    whose canonical recipe cannot be derived/verified — classification
+    fails closed: an identity-bound bundle is never loadable on the
+    strength of its own in-bundle recipe.
+    """
     info: dict = {"classification": CKPT_UNPROVEN, "reasons": []}
     if dry_run:
         info["reasons"].append("dry_run_skips_payload_loading")
@@ -606,11 +661,13 @@ def classify_checkpoint(path: Path, *, report_identity: dict | None,
 
     if all(k in raw for k in ("format_version", "kind", "model_id",
                               "revision", "tensors")):
-        return _classify_bundle(raw, path, report_identity, info)
+        return _classify_bundle(raw, path, report_identity, report_recipe,
+                                info)
     return _classify_plain_state(raw, info)
 
 
-def _classify_bundle(raw: dict, path: Path, report_identity, info: dict) -> dict:
+def _classify_bundle(raw: dict, path: Path, report_identity,
+                     report_recipe: dict | None, info: dict) -> dict:
     from ..train.checkpointing import (
         AdapterBundleIdentityError,
         AdapterBundleSchemaError,
@@ -628,17 +685,28 @@ def _classify_bundle(raw: dict, path: Path, report_identity, info: dict) -> dict
     if report_identity:
         rep_mid = report_identity.get("model_id")
         rep_rev = report_identity.get("revision")
-        if (rep_mid and str(bid) != str(rep_mid)) or \
-                (rep_rev and str(brev) != str(rep_rev)):
+        if (rep_mid and str(bid) != str(rep_mid)) \
+                or (rep_rev and str(brev) != str(rep_rev)):
             info["classification"] = CKPT_INVALID
             info["reasons"].append("bundle_identity_conflicts_with_report")
             return info
+    if report_recipe is None:
+        # FAIL CLOSED: no independently derived canonical recipe exists
+        # (orphan bundle, or sidecar report failed recipe derivation/
+        # verification). The raw in-bundle recipe can never substitute.
+        info["classification"] = CKPT_INVALID
+        info["reasons"].append(
+            "bundle_unverifiable_without_derived_report_recipe")
+        return info
     try:
         # Strict project loader: validates keys, declared shapes/dtypes,
-        # finiteness AND identity before returning tensor clones — the
+        # finiteness AND identity (model_id/revision/recipe — the recipe
+        # compared is the INDEPENDENTLY DERIVED canonical one, never the
+        # raw bundle payload) before returning tensor clones — the
         # returned payload is the ground truth for the fp32 check below.
         tensors = load_adapter_bundle(path, model_id=str(bid),
-                                      revision=str(brev))
+                                      revision=str(brev),
+                                      recipe=report_recipe)
     except AdapterBundleIdentityError as e:
         info["classification"] = CKPT_INVALID
         info["reasons"].append(f"identity_error:{e}")
@@ -673,6 +741,9 @@ def _classify_bundle(raw: dict, path: Path, report_identity, info: dict) -> dict
     info["reasons"].append("payload_floating_tensors_all_fp32")
     if report_identity:
         info["reasons"].append("identity_matches_sidecar_report")
+    if report_recipe is not None:
+        info["reasons"].append(
+            "bundle_recipe_equals_independently_derived_report_recipe")
     return info
 
 
@@ -1119,7 +1190,9 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
             if ri.checkpoint_rel:
                 cls = classify_checkpoint(
                     files_by_id[ri.checkpoint_rel].abs,
-                    report_identity=identity, dry_run=dry_run)
+                    report_identity=identity,
+                    report_recipe=(identity or {}).get("recipe"),
+                    dry_run=dry_run)
                 rv["checkpoint"] = cls
                 rv["checkpoint_sha256"] = ri.ckpt_sha256
             run_verdicts.append(rv)
@@ -1127,8 +1200,11 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
     orphan_verdicts: list[dict] = []
     if not dry_run:
         for f in orphan_ckpts:
+            # Orphan bundles have no owning report: no canonical recipe can
+            # be derived, so classification must fail closed (never
+            # loadable on the bundle's own claims).
             cls = classify_checkpoint(f.abs, report_identity=None,
-                                      dry_run=False)
+                                      report_recipe=None, dry_run=False)
             orphan_verdicts.append({"id": f"{f.label}/{f.rel}",
                                     "classification": cls["classification"],
                                     "reasons": cls["reasons"]})
@@ -1227,10 +1303,11 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
     reports_ok = not schema_failures and not suite_mismatch
     prereq(PREREQ_REPORTS,
            STATUS_PROVEN if reports_ok else STATUS_FAILED,
-           (f"{len(retained_runs)}/{len(retained_runs)} retained (2B + live "
-            f"4B) reports fully schema-valid with pinned revision + finite "
-            f"metrics + suite hash matching the recomputed behavioral-v2 "
-            f"suite"
+            (f"{len(retained_runs)}/{len(retained_runs)} retained (2B + live "
+             f"4B) reports fully schema-valid with pinned revision + finite "
+             f"metrics + suite hash matching the recomputed behavioral-v2 "
+             f"suite + recipe equal to the canonically derived "
+             f"recipe_from_config(config, suite_sha256)"
             if reports_ok else
             f"{len(schema_failures)} retained reports carry schema "
             f"violations (missing fields are blockers): "
@@ -1247,7 +1324,8 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
            ("dry run skips payload loading; classification unproven"
             if dry_run else
             f"{n_loadable}/{n_ckpts} checkpoints strictly loadable with "
-            f"in-bundle identity and VERIFIED fp32 payload tensors; "
+            f"in-bundle identity matching the INDEPENDENTLY derived report "
+            f"recipe and VERIFIED fp32 payload tensors; "
             f"{n_legacy} legacy-unbound, {n_corrupt} corrupt, {n_invalid} "
             f"invalid, {n_nonfp32} non-fp32-payload, "
             f"{len(orphan_ckpts)} orphan, {len(dup_binding_groups)} "
@@ -1416,6 +1494,21 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
         blocker("REPORT_SCHEMA_MISSING_FIELDS",
                 f"{len(schema_failures)}/{len(retained_runs)} retained "
                 f"reports violate the required train-report schema")
+    recipe_failures = [rv for rv in retained_runs
+                       if any(str(p).startswith("recipe:")
+                              for p in rv.get("report_problems", []))]
+    if recipe_failures:
+        blocker("REPORT_RECIPE_NOT_CANONICAL",
+                f"{len(recipe_failures)}/{len(retained_runs)} retained "
+                f"reports carry no verifiable canonical recipe (missing, "
+                f"not derivable from the validated config + suite hash, or "
+                f"differing from that derivation): "
+                + "; ".join(
+                    f"{_rv_path(rv)}: "
+                    f"{','.join(p for p in rv['report_problems']
+                                if str(p).startswith('recipe:'))}"
+                    for rv in sorted(recipe_failures,
+                                     key=_rv_path)))
     if suite_mismatch:
         blocker("REPORT_SUITE_HASH_MISMATCH",
                 f"{len(suite_mismatch)}/{len(retained_runs)} retained "
