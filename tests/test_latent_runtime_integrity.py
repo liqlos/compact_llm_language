@@ -821,6 +821,371 @@ def test_adversarial_two_group_topology_rollback_then_matches_control():
 
 
 # ---------------------------------------------------------------------------
+# structurally exact optimizer-state rollback (adversarial metadata swaps)
+# ---------------------------------------------------------------------------
+
+def _state_leaf_exact(live, snap) -> bool:
+    """Bit-and-metadata exactness: every tensor leaf must equal the
+    snapshot in values AND shape, dtype, device, layout, strides and
+    storage offset; containers must match structurally; scalars must be
+    value- and type-identical."""
+    if torch.is_tensor(snap):
+        return (torch.is_tensor(live)
+                and tuple(live.shape) == tuple(snap.shape)
+                and live.dtype == snap.dtype
+                and live.device == snap.device
+                and live.layout == snap.layout
+                and tuple(live.stride()) == tuple(snap.stride())
+                and live.storage_offset() == snap.storage_offset()
+                and bool(torch.equal(live, snap)))
+    if isinstance(snap, dict):
+        return (isinstance(live, dict)
+                and set(live.keys()) == set(snap.keys())
+                and all(_state_leaf_exact(live[k], v)
+                        for k, v in snap.items()))
+    if isinstance(snap, (list, tuple)):
+        return (isinstance(live, type(snap)) and len(live) == len(snap)
+                and all(_state_leaf_exact(a, b)
+                        for a, b in zip(live, snap)))
+    return (not torch.is_tensor(live) and type(live) is type(snap)
+            and live == snap)
+
+
+def _opt_state_structurally_exact(opt, snap_tree) -> bool:
+    """Whole-optimizer-state exactness against a ``_deep_opt_state`` tree:
+    identical key sets and per-entry structural/metadata/value equality
+    (hostile injected fields cannot survive)."""
+    if set(opt.state.keys()) != set(snap_tree.keys()):
+        return False
+    return all(_state_leaf_exact(opt.state[p], entry)
+               for p, entry in snap_tree.items())
+
+
+class _ShapeDtypePoisonAdam(torch.optim.Adam):
+    """Performs a REAL update, then replaces one momentum tensor with a
+    DIFFERENT-SHAPE, DIFFERENT-DTYPE tensor, swaps another to float16,
+    turns a scalar state field into junk, corrupts parameters, group
+    metadata/topology and gradients, and finally raises a distinctive
+    ValueError."""
+
+    def __init__(self, params, lr):
+        super().__init__(params, lr=lr)
+        self.armed = False
+        self.foreign = torch.nn.Parameter(torch.zeros(1))
+
+    def step(self, closure=None):
+        super().step(closure)
+        if not self.armed:
+            return
+        w = self.param_groups[0]["params"][0]
+        b = self.param_groups[0]["params"][1]
+        self.state[w]["exp_avg"] = torch.zeros(
+            1, dtype=torch.float16)               # wrong shape AND dtype
+        self.state[b]["exp_avg"] = \
+            self.state[b]["exp_avg"].to(torch.float16)  # same shape, fp16
+        self.state[b]["step"] = "junk-non-tensor"
+        with torch.no_grad():
+            w.add_(7.0)
+            for group in self.param_groups:
+                group["lr"] = 123.0
+                group["injected_meta"] = {"evil": [1]}
+            if b.grad is not None:
+                b.grad.fill_(99.0)                 # hostile gradient rewrite
+        g = self.param_groups[0]                   # hostile topology rewrite
+        g["params"].reverse()
+        g["params"].append(self.foreign)
+        raise ValueError("shape-shifting state tensor corruption")
+
+
+def test_adversarial_shape_dtype_state_swap_rolls_back_exactly():
+    torch.manual_seed(5)
+    x = torch.randn(8, 4)
+    m_adv = torch.nn.Linear(4, 4)
+    m_ctl = torch.nn.Linear(4, 4)
+    m_ctl.load_state_dict(m_adv.state_dict())
+    ps_adv = list(m_adv.parameters())
+    ps_ctl = list(m_ctl.parameters())
+    w_a, b_a = ps_adv
+    opt_adv = _ShapeDtypePoisonAdam(ps_adv, lr=0.05)
+    opt_ctl = torch.optim.Adam(ps_ctl, lr=0.05)
+    foreign = opt_adv.foreign
+
+    def fresh_grads(m):
+        m.zero_grad(set_to_none=True)
+        loss = (m(x) ** 2).mean()
+        loss.backward()
+        return loss
+
+    def ctl_step():
+        fresh_grads(m_ctl)
+        torch.nn.utils.clip_grad_norm_(ps_ctl, 1.0)
+        opt_ctl.step()
+
+    # one clean step on both sides -> identical non-empty Adam state
+    guarded_optimizer_step(opt_adv, fresh_grads(m_adv).detach(), ps_adv, 1.0)
+    ctl_step()
+    assert bool(torch.equal(w_a.detach(), ps_ctl[0].detach()))
+    assert all(
+        torch.equal(opt_adv.state[a]["exp_avg"], opt_ctl.state[c]["exp_avg"])
+        and torch.equal(opt_adv.state[a]["exp_avg_sq"],
+                        opt_ctl.state[c]["exp_avg_sq"])
+        for a, c in zip(ps_adv, ps_ctl)), \
+        "pairs did not start from identical optimizer state"
+
+    # -- armed failure after a real, structure-breaking update --------------
+    opt_adv.armed = True
+    fresh_grads(m_adv)
+    pre_params = _snapshot(ps_adv)
+    pre_grads = {id(p): p.grad.detach().clone() for p in ps_adv}
+    pre_state = _deep_opt_state(opt_adv)
+    pre_ids = _param_group_param_ids(opt_adv)
+
+    with pytest.raises(ValueError,
+                       match="shape-shifting state tensor corruption") as e:
+        guarded_optimizer_step(opt_adv, torch.tensor(0.5), ps_adv, 1.0)
+    assert type(e.value) is ValueError, \
+        "original step exception was masked by a rollback failure"
+
+    # exact state: structure + metadata + values (swapped shape/dtype/junk
+    # leaf must ALL be gone; the pristine snapshot must be back verbatim)
+    assert _opt_state_structurally_exact(opt_adv, pre_state), \
+        "optimizer state was not restored exactly after metadata swap"
+    assert _unchanged(ps_adv, pre_params), \
+        "parameter corruption survived the rollback"
+    for p in ps_adv:
+        assert p.grad is not None and \
+            bool(torch.equal(p.grad, pre_grads[id(p)])), \
+            "pre-step gradients were not restored bit-exactly"
+    assert [g["lr"] for g in opt_adv.param_groups] == [0.05], \
+        "mutated LR was not rolled back"
+    assert all("injected_meta" not in g for g in opt_adv.param_groups), \
+        "injected group field survived the rollback"
+    assert _param_group_param_ids(opt_adv) == pre_ids, \
+        "per-group Parameter identity/order not restored"
+    assert all(id(foreign) != id(p)
+               for g in opt_adv.param_groups for p in g["params"]), \
+        "hostilely-added foreign Parameter survived the rollback"
+
+    # -- disarmed retry of the SAME update vs independent control -----------
+    opt_adv.armed = False
+    guarded_optimizer_step(opt_adv, fresh_grads(m_adv).detach(), ps_adv, 1.0)
+    ctl_step()
+    assert bool(torch.equal(w_a.detach(), ps_ctl[0].detach())) and \
+        bool(torch.equal(b_a.detach(), ps_ctl[1].detach())), \
+        "post-retry trajectory diverges from the clean control"
+    assert all(
+        torch.equal(opt_adv.state[a]["exp_avg"], opt_ctl.state[c]["exp_avg"])
+        and torch.equal(opt_adv.state[a]["exp_avg_sq"],
+                        opt_ctl.state[c]["exp_avg_sq"])
+        for a, c in zip(ps_adv, ps_ctl)), \
+        "optimizer state diverges from the clean control after retry"
+
+
+class _DtypeOnlySwapSGD(torch.optim.SGD):
+    """Performs a REAL momentum update, then replaces a same-shape
+    float32 ``momentum_buffer`` with a float16 tensor of DIFFERENT VALUES
+    and raises. Restoration through ``Tensor.copy_`` would silently keep
+    the corrupt live dtype (and cast-rounded values)."""
+
+    def __init__(self, params, lr):
+        super().__init__(params, lr=lr, momentum=0.9)
+        self.armed = False
+
+    def step(self, closure=None):
+        super().step(closure)
+        if not self.armed:
+            return
+        st = self.state[self.param_groups[0]["params"][0]]
+        assert st["momentum_buffer"].dtype == torch.float32
+        st["momentum_buffer"] = (st["momentum_buffer"].to(
+            torch.float16) * 1.5)                  # same shape, fp16, moved
+        raise ValueError("dtype-only state swap")
+
+
+def test_adversarial_same_shape_dtype_downgrade_restores_exactly():
+    torch.manual_seed(6)
+    x = torch.randn(8, 4)
+    m_adv = torch.nn.Linear(4, 4)
+    m_ctl = torch.nn.Linear(4, 4)
+    m_ctl.load_state_dict(m_adv.state_dict())
+    ps_adv = list(m_adv.parameters())
+    ps_ctl = list(m_ctl.parameters())
+    w_a, b_a = ps_adv
+    opt_adv = _DtypeOnlySwapSGD(ps_adv, lr=0.05)
+    opt_ctl = torch.optim.SGD(ps_ctl, lr=0.05, momentum=0.9)
+
+    def fresh_grads(m):
+        m.zero_grad(set_to_none=True)
+        loss = (m(x) ** 2).mean()
+        loss.backward()
+        return loss
+
+    def ctl_step():
+        fresh_grads(m_ctl)
+        torch.nn.utils.clip_grad_norm_(ps_ctl, 1.0)
+        opt_ctl.step()
+
+    guarded_optimizer_step(opt_adv, fresh_grads(m_adv).detach(), ps_adv, 1.0)
+    ctl_step()
+    buf = opt_adv.state[w_a]["momentum_buffer"]
+    assert buf.dtype == torch.float32 and buf.shape == (4, 4)
+
+    opt_adv.armed = True
+    fresh_grads(m_adv)
+    pre_params = _snapshot(ps_adv)
+    pre_grads = {id(p): p.grad.detach().clone() for p in ps_adv}
+    pre_state = _deep_opt_state(opt_adv)
+
+    with pytest.raises(ValueError, match="dtype-only state swap") as e:
+        guarded_optimizer_step(opt_adv, torch.tensor(0.5), ps_adv, 1.0)
+    assert type(e.value) is ValueError, \
+        "original step exception was masked by a rollback failure"
+
+    assert _opt_state_structurally_exact(opt_adv, pre_state), \
+        "float16-swapped momentum buffer was not restored to exact fp32"
+    assert opt_adv.state[w_a]["momentum_buffer"].dtype == torch.float32, \
+        "rollback preserved the corrupt live dtype"
+    assert _unchanged(ps_adv, pre_params)
+    for p in ps_adv:
+        assert p.grad is not None and \
+            bool(torch.equal(p.grad, pre_grads[id(p)]))
+    assert _param_group_param_ids(opt_adv) == [[id(w_a), id(b_a)]], \
+        "per-group Parameter identity/order not restored"
+
+    opt_adv.armed = False
+    guarded_optimizer_step(opt_adv, fresh_grads(m_adv).detach(), ps_adv, 1.0)
+    ctl_step()
+    assert bool(torch.equal(w_a.detach(), ps_ctl[0].detach())) and \
+        bool(torch.equal(b_a.detach(), ps_ctl[1].detach())), \
+        "post-retry trajectory diverges from the clean control"
+    assert all(
+        torch.equal(opt_adv.state[a]["momentum_buffer"],
+                    opt_ctl.state[c]["momentum_buffer"])
+        for a, c in zip(ps_adv, ps_ctl)), \
+        "optimizer state diverges from the clean control after retry"
+
+
+class _OuterListRebindSGD(torch.optim.SGD):
+    """Performs a REAL update while mutating the ORIGINAL outer list's
+    groups, then REBINDS ``self.param_groups`` to a fresh hostile outer
+    list (the original list object survives only via this cache), and
+    raises. Refuses any retry unless the ACTIVE outer list IS the
+    originally cached one."""
+
+    def __init__(self, params, lr):
+        super().__init__(params, lr=lr, momentum=0.9)
+        self.armed = False
+        self.original_outer = self.param_groups      # cache outer identity
+        self.foreign = torch.nn.Parameter(torch.zeros(1))
+
+    def step(self, closure=None):
+        super().step(closure)
+        if not self.armed:
+            return
+        with torch.no_grad():
+            next(iter(self.state.values()))["momentum_buffer"].add_(5.0)
+            self.param_groups[0]["params"][0].add_(3.0)
+            for g in self.param_groups:
+                g["lr"] = 42.0
+                g["injected_meta"] = True
+        self.param_groups = [                        # hostile OUTER rebinding
+            {"params": [self.foreign], "lr": 9.9, "hostile": True}]
+        raise ValueError("outer param_groups list rebinding")
+
+    def refuse_if_outer_list_lost(self):
+        if self.param_groups is not self.original_outer:
+            raise AssertionError(
+                "active param_groups is NOT the original outer list object")
+
+
+def test_adversarial_outer_param_groups_list_identity_restored():
+    torch.manual_seed(7)
+    x = torch.randn(8, 4)
+    m_adv = torch.nn.Linear(4, 4)
+    m_ctl = torch.nn.Linear(4, 4)
+    m_ctl.load_state_dict(m_adv.state_dict())
+    ps_adv = list(m_adv.parameters())
+    ps_ctl = list(m_ctl.parameters())
+    w_a, b_a = ps_adv
+    opt_adv = _OuterListRebindSGD(ps_adv, lr=0.05)
+    opt_ctl = torch.optim.SGD(ps_ctl, lr=0.05, momentum=0.9)
+    foreign = opt_adv.foreign
+    original_outer = opt_adv.original_outer
+    assert opt_adv.param_groups is original_outer
+
+    def fresh_grads(m):
+        m.zero_grad(set_to_none=True)
+        loss = (m(x) ** 2).mean()
+        loss.backward()
+        return loss
+
+    def ctl_step():
+        fresh_grads(m_ctl)
+        torch.nn.utils.clip_grad_norm_(ps_ctl, 1.0)
+        opt_ctl.step()
+
+    guarded_optimizer_step(opt_adv, fresh_grads(m_adv).detach(), ps_adv, 1.0)
+    ctl_step()
+    assert opt_adv.param_groups is original_outer, \
+        "clean step replaced the outer param_groups list"
+
+    opt_adv.armed = True
+    fresh_grads(m_adv)
+    pre_params = _snapshot(ps_adv)
+    pre_grads = {id(p): p.grad.detach().clone() for p in ps_adv}
+    pre_state = _deep_opt_state(opt_adv)
+    pre_groups = _param_groups_snapshot(opt_adv)
+    pre_ids = _param_group_param_ids(opt_adv)
+
+    with pytest.raises(ValueError,
+                       match="outer param_groups list rebinding") as e:
+        guarded_optimizer_step(opt_adv, torch.tensor(0.5), ps_adv, 1.0)
+    assert type(e.value) is ValueError, \
+        "original step exception was masked by a rollback failure"
+
+    # the ORIGINAL outer list object must be back — not an equal copy
+    assert opt_adv.param_groups is original_outer, \
+        "rollback did not restore the original outer param_groups identity"
+    opt_adv.refuse_if_outer_list_lost()      # refuses retry on lost identity
+    assert len(opt_adv.param_groups) == 1, "hostile group count leaked"
+    assert _opt_state_structurally_exact(opt_adv, pre_state), \
+        "optimizer state not restored exactly across outer-list rebind"
+    assert _unchanged(ps_adv, pre_params)
+    for p in ps_adv:
+        assert p.grad is not None and \
+            bool(torch.equal(p.grad, pre_grads[id(p)])), \
+            "pre-step gradients were not restored bit-exactly"
+    assert _param_groups_unchanged(opt_adv, pre_groups), \
+        "group fields differ after outer-list rollback"
+    assert [g["lr"] for g in opt_adv.param_groups] == [0.05], \
+        "mutated LR was not rolled back"
+    assert all("injected_meta" not in g and "hostile" not in g
+               for g in opt_adv.param_groups), \
+        "injected group field survived the rollback"
+    assert _param_group_param_ids(opt_adv) == pre_ids, \
+        "per-group Parameter identity/order not restored"
+    assert id(foreign) not in {id(p) for p in
+                               opt_adv.param_groups[0]["params"]}, \
+        "hostilely-added foreign Parameter survived the rollback"
+
+    # -- disarmed retry of the SAME update vs independent control -----------
+    opt_adv.armed = False
+    opt_adv.refuse_if_outer_list_lost()   # still refuses before retrying
+    guarded_optimizer_step(opt_adv, fresh_grads(m_adv).detach(), ps_adv, 1.0)
+    opt_adv.refuse_if_outer_list_lost()   # ... and after it
+    ctl_step()
+    assert opt_adv.param_groups is original_outer
+    assert bool(torch.equal(w_a.detach(), ps_ctl[0].detach())) and \
+        bool(torch.equal(b_a.detach(), ps_ctl[1].detach())), \
+        "post-retry trajectory diverges from the clean control"
+    assert all(
+        torch.equal(opt_adv.state[a]["momentum_buffer"],
+                    opt_ctl.state[c]["momentum_buffer"])
+        for a, c in zip(ps_adv, ps_ctl)), \
+        "optimizer state diverges from the clean control after retry"
+
+
+# ---------------------------------------------------------------------------
 # fp32 trainables over a lower-precision backbone
 # ---------------------------------------------------------------------------
 
