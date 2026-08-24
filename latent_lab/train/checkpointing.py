@@ -345,8 +345,36 @@ def _tree_is_finite(obj) -> bool:
     return True
 
 
+def _in_place_exact(live, snap_val) -> bool:
+    """True iff copying ``snap_val`` into the live state tensor is
+    guaranteed exact: identical shape, dtype, device, layout, strides
+    and storage geometry (offset + backing-store size). Anything else —
+    a different shape/dtype or a hostilely replaced tensor/view — must
+    be REBOUND from the pristine snapshot clone instead of copied into,
+    so rollback can neither raise a size mismatch nor silently keep a
+    wrong dtype."""
+    try:
+        return (
+            live.shape == snap_val.shape
+            and live.dtype == snap_val.dtype
+            and live.device == snap_val.device
+            and live.layout == snap_val.layout
+            and tuple(live.stride()) == tuple(snap_val.stride())
+            and live.storage_offset() == snap_val.storage_offset()
+            and live.untyped_storage().nbytes()
+            == snap_val.untyped_storage().nbytes())
+    except Exception:
+        return False
+
+
 def _restore_optimizer_state(optimizer, snap) -> None:
-    """Roll optimizer.state back to the snapshot bit-exactly, in place."""
+    """Roll optimizer.state back to the snapshot bit-exactly, in place.
+
+    A live state tensor is reused via ``copy_`` ONLY when it is provably
+    metadata-identical to its snapshot (see :func:`_in_place_exact`);
+    every replaced or remetadataed leaf is reconstructed/rebound from the
+    pristine snapshot clone, preserving values plus shape, dtype, device,
+    layout and stride/storage metadata exactly."""
     state = optimizer.state
     for key in list(state.keys()):
         if key not in snap:
@@ -362,7 +390,8 @@ def _restore_optimizer_state(optimizer, snap) -> None:
                 del live_entry[name]
         for name, val in snap_entry.items():
             live_val = live_entry.get(name)
-            if torch.is_tensor(live_val) and torch.is_tensor(val):
+            if torch.is_tensor(live_val) and torch.is_tensor(val) \
+                    and _in_place_exact(live_val, val):
                 with torch.no_grad():
                     live_val.copy_(val)
             else:
@@ -388,15 +417,17 @@ def _optimizer_owned_params(optimizer) -> list:
     return owned
 
 
-def _snapshot_param_groups(optimizer) -> list:
+def _snapshot_param_groups(optimizer) -> tuple:
     """Structural snapshot of ``param_groups`` sufficient to rebuild the
-    exact pre-step topology. Per group it records the live group dict (by
-    reference), deep copies of every non-``params`` field, whether a
-    ``params`` entry existed, the live params list object (by reference)
-    and a copy of its Parameter order. Parameter objects themselves are
-    never copied or replaced."""
+    exact pre-step topology: the original OUTER list object (by
+    reference) plus, per group, the live group dict (by reference), deep
+    copies of every non-``params`` field, whether a ``params`` entry
+    existed, the live params list object (by reference) and a copy of its
+    Parameter order. Parameter objects themselves are never copied or
+    replaced."""
+    groups = optimizer.param_groups
     snap = []
-    for group in optimizer.param_groups:
+    for group in groups:
         fields = {
             k: (v.detach().clone() if torch.is_tensor(v) else copy.deepcopy(v))
             for k, v in group.items() if k != "params"}
@@ -404,22 +435,27 @@ def _snapshot_param_groups(optimizer) -> list:
         plist = group["params"] if had_params else ()
         params_ref = plist if isinstance(plist, list) else None
         snap.append((group, fields, had_params, params_ref, list(plist)))
-    return snap
+    return groups, snap
 
 
 def _restore_param_groups(optimizer, snap) -> None:
     """Rebuild ``param_groups`` IN PLACE from the snapshot: exact original
-    group count/order, the original group dicts with their original field
+    OUTER list object identity (a failing step may rebind the attribute
+    to a hostile replacement list — the original list is rebuilt and
+    rebound instead of mutating the replacement), exact original group
+    count/order, the original group dicts with their original field
     values, and each group's original live Parameter objects in their
     exact original order. Hostile additions (groups or per-group params)
     are undone by removal, hostile removals/reordering by reinsertion of
     the original objects; no Parameter object is ever replaced."""
+    outer, group_snaps = snap
     live = optimizer.param_groups
-    present = {id(g) for g in live}
+    target = outer if isinstance(outer, list) else live
+    present = {id(g) for g in target}
     rebuilt = []
-    for group, fields, had_params, params_ref, params_order in snap:
+    for group, fields, had_params, params_ref, params_order in group_snaps:
         if id(group) not in present:      # hostile group removal: reinsert
-            live.append(group)
+            target.append(group)
             present.add(id(group))
         for key in list(group.keys()):
             if key != "params" and key not in fields:
@@ -437,7 +473,12 @@ def _restore_param_groups(optimizer, snap) -> None:
         elif "params" in group:
             del group["params"]
         rebuilt.append(group)
-    live[:] = rebuilt               # drop injected groups, restore order
+    target[:] = rebuilt               # drop injected groups, restore order
+    if target is not live:            # restore the ORIGINAL outer binding
+        try:
+            optimizer.param_groups = target
+        except AttributeError:
+            pass
 
 
 def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
@@ -452,14 +493,19 @@ def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
       * Every trainable parameter, every pre-clip gradient (including the
         ``None`` versus tensor distinction and exact bytes), a deep exact
         copy of the optimizer state and the complete ``param_groups``
-        topology (group count/order, every group field, and each group's
-        live Parameter identities in exact order) are snapshotted before
+        topology (the original outer ``param_groups`` list object itself,
+        group count/order, every group field, and each group's live
+        Parameter identities in exact order) are snapshotted before
         ``optimizer.step()``. If the step raises, or any post-step
         parameter or optimizer-state tensor is non-finite, all of it —
         parameters, gradients, complete optimizer state including
-        injected fields, and the full param-group structure — is restored
-        exactly while keeping the live Parameter identities, then the
-        error is raised. The optimizer remains usable after rollback.
+        injected fields (every leaf restored with its exact shape,
+        dtype, device, layout and stride/storage metadata; replaced or
+        remetadataed tensors rebound from pristine clones), and the full
+        param-group structure including the original outer list identity —
+        is restored exactly while keeping the live Parameter identities,
+        then the original error is re-raised unmasked. The optimizer
+        remains usable after rollback.
       * The caller-supplied ``params`` iterable is never trusted as
         exhaustive: the authoritative transaction/finite-check set is the
         deterministic first-occurrence union of the supplied Parameters
@@ -511,8 +557,12 @@ def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
                     p.grad = None
                 elif p.grad is None:
                     p.grad = saved.clone()
-                else:
+                elif (p.grad.shape == saved.shape
+                        and p.grad.dtype == saved.dtype
+                        and p.grad.layout == saved.layout):
                     p.grad.copy_(saved)
+                else:                       # replaced mid-step with foreign
+                    p.grad = saved.clone()  # metadata: rebind, never raise
 
     torch.nn.utils.clip_grad_norm_(params, clip)
     for p, _ in pairs:  # recheck after clipping
