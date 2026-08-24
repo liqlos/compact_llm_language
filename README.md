@@ -86,8 +86,13 @@ uv run python -m bench.run_bench --exact --json .rcc_bench/results.json
 
 Deterministic, hardware-free-capable gate over the retained 2B/4B artifacts:
 inventories + hashes every file, validates train-report pins, classifies
-checkpoints via safe/strict bundle loading, checks rescoring eligibility,
-verifies 4B NaN-batch quarantine, and emits one canonical verdict.
+checkpoints via safe/strict bundle loading (actual fp32 payload enforcement),
+rescores evals only from exactly one lossless raw representation per record
+(ties/duplicates/conflicts are invalid statuses, never silently scored),
+verifies 4B NaN-batch quarantine completeness, joins report <-> checkpoint <->
+eval per run over BOTH mandatory splits, and emits one canonical verdict.
+Fail-closed: output/input overlap is rejected pre-write and a streaming
+source fingerprint proves the inputs were not mutated.
 
 ```bash
 uv run python -m latent_lab.bench.no_spend_gate   # full mode (CPU-only; runs proof regressions)

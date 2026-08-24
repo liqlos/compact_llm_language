@@ -24,6 +24,18 @@ from dataclasses import dataclass, field
 
 MISSING_RAW_PREDICTION = "NON_RESCORABLE_MISSING_RAW_PREDICTION"
 
+# Fail-closed per-record invalid statuses: an eval file containing any such
+# record can NEVER aggregate to RESCORED_CORRECTED — it is evidence of a
+# broken/ambiguous scorer capture, not a partially usable rescore.
+INVALID_UNKNOWN_EXAMPLE = "INVALID_UNKNOWN_EXAMPLE"
+INVALID_DUPLICATE_EXAMPLE_RECORDS = "INVALID_DUPLICATE_EXAMPLE_RECORDS"
+INVALID_CONFLICTING_REPRESENTATIONS = "INVALID_CONFLICTING_REPRESENTATIONS"
+INVALID_MALFORMED_CANDIDATE_SCORES = "INVALID_MALFORMED_CANDIDATE_SCORES"
+INVALID_NONFINITE_CANDIDATE_SCORES = "INVALID_NONFINITE_CANDIDATE_SCORES"
+INVALID_AMBIGUOUS_TOP_TIE = "INVALID_AMBIGUOUS_TOP_TIE"
+INVALID_MALFORMED_RANKED_CANDIDATES = "INVALID_MALFORMED_RANKED_CANDIDATES"
+INVALID_DUPLICATE_CANDIDATES = "INVALID_DUPLICATE_CANDIDATES"
+
 FLAG_DUPLICATE_CANDIDATES = "DUPLICATE_CANDIDATES"
 FLAG_GOLD_ABSENT = "GOLD_ABSENT"
 FLAG_ORDER_NOT_PERMUTATION = "ORDER_NOT_PERMUTATION"
@@ -35,6 +47,11 @@ RAW_SCORER_FIELDS = (
     "ranked_candidates",      # candidate contents in ranked order
     "predicted_answer",       # decoded answer string
 )
+
+# Lossless raw representations the corrected scorer accepts. A decoded
+# ``predicted_answer`` string is NOT lossless (the ranking is unrecoverable),
+# so it never satisfies the rescore contract.
+LOSSLESS_RAW_FIELDS = ("candidate_scores", "ranked_candidates")
 
 
 def normalize_answer(value: object) -> str:
@@ -109,65 +126,156 @@ def corrected_score(candidates, answer, *, order=None, scores=None) -> Corrected
 
 @dataclass(frozen=True)
 class RescoreOutcome:
-    status: str                       # RESCORED_CORRECTED | MISSING_RAW_PREDICTION | NO_RECORDS
+    status: str                       # RESCORED_CORRECTED | MISSING_RAW_PREDICTION | NO_RECORDS | INVALID_*
     n_records: int = 0
     corrected_accuracy: float | None = None
     detail: str | None = None
+    flags: tuple[str, ...] = ()       # aggregated, never dropped on success
+
+
+def _is_number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _top_tie(vals: list[float]) -> bool:
+    """True iff the maximum score is attained by more than one candidate —
+    the top of the ranking is then ambiguous and the record is invalid."""
+    if not vals:
+        return False
+    m = max(vals)
+    return sum(1 for v in vals if v == m) > 1
 
 
 def _record_raw_inputs(record: dict, candidates) -> bool:
     """True iff this record retained enough raw evidence to re-run the
     corrected scorer (per-candidate scores aligned to the example's
-    candidates, or the ranked candidate strings, or a decoded answer)."""
+    candidates, or the full ranked candidate strings). A decoded
+    ``predicted_answer`` alone is lossy and does NOT qualify."""
     if "candidate_scores" in record:
         cs = record["candidate_scores"]
         return isinstance(cs, (list, tuple)) and len(cs) == len(candidates)
     if "ranked_candidates" in record:
         rc = record["ranked_candidates"]
-        return isinstance(rc, (list, tuple)) and len(rc) > 0
-    return "predicted_answer" in record
+        return isinstance(rc, (list, tuple)) and len(rc) == len(candidates)
+    return False
 
 
 def rescore_records(records, examples_by_id) -> RescoreOutcome:
-    """Recompute corrected accuracy over retained records.
+    """Recompute corrected accuracy over retained records — fail-closed.
 
-    Any record missing raw prediction inputs makes the whole file
-    NON_RESCORABLE_MISSING_RAW_PREDICTION — partial rescores would silently
-    bias the aggregate.
+    Contract enforced per record:
+      * the example id must exist in the suite and appear at most once;
+      * EXACTLY ONE lossless raw representation may be present
+        (``candidate_scores`` or ``ranked_candidates``); several at once
+        are a conflicting capture, none is NON_RESCORABLE;
+      * scores must be numeric, aligned in length and fully finite; a top
+        tie is ambiguous-invalid; duplicated candidate contents are
+        ambiguous-invalid;
+      * a ranking must be a full unique permutation of the example's
+        candidates (unknown/partial/repeated entries are invalid).
+
+    Any violation aborts aggregation with the specific INVALID_* status —
+    never an uncaught exception, never a partial rescore.
     """
     if not records:
         return RescoreOutcome(status="NO_RECORDS")
     hits = 0
-    for rec in records:
-        ex = examples_by_id.get(rec.get("ex_id"))
+    flags: set[str] = set()
+    seen_ex: set = set()
+    for i, rec in enumerate(records):
+        if not isinstance(rec, dict):
+            return RescoreOutcome(
+                status=INVALID_MALFORMED_CANDIDATE_SCORES,
+                n_records=len(records),
+                detail=f"record {i}: not an object")
+        ex_id = rec.get("ex_id")
+        ex = examples_by_id.get(ex_id)
         if ex is None:
             return RescoreOutcome(
-                status=MISSING_RAW_PREDICTION, n_records=len(records),
-                detail=f"example {rec.get('ex_id')!r} absent from suite")
+                status=INVALID_UNKNOWN_EXAMPLE, n_records=len(records),
+                detail=f"example {ex_id!r} absent from suite")
+        if ex_id in seen_ex:
+            return RescoreOutcome(
+                status=INVALID_DUPLICATE_EXAMPLE_RECORDS,
+                n_records=len(records),
+                detail=f"example {ex_id!r} evaluated more than once")
+        seen_ex.add(ex_id)
         cands = tuple(ex["candidates"]) if isinstance(ex, dict) \
             else tuple(ex.candidates)
         ans = ex["answer"] if isinstance(ex, dict) else ex.answer
-        if not _record_raw_inputs(rec, cands):
+
+        by_norm: dict[str, int] = {}
+        for j, c in enumerate(cands):
+            key = normalize_answer(c)
+            if key in by_norm:
+                return RescoreOutcome(
+                    status=INVALID_DUPLICATE_CANDIDATES,
+                    n_records=len(records),
+                    detail=f"example {ex_id!r}: duplicate candidate {key!r}")
+            by_norm[key] = j
+
+        present = [f for f in LOSSLESS_RAW_FIELDS if f in rec]
+        if not present:
             return RescoreOutcome(
                 status=MISSING_RAW_PREDICTION, n_records=len(records),
                 detail="records carry only derived correct/rank_of_gold")
-        if "candidate_scores" in rec:
-            cs = corrected_score(cands, ans, scores=rec["candidate_scores"])
-        elif "ranked_candidates" in rec:
-            by_norm = {}
-            for i, c in enumerate(cands):
-                by_norm.setdefault(normalize_answer(c), i)
-            order = [by_norm[normalize_answer(x)]
-                     for x in rec["ranked_candidates"]]
-            cs = corrected_score(cands, ans, order=order)
+        if len(present) > 1:
+            return RescoreOutcome(
+                status=INVALID_CONFLICTING_REPRESENTATIONS,
+                n_records=len(records),
+                detail=f"record {i}: multiple raw representations "
+                       f"{sorted(present)}")
+
+        if present[0] == "candidate_scores":
+            cs_raw = rec["candidate_scores"]
+            if not isinstance(cs_raw, (list, tuple)) or \
+                    len(cs_raw) != len(cands) or \
+                    not all(_is_number(v) for v in cs_raw):
+                return RescoreOutcome(
+                    status=INVALID_MALFORMED_CANDIDATE_SCORES,
+                    n_records=len(records),
+                    detail=f"record {i}: candidate_scores must be numeric "
+                           f"and aligned with candidates")
+            vals = [float(v) for v in cs_raw]
+            if not all(math.isfinite(v) for v in vals):
+                return RescoreOutcome(
+                    status=INVALID_NONFINITE_CANDIDATE_SCORES,
+                    n_records=len(records),
+                    detail=f"record {i}: non-finite candidate_scores")
+            if _top_tie(vals):
+                return RescoreOutcome(
+                    status=INVALID_AMBIGUOUS_TOP_TIE,
+                    n_records=len(records),
+                    detail=f"record {i}: top score attained by multiple "
+                           f"candidates")
+            cs = corrected_score(cands, ans, scores=cs_raw)
         else:
-            pred = normalize_answer(rec["predicted_answer"])
-            cs = CorrectedScore(correct=(pred == normalize_answer(ans)),
-                                rank_of_gold=-1)
+            rc = rec["ranked_candidates"]
+            if not isinstance(rc, (list, tuple)) or \
+                    len(rc) != len(cands) or \
+                    not all(isinstance(x, str) for x in rc):
+                return RescoreOutcome(
+                    status=INVALID_MALFORMED_RANKED_CANDIDATES,
+                    n_records=len(records),
+                    detail=f"record {i}: ranked_candidates must be a full "
+                           f"string ranking aligned with candidates")
+            keys = [normalize_answer(x) for x in rc]
+            if len(set(keys)) != len(keys) or \
+                    any(k not in by_norm for k in keys):
+                return RescoreOutcome(
+                    status=INVALID_MALFORMED_RANKED_CANDIDATES,
+                    n_records=len(records),
+                    detail=f"record {i}: ranked_candidates repeat or "
+                           f"introduce entries outside the example")
+            order = [by_norm[k] for k in keys]
+            cs = corrected_score(cands, ans, order=order)
+
+        flags.update(cs.flags)
         hits += int(cs.correct)
     return RescoreOutcome(status="RESCORED_CORRECTED",
                           n_records=len(records),
-                          corrected_accuracy=round(hits / len(records), 6))
+                          corrected_accuracy=round(hits / len(records), 6),
+                          flags=tuple(sorted(flags)))
 
 
 @dataclass(frozen=True)
