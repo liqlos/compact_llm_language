@@ -19,10 +19,12 @@ FAIL-CLOSED contract (every known fail-open is a blocker, never a skip):
 * Discovery is symmetric: orphan checkpoints, orphan eval files,
   byte-duplicate checkpoints bound to more than one run directory, and
   unreadable artifacts are explicit blockers.
-* Every retained loadable 2B checkpoint needs valid rescored raw-score
-  eval evidence bound to it (adapter path + model + revision + current
-  suite hash) covering BOTH required splits (test_id AND test_ood); one
-  unrelated eval proves nothing globally.
+* Every retained loadable checkpoint (2B AND live 4B) needs valid
+  rescored raw-score eval evidence bound to it (adapter path + model +
+  revision + current suite hash) covering BOTH required splits (test_id
+  AND test_ood) over the COMPLETE preregistered example set of each
+  declared split; a lone labelled record, or a test_id record relabelled
+  into a test_ood file, proves nothing globally.
 * The rejected 4B batch must be nonempty, markered, and complete: any
   known-invalid or byte-duplicate 4B artifact left in any live tree is a
   blocker; one differing file does not mask other identical live copies;
@@ -114,6 +116,11 @@ CKPT_NON_FP32_PAYLOAD = "non-fp32-payload"
 
 REQUIRED_SPLITS = ("test_id", "test_ood")
 
+# Eval status for records whose ex_id is outside the preregistered
+# membership of the file's declared split (relabelling cannot manufacture
+# coverage).
+SPLIT_MEMBERSHIP_VIOLATION = "SPLIT_MEMBERSHIP_VIOLATION"
+
 _PINNED_REVISION_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 _SUITE_SHA_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 
@@ -129,6 +136,7 @@ REQUIRED_CONFIG_FIELDS = {
 EVAL_BAD_STATUSES = frozenset({
     "unreadable", "malformed_json", "invalid_metadata", "suite_mismatch",
     "NO_RECORDS", INVALID_RECORDS, MISSING_RAW_PREDICTION,
+    SPLIT_MEMBERSHIP_VIOLATION,
 })
 
 BLOCKER_ACTIONS = {
@@ -167,6 +175,10 @@ BLOCKER_ACTIONS = {
     "EVAL_SPLIT_COVERAGE_MISSING":
         "Run the corrected raw-score evaluation for every listed "
         "(run, split) pair before treating the checkpoint as proven.",
+    "EVAL_SPLIT_MEMBERSHIP_VIOLATION":
+        "Re-run evaluation per split over exactly the preregistered "
+        "example set of the declared split; never satisfy coverage by "
+        "copying or relabelling records across split-labelled files.",
     "EVAL_IDENTITY_MISMATCH":
         "Regenerate the eval under the exact model id/revision/suite hash "
         "of the checkpoint it claims to score.",
@@ -707,6 +719,7 @@ def evaluate_eval_file(path: Path, examples_by_id: dict | None,
         "revision": None,
         "suite_sha256_matches_current_suite": None,
         "bound_run": None,
+        "record_ex_ids": None,
         "n_records": 0,
     }
     try:
@@ -757,6 +770,26 @@ def evaluate_eval_file(path: Path, examples_by_id: dict | None,
             return out
         records.extend(res["records"])
     out["n_records"] = len(records)
+    out["record_ex_ids"] = sorted({str(r.get("ex_id")) for r in records
+                                   if isinstance(r, dict)})
+
+    # Relational identity check: every record in a required-split file must
+    # reference an example that canonically BELONGS to the preregistered
+    # membership of the DECLARED split; copying or relabelling records
+    # across split-labelled files can never manufacture coverage.
+    if data["split"] in REQUIRED_SPLITS:
+        expected = suite_examples_by_split()[data["split"]]
+        foreign = [i for i in out["record_ex_ids"] if i not in expected]
+        if foreign:
+            shown = ", ".join(foreign[:8]) + \
+                ("…" if len(foreign) > 8 else "")
+            out["status"] = SPLIT_MEMBERSHIP_VIOLATION
+            out["detail"] = (
+                f"{len(foreign)} record ex_id(s) outside the preregistered "
+                f"{data['split']} membership "
+                f"({len(out['record_ex_ids'])} distinct ids present): "
+                f"{shown}")
+            return out
 
     if examples_by_id is None:
         examples_by_id = suite_examples_by_id()
@@ -776,6 +809,7 @@ def evaluate_eval_file(path: Path, examples_by_id: dict | None,
 
 _SUITE_CACHE: dict | None = None
 _SUITE_SHA_CACHE: str | None = None
+_SUITE_SPLIT_CACHE: dict[str, frozenset[str]] | None = None
 
 
 def suite_examples_by_id() -> dict:
@@ -791,6 +825,20 @@ def suite_examples_by_id() -> dict:
                 cache[ex.ex_id] = ex
         _SUITE_CACHE = cache
     return _SUITE_CACHE
+
+
+def suite_examples_by_split() -> dict[str, frozenset[str]]:
+    """split -> preregistered ex_id membership, built once per process."""
+    global _SUITE_SPLIT_CACHE
+    if _SUITE_SPLIT_CACHE is None:
+        from ..bench.suite import build_suite
+
+        suite = build_suite()
+        _SUITE_SPLIT_CACHE = {
+            name: frozenset(ex.ex_id for ex in exs)
+            for name, exs in suite.splits().items()
+        }
+    return _SUITE_SPLIT_CACHE
 
 
 def current_suite_sha256() -> str:
@@ -1136,6 +1184,10 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
     candidate_ckpt_rvs = [rv for rv in run_verdicts
                           if rv.get("checkpoint")
                           and rv["scope"] == "retained_candidate"]
+    # Report-schema/selection prerequisites apply to EVERY retained run,
+    # including live 4B runs without checkpoint payloads.
+    retained_runs = [rv for rv in run_verdicts
+                     if rv["scope"] == "retained_candidate"]
     rejected_ckpt_rvs = [rv for rv in run_verdicts
                          if rv.get("checkpoint")
                          and rv["scope"] == "rejected_negative"]
@@ -1165,25 +1217,27 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
            f"{len(scanned)} files hashed; streaming input fingerprints "
            f"taken before and after the gate and matched")
 
-    schema_failures = [rv["run_id"] for rv in two_b_runs
+    schema_failures = [rv for rv in retained_runs
                        if rv.get("report_problems")]
-    precision_missing = [rv["run_id"] for rv in two_b_runs
+    precision_missing = [rv for rv in retained_runs
                          if "trainable_precision:missing"
                          in rv.get("report_problems", [])]
-    suite_mismatch = [rv["run_id"] for rv in two_b_runs
+    suite_mismatch = [rv for rv in retained_runs
                       if rv.get("suite_sha256_matches_current_suite") is False]
     reports_ok = not schema_failures and not suite_mismatch
     prereq(PREREQ_REPORTS,
            STATUS_PROVEN if reports_ok else STATUS_FAILED,
-           (f"{len(two_b_runs)}/{len(two_b_runs)} retained 2B reports fully "
-            f"schema-valid with pinned revision + finite metrics + suite "
-            f"hash matching the recomputed behavioral-v2 suite"
+           (f"{len(retained_runs)}/{len(retained_runs)} retained (2B + live "
+            f"4B) reports fully schema-valid with pinned revision + finite "
+            f"metrics + suite hash matching the recomputed behavioral-v2 "
+            f"suite"
             if reports_ok else
-            f"{len(schema_failures)} 2B reports carry schema violations "
-            f"(missing fields are blockers): "
+            f"{len(schema_failures)} retained reports carry schema "
+            f"violations (missing fields are blockers): "
             + "; ".join(
-                f"{rv['run_id']}: {','.join(rv['report_problems'])}"
-                for rv in sorted(two_b_runs, key=lambda r: r["run_id"])
+                f"{rv['root']}/{rv['dir']}: {','.join(rv['report_problems'])}"
+                for rv in sorted(retained_runs,
+                                 key=lambda r: (r["root"], r["dir"]))
                 if rv.get("report_problems"))))
 
     ckpt_strict_ok = (not dry_run and n_ckpts > 0 and n_loadable == n_ckpts
@@ -1201,14 +1255,21 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
 
     bad_evals = [e for e in eval_verdicts
                  if e.get("status") in EVAL_BAD_STATUSES]
+    membership_violations = [e for e in eval_verdicts
+                             if e.get("status")
+                             == SPLIT_MEMBERSHIP_VIOLATION]
     rescored = [e for e in eval_verdicts
                 if e.get("status") == RESCORED_CORRECTED]
     orphan_evals = [e for e in eval_verdicts if e.get("bound_run") is None]
 
+    # Retained candidates in EITHER root with strictly loadable checkpoints
+    # must be proven by eval evidence — live 4B checkpoints carry the same
+    # prerequisites as retained 2B checkpoints.
     eligible_rvs = [rv for rv in candidate_ckpt_rvs
-                    if rv["root"] == "2b"
-                    and rv.get("checkpoint", {}).get("classification")
+                    if rv.get("checkpoint", {}).get("classification")
                     == CKPT_LOADABLE]
+    expected_by_split = {s: suite_examples_by_split()[s]
+                         for s in REQUIRED_SPLITS}
     identity_mismatches: list[str] = []
     coverage_gaps: list[str] = []
     covered_runs: list[str] = []
@@ -1216,11 +1277,13 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
         for rv in eligible_rvs:
             rid = f"{rv['root']}/{rv['dir']}"
             ident = rv.get("identity") or {}
-            covered = set()
+            covered_ids: dict[str, set] = {s: set() for s in REQUIRED_SPLITS}
             for ev in eval_verdicts:
                 if ev.get("bound_run") != rid:
                     continue
                 if ev.get("status") != RESCORED_CORRECTED:
+                    continue
+                if ev.get("split") not in covered_ids:
                     continue
                 if ev.get("model") != ident.get("model_id") \
                         or ev.get("revision") != ident.get("revision") \
@@ -1228,10 +1291,19 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
                         is not True:
                     identity_mismatches.append(f"{ev['file']} vs {rid}")
                     continue
-                covered.add(ev.get("split"))
-            missing = [s for s in REQUIRED_SPLITS if s not in covered]
-            if missing:
-                coverage_gaps.append(f"{rid}: missing {','.join(missing)}")
+                covered_ids[ev["split"]].update(ev.get("record_ex_ids") or ())
+            gaps = []
+            for s in REQUIRED_SPLITS:
+                missing_ids = sorted(expected_by_split[s] - covered_ids[s])
+                n_expected = len(expected_by_split[s])
+                if missing_ids:
+                    shown = ", ".join(missing_ids[:5]) + \
+                        ("…" if len(missing_ids) > 5 else "")
+                    gaps.append(
+                        f"{s} missing {len(missing_ids)}/{n_expected} "
+                        f"preregistered examples ({shown})")
+            if gaps:
+                coverage_gaps.append(f"{rid}: " + "; ".join(gaps))
             else:
                 covered_runs.append(rid)
 
@@ -1246,7 +1318,9 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
             f"{len(bad_evals)} invalid/unrescorable",
             f"{len(orphan_evals)} unbound",
             f"{len(identity_mismatches)} identity mismatches",
-            f"{len(coverage_gaps)} runs with required-split gaps",
+            f"{len(membership_violations)} split-membership violations",
+            f"{len(coverage_gaps)} runs with incomplete preregistered "
+            f"split coverage",
         ]
         rescore_detail = "retained-eval evidence incomplete: " \
             + "; ".join(parts)
@@ -1260,9 +1334,10 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
 
     selection_ok = all(
         (rv.get("selection_check") or {}).get("consistent_with_reported")
-        for rv in two_b_runs if rv.get("selection_check"))
-    corrected_histories = bool(two_b_runs) and all(
-        rv.get("scorer_tag") == corrected_scorer_tag for rv in two_b_runs)
+        for rv in retained_runs if rv.get("selection_check"))
+    corrected_histories = bool(retained_runs) and all(
+        rv.get("scorer_tag") == corrected_scorer_tag
+        for rv in retained_runs)
     if rescore_status == STATUS_PROVEN and corrected_histories and selection_ok:
         selection_status = STATUS_PROVEN
         selection_detail = ("best_step values reproduce from histories "
@@ -1327,18 +1402,25 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
                          "smallest_next_action":
                              BLOCKER_ACTIONS.get(code, NEXT_ACTION_GENERIC)})
 
+    def _rv_path(rv) -> str:
+        return f"{rv['root']}/{rv['dir']}"
+
     if precision_missing:
         blocker("REPORT_TRAINABLE_PRECISION_MISSING",
-                f"{len(precision_missing)}/{len(two_b_runs)} 2B reports lack "
-                f"explicit trainable-precision fields")
+                f"{len(precision_missing)}/{len(retained_runs)} retained "
+                f"reports lack explicit trainable-precision fields: "
+                + ", ".join(_rv_path(rv)
+                            for rv in sorted(precision_missing,
+                                             key=_rv_path)))
     if schema_failures:
         blocker("REPORT_SCHEMA_MISSING_FIELDS",
-                f"{len(schema_failures)}/{len(two_b_runs)} 2B reports "
-                f"violate the required train-report schema")
+                f"{len(schema_failures)}/{len(retained_runs)} retained "
+                f"reports violate the required train-report schema")
     if suite_mismatch:
         blocker("REPORT_SUITE_HASH_MISMATCH",
-                f"{len(suite_mismatch)}/{len(two_b_runs)} 2B reports pin a "
-                f"suite hash different from the current recomputed suite")
+                f"{len(suite_mismatch)}/{len(retained_runs)} retained "
+                f"reports pin a suite hash different from the current "
+                f"recomputed suite")
     if n_bf16:
         blocker("TRAINABLES_NOT_FP32_IN_RETAINED_CHECKPOINTS",
                 f"{n_bf16}/{n_ckpts} retained checkpoints store floating "
@@ -1399,6 +1481,15 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
                 f"{len(identity_mismatches)} eval file(s) bound to a run but "
                 f"scored under a different model/revision/suite hash: "
                 + "; ".join(identity_mismatches[:8]))
+    if membership_violations:
+        listing = "; ".join(
+            f"{e['file']} declares {e['split']}"
+            for e in membership_violations[:8])
+        blocker("EVAL_SPLIT_MEMBERSHIP_VIOLATION",
+                f"{len(membership_violations)}/{len(eval_verdicts)} eval "
+                f"file(s) contain records whose ex_id is outside the "
+                f"preregistered membership of their declared split "
+                f"(relabelling cannot manufacture coverage): {listing}")
     if coverage_gaps:
         blocker("EVAL_SPLIT_COVERAGE_MISSING",
                 f"{len(coverage_gaps)}/{len(eligible_rvs)} loadable retained "
@@ -1469,6 +1560,7 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
         "files_scanned": len(scanned),
         "bytes_scanned": sum(f.size for f in scanned),
         "runs_2b": len(two_b_runs),
+        "retained_candidate_runs": len(retained_runs),
         "runs_4b_live": len(quarantine.get("live_run_dirs", [])),
         "runs_4b_rejected": len(quarantine.get("rejected_run_dirs", [])),
         "checkpoints_total": n_ckpts + len(rejected_ckpt_rvs),
@@ -1486,6 +1578,7 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
             e for e in eval_verdicts
             if e.get("status") == MISSING_RAW_PREDICTION]),
         "eval_files_invalid_or_unbound": len(bad_evals) + len(orphan_evals),
+        "eval_files_split_membership_violations": len(membership_violations),
         "eligible_checkpoints_fully_covered": len(covered_runs),
         "eligible_checkpoints_with_gaps": len(coverage_gaps),
     }
@@ -1526,9 +1619,15 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
         "quarantine_4b": quarantine,
         "duplicate_checkpoint_bindings": dup_binding_groups,
         "required_splits": list(REQUIRED_SPLITS),
+        "preregistered_split_sizes": {
+            s: len(expected_by_split[s]) for s in REQUIRED_SPLITS},
         "coverage": {"fully_covered_runs": covered_runs,
                      "gap_runs": coverage_gaps,
-                     "identity_mismatches": identity_mismatches},
+                     "identity_mismatches": identity_mismatches,
+                     "membership_violations": [
+                         {"file": e["file"], "root": e["root"],
+                          "split": e["split"]}
+                         for e in membership_violations]},
         "proof_tests": None if proof is None else {
             "all_passed": proof["all_passed"],
             "returncode": proof["returncode"],
