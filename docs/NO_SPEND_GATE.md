@@ -54,11 +54,19 @@ uv run python -m latent_lab.bench.no_spend_gate --dry-run
   checkpoints bound to more than one run directory, and unreadable
   artifacts are explicit blockers — discovery does not start and stop at
   reports.
-- **Per-checkpoint eval joins.** Every retained loadable 2B checkpoint
-  needs valid rescored raw-score evidence bound to it by adapter path +
-  exact model id + pinned revision + current suite hash, covering BOTH
-  required splits (`test_id` AND `test_ood`). One unrelated or one-split
-  eval proves nothing globally.
+- **Per-checkpoint eval joins.** Every retained loadable checkpoint (2B
+  AND live 4B) needs valid rescored raw-score evidence bound to it by
+  adapter path + exact model id + pinned revision + current suite hash,
+  covering BOTH required splits (`test_id` AND `test_ood`) over the
+  COMPLETE preregistered example set of each declared split; records
+  whose `ex_id` lies outside the preregistered membership of the file's
+  declared split are explicit blockers. One unrelated, one-split, or
+  partial eval proves nothing globally.
+- **Uniform retained prerequisites.** Report schema validity (including
+  `trainable_precision`), suite-hash pinning, corrected-metric selection,
+  and full eval coverage apply to every retained run — a live 4B
+  checkpoint with an incomplete report or no eval evidence forces
+  NOT_READY exactly like a 2B one.
 - **Quarantine completeness.** The rejected 4B batch must be nonempty,
   markered, and fully contained: ANY known-invalid or byte-duplicate 4B
   artifact left in any live tree blocks READY even when sibling files

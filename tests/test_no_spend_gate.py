@@ -364,6 +364,41 @@ def _derived_only_eval(adapter="runs/E_k4_s0") -> dict:
     ])
 
 
+def _full_split_records(split: str) -> list[dict]:
+    """Raw-score records for the COMPLETE preregistered split membership."""
+    by_id = g.suite_examples_by_id()
+    return [_raw_record(by_id[eid])
+            for eid in sorted(g.suite_examples_by_split()[split])]
+
+
+def _clean_retained_evidence(corpus):
+    """Retained 2B run with schema-valid report + verified fp32 bundle and
+    an empty live 4B tree; quarantine negative evidence stays intact."""
+    import shutil
+
+    import torch
+
+    from latent_lab.train.checkpointing import save_adapter_bundle
+
+    r2b, r4b = corpus
+    shutil.rmtree(r4b / "runs")
+    shutil.rmtree(r2b / "runs" / "legacy_run")
+    run = r2b / "runs" / "E_k4_s0"
+    rep = _valid_report()
+    rep["config"]["scorer"] = "corrected-gold-aware-v1"
+    rep["trainable_precision"] = "fp32"
+    (run / "train_report.json").write_text(json.dumps(rep))
+    os.remove(run / "best_params.pt")
+    save_adapter_bundle(run / "best_params.pt",
+                        {"lora.A": torch.eye(2, dtype=torch.float32)},
+                        model_id="Qwen/Qwen3.5-2B",
+                        revision=PINNED_REV_2B,
+                        metrics={"best_score": 0.5, "best_step": 200})
+    for p in r2b.glob("results/ev_*.json"):
+        os.remove(p)
+    return r2b, r4b
+
+
 @pytest.fixture()
 def corpus(tmp_path):
     """Synthetic retained-evidence tree mirroring the historical shape."""
@@ -670,6 +705,85 @@ class TestGateEndToEnd:
         assert "test_ood" in detail
         assert res.verdict == "NOT_READY"
 
+    def test_single_record_cannot_cover_full_preregistered_split(self, corpus):
+        """Regression (audit 91e842f defect 1): one raw record merely
+        LABELLED for a required split must not count as coverage of the
+        complete preregistered example set of that split."""
+        r2b, r4b = _clean_retained_evidence(corpus)
+        ex_ti = _suite_ex("ti-")
+        (r2b / "results" / "ev_E_k4_s0_test_id_clean.json").write_text(
+            json.dumps(_eval_for("runs/E_k4_s0", "test_id",
+                                 [_raw_record(ex_ti)])))
+        (r2b / "results" / "ev_E_k4_s0_test_ood_clean.json").write_text(
+            json.dumps(_eval_for("runs/E_k4_s0", "test_ood",
+                                 _full_split_records("test_ood"))))
+        res = g.run_gate(r2b, r4b, repo_root=None, skip_proof_tests=True,
+                         proof_result=PROOF_OK)
+        codes = {b["code"] for b in res.gate_verdict["blockers"]}
+        assert "EVAL_SPLIT_COVERAGE_MISSING" in codes
+        detail = [b["detail"] for b in res.gate_verdict["blockers"]
+                  if b["code"] == "EVAL_SPLIT_COVERAGE_MISSING"][0]
+        assert "test_id" in detail and "preregistered" in detail
+        assert res.verdict == "NOT_READY"
+
+    def test_test_id_records_relabelled_test_ood_violate_membership(
+            self, corpus):
+        """Regression (audit 91e842f defect 2): copying test_id examples
+        into a file declared test_ood must not satisfy OOD coverage; every
+        record's ex_id must belong to the preregistered membership of the
+        declared split."""
+        r2b, r4b = _clean_retained_evidence(corpus)
+        ti_records = _full_split_records("test_id")
+        (r2b / "results" / "ev_E_k4_s0_test_id_clean.json").write_text(
+            json.dumps(_eval_for("runs/E_k4_s0", "test_id", ti_records)))
+        (r2b / "results" / "ev_E_k4_s0_test_ood_clean.json").write_text(
+            json.dumps(_eval_for("runs/E_k4_s0", "test_ood",
+                                 list(ti_records))))
+        res = g.run_gate(r2b, r4b, repo_root=None, skip_proof_tests=True,
+                         proof_result=PROOF_OK)
+        codes = {b["code"] for b in res.gate_verdict["blockers"]}
+        assert "EVAL_SPLIT_MEMBERSHIP_VIOLATION" in codes
+        detail = [b["detail"] for b in res.gate_verdict["blockers"]
+                  if b["code"] == "EVAL_SPLIT_MEMBERSHIP_VIOLATION"][0]
+        assert "test_ood" in detail
+        cov = [b["detail"] for b in res.gate_verdict["blockers"]
+               if b["code"] == "EVAL_SPLIT_COVERAGE_MISSING"][0]
+        assert "test_ood" in cov
+        assert res.verdict == "NOT_READY"
+
+    def test_live_4b_retained_checkpoint_requires_full_prerequisites(
+            self, corpus):
+        """Regression (audit 91e842f defect 3): a retained live 4B
+        checkpoint must meet the SAME report-schema and eval prerequisites
+        as 2B; a live 4B report lacking trainable_precision with no eval
+        evidence must force NOT_READY."""
+        import torch
+
+        from latent_lab.train.checkpointing import save_adapter_bundle
+
+        r2b, r4b = corpus
+        live = r4b / "runs" / "E4_retained"
+        live.mkdir(parents=True)
+        rep = _valid_report(model="Qwen/Qwen3.5-4B", revision=REV_4B)
+        # _valid_report carries no trainable_precision field at all
+        assert "trainable_precision" not in rep
+        rep["config"]["scorer"] = "corrected-gold-aware-v1"
+        (live / "train_report.json").write_text(json.dumps(rep))
+        save_adapter_bundle(live / "best_params.pt",
+                            {"lora.A": torch.ones(2, dtype=torch.float32)},
+                            model_id="Qwen/Qwen3.5-4B", revision=REV_4B,
+                            metrics={"best_score": 0.4, "best_step": 200})
+        res = self.run_gate(corpus)
+        codes = {b["code"] for b in res.gate_verdict["blockers"]}
+        prec = [b["detail"] for b in res.gate_verdict["blockers"]
+                if b["code"] == "REPORT_TRAINABLE_PRECISION_MISSING"][0]
+        assert "E4_retained" in prec
+        assert "EVAL_SPLIT_COVERAGE_MISSING" in codes
+        cov = [b["detail"] for b in res.gate_verdict["blockers"]
+               if b["code"] == "EVAL_SPLIT_COVERAGE_MISSING"][0]
+        assert "4b/runs/E4_retained" in cov
+        assert res.verdict == "NOT_READY"
+
     def test_orphan_corrupt_checkpoint_is_explicit_blocker(self, corpus):
         import torch
 
@@ -859,14 +973,14 @@ class TestGateEndToEnd:
         # remove legacy_run's schema-violating report tree entirely
         shutil.rmtree(r2b / "runs" / "legacy_run")
 
-        ex_ti = _suite_ex("ti-")
-        ex_to = _suite_ex("to-")
+        # Full preregistered coverage: EVERY test_id and test_ood example,
+        # in its own split-labelled file (honest READY control).
         (r2b / "results" / "ev_E_k4_s0_test_id_clean.json").write_text(
             json.dumps(_eval_for("runs/E_k4_s0", "test_id",
-                                 [_raw_record(ex_ti)])))
+                                 _full_split_records("test_id"))))
         (r2b / "results" / "ev_E_k4_s0_test_ood_clean.json").write_text(
             json.dumps(_eval_for("runs/E_k4_s0", "test_ood",
-                                 [_raw_record(ex_to)])))
+                                 _full_split_records("test_ood"))))
 
         res = g.run_gate(r2b, r4b, repo_root=None, skip_proof_tests=True,
                          proof_result=PROOF_OK)
