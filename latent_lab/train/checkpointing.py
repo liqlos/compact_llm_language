@@ -9,23 +9,27 @@ Three responsibilities live here:
     revisions must be pinned immutable 40-hex commit ids (no network);
     loads prevalidate every key, tensor type, shape, dtype and finiteness
     before any tensor is copied, so failed loads are atomic.
-  * guarded_optimizer_step — transactional fail-closed stepping: no
-    optimizer.step() unless loss, the clip configuration, parameters,
+  * guarded_optimizer_step — transactional fail-closed stepping backed by
+    the exact storage-graph engine in latent_lab.train.opt_transaction:
+    no optimizer.step() unless loss, the clip configuration, parameters,
     gradients and the clip norm are all finite, with rechecks after
     clipping and after the update; any post-step corruption rolls the
-    parameters, the complete optimizer state (every tensor's values AND
-    its exact shape/dtype/device/layout/stride metadata, structurally
-    exact) and the full param-group topology (the original outer list
-    object, group count/order, fields, per-group Parameter identities
-    and order) back bit-exactly, without ever masking or replacing the
-    original step exception. The transaction set is derived from the
-    optimizer's own groups, so Parameters omitted by the caller stay
-    covered.
+    parameters, gradients and the COMPLETE optimizer state back bit- and
+    byte-exactly — full backing storages (including hidden bytes outside
+    visible leaf views), alias/overlap/cross-dtype view graphs, repeated
+    tensor-object references, tensor metadata (dtype/device/layout/
+    shape/stride/storage_offset/requires_grad) and the original
+    ``optimizer.state`` mapping object identity included — without ever
+    masking or replacing the original step exception. The transaction set
+    is derived from the optimizer's own groups, so Parameters omitted by
+    the caller stay covered. Snapshot preflight is fail-closed: state
+    that cannot be reconstructed exactly (sparse/nested/quantized/meta,
+    subclasses, unsupported devices, out-of-bounds views, oversized
+    unique-storage totals) aborts BEFORE any mutation, before clipping.
 """
 
 from __future__ import annotations
 
-import copy
 import math
 import os
 import re
@@ -35,6 +39,19 @@ try:
     import torch
 except ImportError:  # pragma: no cover - import-safety without lab group
     torch = None
+
+from latent_lab.train.opt_transaction import (  # noqa: E402,F401
+    DEFAULT_STATE_SNAPSHOT_BUDGET_BYTES,
+    OptimizerRollbackError,
+    OptimizerStateBudgetExceeded,
+    OptimizerStateSnapshotError,
+    OptimizerTransaction,
+    OptimizerTransactionError,
+    optimizer_owned_params as _optimizer_owned_params,
+    resolve_state_snapshot_budget as _resolve_budget,
+    restore_param_groups as _restore_param_groups,
+    snapshot_param_groups as _snapshot_param_groups,
+)
 
 
 class CheckpointError(RuntimeError):
@@ -325,19 +342,6 @@ def load_adapter_bundle(path, *, model_id, revision) -> dict:
 # fail-closed optimizer stepping
 # ---------------------------------------------------------------------------
 
-def _deep_clone_tree(obj):
-    """Exact deep copy of a tensor tree (optimizer state shapes)."""
-    if torch.is_tensor(obj):
-        return obj.detach().clone()
-    if isinstance(obj, dict):
-        return {k: _deep_clone_tree(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_deep_clone_tree(v) for v in obj]
-    if isinstance(obj, tuple):
-        return tuple(_deep_clone_tree(v) for v in obj)
-    return obj
-
-
 def _tree_is_finite(obj) -> bool:
     if torch.is_tensor(obj):
         return not obj.is_floating_point() or bool(torch.isfinite(obj).all())
@@ -348,168 +352,52 @@ def _tree_is_finite(obj) -> bool:
     return True
 
 
-def _inplace_exact_restore_possible(live, snap) -> bool:
-    """True only when copying ``snap`` through the live tensor object
-    cannot change any observable metadata — i.e. both are strided tensors
-    with identical shape, dtype, device, layout, strides and storage
-    offset. Anything else must be rebound from the pristine snapshot."""
-    if snap.layout != torch.strided or live.layout != torch.strided:
-        return False
-    return (tuple(live.shape) == tuple(snap.shape)
-            and live.dtype == snap.dtype
-            and live.device == snap.device
-            and tuple(live.stride()) == tuple(snap.stride())
-            and live.storage_offset() == snap.storage_offset())
-
-
-def _restore_optimizer_state(optimizer, snap) -> None:
-    """Roll optimizer.state back to the snapshot bit-exactly, in place.
-
-    A snapshot leaf is restored through its live tensor object ONLY when
-    that object is structurally compatible (same shape, dtype, device,
-    layout, strides, storage offset), so in-place restoration is exact;
-    every other leaf — replaced objects, mismatched metadata, non-tensor
-    values, injected fields — is rebound to a fresh clone of the pristine
-    snapshot. ``Tensor.copy_`` therefore can never cast dtypes, coerce
-    shapes or fail with a size mismatch during rollback."""
-    state = optimizer.state
-    for key in list(state.keys()):
-        if key not in snap:
-            del state[key]
-    for key, snap_entry in snap.items():
-        live_entry = state.get(key) if hasattr(state, "get") else None
-        if not isinstance(live_entry, dict) or \
-                not isinstance(snap_entry, dict):
-            state[key] = _deep_clone_tree(snap_entry)
-            continue
-        for name in list(live_entry.keys()):
-            if name not in snap_entry:
-                del live_entry[name]
-        for name, val in snap_entry.items():
-            live_val = live_entry.get(name)
-            if torch.is_tensor(val) and torch.is_tensor(live_val) and \
-                    _inplace_exact_restore_possible(live_val, val):
-                with torch.no_grad():
-                    live_val.copy_(val)
-            else:
-                live_entry[name] = _deep_clone_tree(val)
-
-
-def _optimizer_owned_params(optimizer) -> list:
-    """Authoritative pre-step Parameter set: every tensor owned by the
-    optimizer's ``param_groups``, in deterministic first-occurrence order.
-    The caller-supplied iterable is never trusted as exhaustive."""
-    owned, seen = [], set()
-    for group in optimizer.param_groups:
-        if isinstance(group, dict):
-            plist = group.get("params", ())
-        else:  # exotic non-dict group objects
-            plist = getattr(group, "params", ())
-        if not isinstance(plist, (list, tuple)):
-            continue
-        for p in plist:
-            if torch.is_tensor(p) and id(p) not in seen:
-                seen.add(id(p))
-                owned.append(p)
-    return owned
-
-
-def _snapshot_param_groups(optimizer) -> tuple:
-    """Structural snapshot of ``param_groups`` sufficient to rebuild the
-    exact pre-step topology, INCLUDING the identity of the original outer
-    ``param_groups`` list object itself. Per group it records the live
-    group dict (by reference), deep copies of every non-``params`` field,
-    whether a ``params`` entry existed, the live params list object (by
-    reference) and a copy of its Parameter order. Parameter objects
-    themselves are never copied or replaced."""
-    groups_obj = optimizer.param_groups
-    outer_ref = groups_obj if isinstance(groups_obj, list) else None
-    snap = []
-    for group in groups_obj:
-        fields = {
-            k: (v.detach().clone() if torch.is_tensor(v) else copy.deepcopy(v))
-            for k, v in group.items() if k != "params"}
-        had_params = "params" in group
-        plist = group["params"] if had_params else ()
-        params_ref = plist if isinstance(plist, list) else None
-        snap.append((group, fields, had_params, params_ref, list(plist)))
-    return outer_ref, snap
-
-
-def _restore_param_groups(optimizer, snap) -> None:
-    """Rebuild ``param_groups`` IN PLACE from the snapshot: exact original
-    group count/order, the original group dicts with their original field
-    values, and each group's original live Parameter objects in their
-    exact original order — plus the original OUTER list object: if a
-    hostile step rebound ``optimizer.param_groups`` to a different list,
-    the snapshot's list is reinstated by assignment before its contents
-    are restored in place, so any optimizer/subclass reference to the
-    original list stays authoritative. Hostile additions (groups or
-    per-group params) are undone by removal, hostile removals/reordering
-    by reinsertion of the original objects; no Parameter object is ever
-    replaced."""
-    outer_ref, group_snaps = snap
-    live = optimizer.param_groups
-    if outer_ref is not None and live is not outer_ref:
-        optimizer.param_groups = outer_ref     # undo hostile outer rebind
-        live = outer_ref
-    present = {id(g) for g in live}
-    rebuilt = []
-    for group, fields, had_params, params_ref, params_order in group_snaps:
-        if id(group) not in present:      # hostile group removal: reinsert
-            live.append(group)
-            present.add(id(group))
-        for key in list(group.keys()):
-            if key != "params" and key not in fields:
-                del group[key]            # field injected mid-step
-        for key, val in fields.items():
-            group[key] = (val.detach().clone() if torch.is_tensor(val)
-                          else copy.deepcopy(val))
-        if had_params:
-            if params_ref is None:        # non-list container: restore contents
-                group["params"] = params_order
-            else:
-                if group.get("params") is not params_ref:
-                    group["params"] = params_ref   # hostile list replacement
-                params_ref[:] = params_order       # identities + order, in place
-        elif "params" in group:
-            del group["params"]
-        rebuilt.append(group)
-    live[:] = rebuilt               # drop injected groups, restore order
-
-
-def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
+def guarded_optimizer_step(optimizer, loss, params, clip_norm, *,
+                           state_snapshot_budget_bytes=None) -> None:
     """Step only when everything is finite; roll back completely otherwise.
 
     Transactional contract:
       * PRE-STEP (before any mutation): finite loss, positive finite clip,
         finite parameters, finite gradients and a finite total gradient
         norm. Any rejection here performs no step and mutates nothing.
-      * Gradients are rechecked after clipping; a post-clip rejection also
-        restores the pre-clip gradients.
-      * Every trainable parameter, every pre-clip gradient (including the
-        ``None`` versus tensor distinction and exact bytes), a deep exact
-        copy of the optimizer state and the complete ``param_groups``
-        topology (the original outer list object, group count/order,
-        every group field, and each group's live Parameter identities in
-        exact order) are snapshotted before ``optimizer.step()``. If the
-        step raises, or any post-step parameter or optimizer-state tensor
-        is non-finite, all of it — parameters, gradients, complete
-        optimizer state including injected fields with every tensor's
-        exact shape/dtype/device/layout/stride metadata, and the full
-        param-group structure down to outer-list identity — is restored
-        exactly while keeping the live Parameter identities; a state leaf
-        whose metadata was swapped mid-step is rebound from the pristine
-        snapshot rather than copied through, so rollback itself can never
-        raise a size/dtype mismatch. The original step exception is then
-        re-raised intact (rollback failures chain onto it as __cause__,
-        never replacing it). The optimizer remains usable after rollback.
+      * The optimizer transaction is captured BEFORE gradient clipping:
+        an exact storage-graph snapshot of the complete ``optimizer.state``
+        value tree, of every pre-clip gradient and of every parameter —
+        full unique backing storages cloned exactly once on their own
+        device (hidden bytes outside visible leaf views included),
+        alias/overlap/cross-dtype view graphs and repeated tensor-object
+        references preserved, per-object dtype/device/layout/shape/stride/
+        storage_offset/requires_grad recorded, and the original
+        ``optimizer.state`` mapping object captured by identity. Preflight
+        rejects fail-closed — sparse/nested/quantized/meta tensors,
+        non-plain subclasses, conj/neg views, graph-attached tensors,
+        unsupported devices, out-of-bounds views, exotic containers, or a
+        unique-storage total above the documented budget
+        (``state_snapshot_budget_bytes`` / env
+        ``LATENT_LAB_STATE_SNAPSHOT_BUDGET_BYTES`` /
+        ``DEFAULT_STATE_SNAPSHOT_BUDGET_BYTES``) — before ANY mutation,
+        leaving parameters, gradients, state, param_groups and mapping
+        identities untouched. There is no silent per-leaf clone fallback.
+      * Gradients are rechecked after clipping; a post-clip rejection
+        restores the pre-clip gradients exactly.
+      * If ``optimizer.step()`` raises, or any post-step parameter or
+        optimizer-state tensor is non-finite, everything is restored
+        bit-/byte-exactly: whole storage groups are repaired by one full
+        storage copy when their objects remain coherent (alias graphs and
+        hidden bytes intact), else each affected group is rebuilt
+        coherently via identity-preserving re-pointing onto the pristine
+        bytes; injected state keys are removed, removed/replaced entries
+        reinstated, key order and the original mapping object identity
+        restored, and the param-group topology (original outer list
+        object, group count/order, every group field, live Parameter
+        identities in exact order) rebuilt in place. Rollback failures
+        are only ever chained as the original step exception's
+        ``__cause__`` — never masking it. The optimizer remains usable
+        after rollback; a retry matches an independent clean control.
       * The caller-supplied ``params`` iterable is never trusted as
         exhaustive: the authoritative transaction/finite-check set is the
         deterministic first-occurrence union of the supplied Parameters
-        with every Parameter owned by the optimizer's param_groups, so no
-        optimizer-owned Parameter can be updated by ``optimizer.step()``
-        without snapshot, post-check and rollback coverage.
+        with every Parameter owned by the optimizer's param_groups.
     """
     _require_torch()
     # -- pre-step validation: nothing has been mutated yet -------------------
@@ -544,58 +432,44 @@ def guarded_optimizer_step(optimizer, loss, params, clip_norm) -> None:
             "refusing optimizer.step: non-finite gradient norm "
             "(clip would silently zero it)")
 
-    grad_snap = {id(p): (None if p.grad is None else p.grad.detach().clone())
-                 for p in params}
+    # -- exact transaction capture (BEFORE clipping mutates gradients) ------
+    budget = _resolve_budget(state_snapshot_budget_bytes)
+    tx = OptimizerTransaction(optimizer, params, budget=budget)
+    groups_snap = _snapshot_param_groups(optimizer)
 
-    def restore_grads() -> None:
-        with torch.no_grad():
-            for p in params:
-                saved = grad_snap[id(p)]
-                if saved is None:
-                    p.grad = None
-                elif p.grad is None or not _inplace_exact_restore_possible(
-                        p.grad, saved):
-                    p.grad = saved.clone()   # hostile grad rebinding: rebind
-                else:
-                    p.grad.copy_(saved)
+    def run_rollback():
+        """Attempt full restoration; return None on success, else the
+        rollback failure (to be chained as the reported error's cause)."""
+        try:
+            tx.rollback()
+            _restore_param_groups(optimizer, groups_snap)
+            return None
+        except BaseException as rollback_error:  # noqa: BLE001
+            return rollback_error
 
     torch.nn.utils.clip_grad_norm_(params, clip)
     for p, _ in pairs:  # recheck after clipping
         if not bool(torch.isfinite(p.grad).all()):
-            restore_grads()
-            raise NonFiniteTrainingStateError(
+            failure = NonFiniteTrainingStateError(
                 "gradients became non-finite after clipping")
-
-    # -- transaction: snapshot everything the step may corrupt ---------------
-    param_snap = [p.detach().clone() for p in params]
-    state_snap = _deep_clone_tree(optimizer.state)
-    groups_snap = _snapshot_param_groups(optimizer)
-
-    def restore_params() -> None:
-        with torch.no_grad():
-            for p, saved in zip(params, param_snap):
-                p.copy_(saved)
-
-    def rollback() -> None:
-        restore_params()
-        _restore_optimizer_state(optimizer, state_snap)
-        _restore_param_groups(optimizer, groups_snap)
-        restore_grads()
+            chained = run_rollback()
+            raise failure from chained      # None cause == clean rollback
 
     try:
         optimizer.step()
     except BaseException as step_error:
-        try:
-            rollback()
-        except BaseException as rollback_error:  # never mask the original
-            raise step_error from rollback_error
-        raise
+        chained = run_rollback()
+        if chained is None:
+            raise                           # original exception preserved
+        raise step_error from chained       # rollback failure as cause only
     for p in params:  # recheck after update
         if not bool(torch.isfinite(p.detach()).all()):
-            rollback()
+            chained = run_rollback()
             raise NonFiniteTrainingStateError(
-                "parameters became non-finite after optimizer.step")
+                "parameters became non-finite after optimizer.step"
+            ) from chained
     if not _tree_is_finite(optimizer.state):
-        rollback()
+        chained = run_rollback()
         raise NonFiniteTrainingStateError(
-            "optimizer state became non-finite after optimizer.step")
+            "optimizer state became non-finite after optimizer.step"
+        ) from chained
