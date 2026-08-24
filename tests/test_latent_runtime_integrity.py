@@ -31,6 +31,7 @@ from latent_lab.train.checkpointing import (
     NonFiniteMetricError,
     NonFiniteStateError,
     NonFiniteTrainingStateError,
+    UnsupportedStorageGraphError,
     guarded_optimizer_step,
     load_adapter_bundle,
     require_pinned_revision,
@@ -1183,6 +1184,490 @@ def test_adversarial_outer_param_groups_list_identity_restored():
                     opt_ctl.state[c]["momentum_buffer"])
         for a, c in zip(ps_adv, ps_ctl)), \
         "optimizer state diverges from the clean control after retry"
+
+
+# ---------------------------------------------------------------------------
+# exact optimizer-state tensor-view / alias rollback (storage-graph proofs)
+# ---------------------------------------------------------------------------
+
+def _test_storage_tag(t):
+    """Reality-reflecting backing-storage identity for alias-pattern
+    checks. Zero-capacity storages are tagged ``empty`` because
+    independent empty tensors can legitimately report data_ptr()==0 and
+    must never be treated as aliases of one another."""
+    try:
+        us = t.untyped_storage()
+    except Exception:
+        return ("opaque",)
+    if us.nbytes() == 0:
+        return ("empty",)
+    return ("storage", int(us.data_ptr()), int(us.nbytes()))
+
+
+class _TreeExpectation:
+    """Lossless structural recorder for a tensor tree (optimizer state).
+
+    Per tensor leaf it records: kind; EXACT shape/dtype/device/layout/
+    strides/storage-offset; logical VALUES (bitwise-compared); the full
+    backing-storage identity including its extent; and the tensor-OBJECT
+    identity. ``assert_matches`` enforces a consistent, INJECTIVE
+    translation of storage and object identities, so leaves sharing one
+    storage (or one object) beforehand must be exactly that afterwards,
+    and independent leaves — including independent empty tensors — must
+    stay independent. Expectations are never produced through a lossy
+    flattening clone; value clones serve only logical comparison.
+    """
+
+    def __init__(self, root):
+        self._root = self._rec(root)
+
+    def _rec(self, node):
+        if torch.is_tensor(node):
+            return ("T",
+                    (tuple(node.shape), node.dtype, node.device,
+                     node.layout, tuple(node.stride()),
+                     int(node.storage_offset())),
+                    node.detach().clone(),
+                    _test_storage_tag(node), id(node))
+        if isinstance(node, dict):
+            return ("D", [(k, self._rec(v)) for k, v in node.items()])
+        if isinstance(node, list):
+            return ("L", [self._rec(v) for v in node])
+        if isinstance(node, tuple):
+            return ("TP", [self._rec(v) for v in node])
+        return ("S", type(node), node)
+
+    def assert_matches(self, actual_root):
+        self._smap, self._srev = {}, {}
+        self._omap, self._orev = {}, {}
+        self._cmp(self._root, actual_root)
+
+    def _map(self, pre, post, forward, reverse, what):
+        if pre in forward:
+            assert forward[pre] == post, \
+                f"{what}: previously-shared identity no longer shared"
+        else:
+            assert post not in reverse, \
+                f"{what}: independent identities were merged"
+            forward[pre] = post
+            reverse[post] = pre
+
+    def _cmp(self, exp, act):
+        kind = exp[0]
+        if kind == "T":
+            _, meta, vals, stag, otag = exp
+            assert torch.is_tensor(act), f"expected tensor leaf, got {act!r}"
+            got_meta = (tuple(act.shape), act.dtype, act.device, act.layout,
+                        tuple(act.stride()), int(act.storage_offset()))
+            assert got_meta == meta, \
+                f"tensor metadata drifted:\n  expected {meta}\n  got {got_meta}"
+            assert bool(torch.equal(act, vals)), "values not bit-exact"
+            post_stag = _test_storage_tag(act)
+            if stag[0] == "storage":
+                assert post_stag[0] == "storage" and \
+                    post_stag[2] == stag[2], \
+                    f"backing-storage extent changed: {stag} -> {post_stag}"
+                self._map(stag, post_stag, self._smap, self._srev, "storage")
+            if stag[0] == "empty":
+                assert post_stag[0] == "empty", \
+                    f"empty tensor gained a real storage: {post_stag}"
+            self._map(otag, id(act), self._omap, self._orev, "object")
+            return
+        if kind == "D":
+            assert isinstance(act, dict), f"expected dict, got {type(act)}"
+            assert set(act.keys()) == {k for k, _ in exp[1]}, \
+                "container keys drifted"
+            for k, sub in exp[1]:
+                self._cmp(sub, act[k])
+            return
+        if kind in ("L", "TP"):
+            typ = list if kind == "L" else tuple
+            assert isinstance(act, typ), f"expected {typ}, got {type(act)}"
+            assert len(act) == len(exp[1]), "container length drifted"
+            for sub, a in zip(exp[1], act):
+                self._cmp(sub, a)
+            return
+        _, ty, val = exp
+        assert not torch.is_tensor(act) and type(act) is ty and act == val, \
+            f"scalar drift: {val!r} vs {act!r}"
+
+
+class _AliasCorruptingSGD(torch.optim.SGD):
+    """Performs a REAL momentum update, then destroys the state's storage
+    graph: value corruption THROUGH the aliased base followed by
+    rebinding every view / repeated-reference / scalar / expanded leaf to
+    fresh normalized tensors (storage_offset 0, dense strides, private
+    storages), junk-field injection, parameter/gradient/topology
+    corruption, and a distinctive raised exception."""
+
+    def __init__(self, params, lr):
+        super().__init__(params, lr=lr, momentum=0.9)
+        self.armed = False
+        self.foreign = torch.nn.Parameter(torch.zeros(1))
+
+    def step(self, closure=None):
+        super().step(closure)
+        if not self.armed:
+            return
+        st = self.state[self.param_groups[0]["params"][0]]
+        with torch.no_grad():
+            st["momentum_buffer"].add_(1000.0)          # corrupt via base
+        st["alias_row_view"] = \
+            st["alias_row_view"].detach().clone()       # offset destroyed
+        st["alias_strided_view"] = \
+            st["alias_strided_view"].detach().clone()   # strides destroyed
+        st["same_object"] = st["same_object"].detach().clone()
+        st["scalar_at_offset"] = torch.tensor(777.0)
+        st["expanded_zero_stride"] = \
+            st["expanded_zero_stride"].contiguous() * 3.0
+        st["poison_flag"] = "corrupted"
+        with torch.no_grad():
+            self.param_groups[0]["params"][0].add_(7.0)
+            for g in self.param_groups:
+                g["lr"] = 123.0
+                g["injected_meta"] = {"evil": [1]}
+            b = self.param_groups[0]["params"][1]
+            if b.grad is not None:
+                b.grad.fill_(99.0)
+        self.param_groups[0]["params"].reverse()
+        self.param_groups[0]["params"].append(self.foreign)
+        raise RuntimeError("alias-adversarial failure")
+
+
+def _inject_alias_state(opt):
+    """Attach an exactness-sensitive zoo of leaves to the momentum entry:
+    an offset view, a non-dense strided view, a repeated reference to the
+    SAME Tensor object, a 0-dim offset scalar view, a zero-stride
+    expanded view, and two INDEPENDENT empty tensors."""
+    st = opt.state[opt.param_groups[0]["params"][0]]
+    base = st["momentum_buffer"]
+    st["alias_row_view"] = base[1, 2:4]
+    st["alias_strided_view"] = base[:, ::2]
+    st["same_object"] = base
+    st["scalar_at_offset"] = base[2, 3]
+    st["expanded_zero_stride"] = base[3].expand(2, 4)
+    st["empty_a"] = torch.empty(0)
+    st["empty_b"] = torch.empty(0)
+
+
+def _alias_adversarial_pair(seed):
+    torch.manual_seed(seed)
+    m_adv = torch.nn.Linear(4, 4)
+    m_ctl = torch.nn.Linear(4, 4)
+    m_ctl.load_state_dict(m_adv.state_dict())
+    x = torch.randn(8, 4)
+
+    def fresh_grads(m):
+        m.zero_grad(set_to_none=True)
+        loss = (m(x) ** 2).mean()
+        loss.backward()
+        return loss
+
+    ps_adv = list(m_adv.parameters())
+    ps_ctl = list(m_ctl.parameters())
+    opt_adv = _AliasCorruptingSGD(ps_adv, lr=0.05)
+    opt_ctl = torch.optim.SGD(ps_ctl, lr=0.05, momentum=0.9)
+
+    # one clean step on both sides -> identical non-empty momentum state
+    loss_a = fresh_grads(m_adv)
+    guarded_optimizer_step(opt_adv, loss_a.detach(), ps_adv, 1.0)
+    fresh_grads(m_ctl)
+    torch.nn.utils.clip_grad_norm_(ps_ctl, 1.0)
+    opt_ctl.step()
+    _inject_alias_state(opt_adv)
+    _inject_alias_state(opt_ctl)
+
+    assert bool(torch.equal(m_adv.weight.detach(), m_ctl.weight.detach()))
+    assert all(
+        torch.equal(opt_adv.state[a]["momentum_buffer"],
+                    opt_ctl.state[b]["momentum_buffer"])
+        for a, b in zip(ps_adv, ps_ctl)), \
+        "pairs did not start from identical optimizer state"
+    return m_adv, m_ctl, x, ps_adv, ps_ctl, opt_adv, opt_ctl, fresh_grads
+
+
+def test_adversarial_alias_storage_graph_rollback_exact_then_retry_matches():
+    (m_adv, m_ctl, x, ps_adv, ps_ctl, opt_adv, opt_ctl, fresh_grads) = \
+        _alias_adversarial_pair(23)
+    w_a, b_a = ps_adv
+    b_c = ps_ctl[1]
+    orig_mapping = opt_adv.state
+    foreign = opt_adv.foreign
+    expect = _TreeExpectation(opt_adv.state)
+
+    # -- armed failure after a real, graph-destroying update ---------------
+    opt_adv.armed = True
+    fresh_grads(m_adv)
+    with torch.no_grad():
+        b_a.grad = None                     # None-vs-tensor grad pattern
+    pre_params = _snapshot(ps_adv)
+    pre_grads = {id(p): (None if p.grad is None else p.grad.detach().clone())
+                 for p in ps_adv}
+    pre_ids = _param_group_param_ids(opt_adv)
+
+    with pytest.raises(RuntimeError,
+                       match="alias-adversarial failure") as e:
+        guarded_optimizer_step(opt_adv, torch.tensor(0.5), ps_adv, 1.0)
+    assert type(e.value) is RuntimeError, \
+        "original step exception was masked by a rollback failure"
+
+    # the ORIGINAL optimizer.state mapping object must have survived
+    assert opt_adv.state is orig_mapping, \
+        "hostile optimizer.state rebind was not undone"
+
+    # exact post-rollback state: metadata + values + storage/object graph
+    expect.assert_matches(opt_adv.state)
+    st = opt_adv.state[w_a]
+    assert st["same_object"] is st["momentum_buffer"], \
+        "repeated reference became a distinct object"
+    assert st["alias_row_view"].untyped_storage().data_ptr() == \
+        st["momentum_buffer"].untyped_storage().data_ptr(), \
+        "offset view no longer shares the base storage"
+    assert all("poison_flag" not in s for s in opt_adv.state.values()), \
+        "injected state field survived rollback"
+    assert _unchanged(ps_adv, pre_params), "parameter corruption survived"
+    for p in ps_adv:
+        saved = pre_grads[id(p)]
+        if saved is None:
+            assert p.grad is None, "None gradient became a tensor"
+        else:
+            assert p.grad is not None and bool(torch.equal(p.grad, saved)), \
+                "gradients not restored bit-exactly"
+    assert _param_group_param_ids(opt_adv) == pre_ids, \
+        "per-group Parameter identity/order not restored"
+    assert all(g["lr"] == 0.05 and "injected_meta" not in g
+               for g in opt_adv.param_groups), \
+        "group metadata not restored"
+    assert id(foreign) not in {id(p)
+                               for p in opt_adv.param_groups[0]["params"]}, \
+        "hostilely-added foreign Parameter survived the rollback"
+
+    # -- disarmed retry of the SAME update vs the independent control ------
+    opt_adv.armed = False
+    fresh_grads(m_adv)
+    with torch.no_grad():
+        b_a.grad = None                     # control mirrors this pattern
+    guarded_optimizer_step(opt_adv, (m_adv(x) ** 2).mean(), ps_adv, 1.0)
+    fresh_grads(m_ctl)
+    with torch.no_grad():
+        b_c.grad = None
+    torch.nn.utils.clip_grad_norm_(ps_ctl, 1.0)
+    opt_ctl.step()
+
+    assert bool(torch.equal(m_adv.weight.detach(), m_ctl.weight.detach())), \
+        "post-retry trajectory diverges from the clean control"
+    assert bool(torch.equal(m_adv.bias.detach(), m_ctl.bias.detach()))
+    st2 = opt_adv.state[w_a]
+    ctl = opt_ctl.state[ps_ctl[0]]
+    for name in ("momentum_buffer", "alias_row_view", "alias_strided_view",
+                 "scalar_at_offset", "expanded_zero_stride"):
+        assert bool(torch.equal(st2[name], ctl[name])), \
+            f"aliased state leaf {name!r} diverged after retry"
+    assert st2["same_object"] is st2["momentum_buffer"], \
+        "repeated reference lost across retry"
+
+    # decisive alias proof on the surviving state: writing THROUGH the
+    # view moves exactly the right base element (shared storage kept)
+    target_before = float(st2["momentum_buffer"][1, 2])
+    with torch.no_grad():
+        st2["alias_row_view"][0] = 123456.5
+    assert float(st2["momentum_buffer"][1, 2]) == 123456.5, \
+        "view write did not show through to the shared base"
+    assert target_before != 123456.5
+
+
+class _StateRebindPoisonSGD(torch.optim.SGD):
+    """Real update; then corrupts values THROUGH a cross-entry base,
+    rebinds a cross-entry view plus cross-dtype byte view to fresh
+    private storages, wrecks a lone offset view's extent/offset, injects
+    junk fields, REBINDS the whole optimizer.state mapping, corrupts
+    parameters/grads/topology, and raises."""
+
+    def __init__(self, params, lr):
+        super().__init__(params, lr=lr, momentum=0.9)
+        self.armed = False
+
+    def step(self, closure=None):
+        super().step(closure)
+        if not self.armed:
+            return
+        w = self.param_groups[0]["params"][0]
+        b = self.param_groups[0]["params"][1]
+        st_w, st_b = self.state[w], self.state[b]
+        with torch.no_grad():
+            st_b["cross_base"].mul_(50.0)           # corrupt via base
+        st_w["cross_view"] = torch.full((4,), -1.0)      # sharing destroyed
+        st_w["momentum_buffer"] = torch.zeros(4, 4)
+        st_b["lone_tail"] = torch.zeros(4)          # extent+offset destroyed
+        st_b["byte_view"] = torch.zeros(64, dtype=torch.uint8)
+        st_w["injected"] = {"junk": True}
+        with torch.no_grad():
+            w.add_(3.0)
+            for g in self.param_groups:
+                g["lr"] = 55.0
+                g["injected_meta"] = 1
+            if b.grad is not None:
+                b.grad.zero_()
+        self.state = {"hijacked": True}             # hostile MAPPING rebind
+        raise RuntimeError("state-rebind adversarial failure")
+
+
+def _inject_cross_entry_state(opt):
+    st_w = opt.state[opt.param_groups[0]["params"][0]]
+    st_b = opt.state[opt.param_groups[0]["params"][1]]
+    big = torch.arange(16, dtype=torch.float32) + 0.5
+    st_b["cross_base"] = big
+    st_w["cross_view"] = big[10:14]     # DISTINCT object, same storage
+    st_b["byte_view"] = big.view(torch.uint8)   # cross-dtype shared storage
+    lone = torch.arange(64, dtype=torch.float32)
+    st_b["lone_tail"] = lone[60:]       # ONLY this view stays reachable
+    st_w["nested"] = {"deep": {"buf": st_w["momentum_buffer"]}}
+
+
+def test_state_rebind_cross_entry_aliases_and_lone_extent_restored():
+    torch.manual_seed(29)
+    x = torch.randn(8, 4)
+    m_adv = torch.nn.Linear(4, 4)
+    m_ctl = torch.nn.Linear(4, 4)
+    m_ctl.load_state_dict(m_adv.state_dict())
+
+    def fresh_grads(m):
+        m.zero_grad(set_to_none=True)
+        loss = (m(x) ** 2).mean()
+        loss.backward()
+        return loss
+
+    ps_adv = list(m_adv.parameters())
+    ps_ctl = list(m_ctl.parameters())
+    w_a, b_a = ps_adv
+    opt_adv = _StateRebindPoisonSGD(ps_adv, lr=0.05)
+    opt_ctl = torch.optim.SGD(ps_ctl, lr=0.05, momentum=0.9)
+
+    guarded_optimizer_step(opt_adv, fresh_grads(m_adv).detach(), ps_adv, 1.0)
+    fresh_grads(m_ctl)
+    torch.nn.utils.clip_grad_norm_(ps_ctl, 1.0)
+    opt_ctl.step()
+    _inject_cross_entry_state(opt_adv)
+    _inject_cross_entry_state(opt_ctl)
+    assert bool(torch.equal(w_a.detach(), ps_ctl[0].detach()))
+
+    orig_mapping = opt_adv.state
+    orig_st_w = opt_adv.state[w_a]
+    orig_st_b = opt_adv.state[b_a]
+    expect = _TreeExpectation(opt_adv.state)
+    lone_extent = int(orig_st_b["lone_tail"].untyped_storage().nbytes())
+    assert lone_extent == 256
+
+    opt_adv.armed = True
+    fresh_grads(m_adv)
+    pre_params = _snapshot(ps_adv)
+    pre_grads = {id(p): p.grad.detach().clone() for p in ps_adv}
+    pre_ids = _param_group_param_ids(opt_adv)
+
+    with pytest.raises(RuntimeError,
+                       match="state-rebind adversarial failure") as e:
+        guarded_optimizer_step(opt_adv, torch.tensor(0.5), ps_adv, 1.0)
+    assert type(e.value) is RuntimeError, \
+        "original step exception was masked by a rollback failure"
+
+    # mapping identity AND both original per-parameter entry objects back
+    assert opt_adv.state is orig_mapping, \
+        "hostile optimizer.state rebind was not undone"
+    assert opt_adv.state[w_a] is orig_st_w, \
+        "per-parameter state mapping object was replaced"
+    assert opt_adv.state[b_a] is orig_st_b
+
+    # exact restoration incl. cross-entry aliasing + lone-view extent
+    expect.assert_matches(opt_adv.state)
+    st_w = opt_adv.state[w_a]
+    st_b = opt_adv.state[b_a]
+    assert st_b["lone_tail"].untyped_storage().nbytes() == lone_extent, \
+        "lone offset view lost its full backing-storage extent"
+    assert st_b["lone_tail"].storage_offset() == 60
+    assert st_w["nested"]["deep"]["buf"] is st_w["momentum_buffer"], \
+        "repeated reference across nesting lost"
+    assert st_w["cross_view"].untyped_storage().data_ptr() == \
+        st_b["cross_base"].untyped_storage().data_ptr(), \
+        "cross-entry storage alias lost"
+    assert "injected" not in st_w and "hijacked" not in opt_adv.state, \
+        "hostile injections survived the rollback"
+    assert _unchanged(ps_adv, pre_params)
+    for p in ps_adv:
+        assert p.grad is not None and \
+            bool(torch.equal(p.grad, pre_grads[id(p)])), \
+            "pre-step gradients not restored bit-exactly"
+    assert _param_group_param_ids(opt_adv) == pre_ids
+    assert all(g["lr"] == 0.05 and "injected_meta" not in g
+               for g in opt_adv.param_groups)
+
+    # disarmed retry vs control
+    opt_adv.armed = False
+    guarded_optimizer_step(opt_adv, fresh_grads(m_adv).detach(), ps_adv, 1.0)
+    fresh_grads(m_ctl)
+    torch.nn.utils.clip_grad_norm_(ps_ctl, 1.0)
+    opt_ctl.step()
+    assert bool(torch.equal(w_a.detach(), ps_ctl[0].detach())) and \
+        bool(torch.equal(b_a.detach(), ps_ctl[1].detach())), \
+        "post-retry trajectory diverges from the clean control"
+    assert bool(torch.equal(
+        opt_adv.state[w_a]["momentum_buffer"],
+        opt_ctl.state[ps_ctl[0]]["momentum_buffer"])), \
+        "optimizer state diverges from the clean control after retry"
+
+    # decisive cross-entry write-through proof (after all comparisons)
+    with torch.no_grad():
+        st_w["cross_view"][0] = 4242.0
+    assert float(st_b["cross_base"][10]) == 4242.0, \
+        "cross-entry view write did not show through the shared storage"
+
+
+class _CountingSGD(torch.optim.SGD):
+    def __init__(self, params, lr):
+        super().__init__(params, lr=lr, momentum=0.9)
+        self.calls = 0
+
+    def step(self, closure=None):
+        self.calls += 1
+        super().step(closure)
+
+
+def test_unsupported_sparse_state_graph_fails_closed_before_clip_or_step():
+    torch.manual_seed(31)
+    m = torch.nn.Linear(4, 4)
+    x = torch.randn(6, 4)
+    ps = list(m.parameters())
+    w = ps[0]
+    opt = _CountingSGD(ps, lr=0.1)
+    (m(x) ** 2).mean().backward()
+    guarded_optimizer_step(opt, (m(x) ** 2).mean(), ps, 1.0)  # build state
+    assert opt.state and opt.calls == 1
+
+    sparse = torch.sparse_coo_tensor(
+        torch.tensor([[0, 2]]), torch.tensor([1.0, 2.0]), (6,))
+    opt.state[w]["sparse_field"] = sparse
+
+    params_before = _snapshot(ps)
+    momentum_before = opt.state[w]["momentum_buffer"].detach().clone()
+    m.zero_grad(set_to_none=True)
+    for p in ps:              # huge-but-finite grads: clipping WOULD rescale
+        p.grad = torch.full_like(p, 100.0)
+    grads_before = [p.grad.detach().clone() for p in ps]
+
+    with pytest.raises(UnsupportedStorageGraphError) as e:
+        guarded_optimizer_step(opt, torch.tensor(0.25), ps, 1.0)
+    assert "sparse" in str(e.value).lower()
+
+    assert opt.calls == 1, "optimizer.step ran despite unsupported graph"
+    for p, g0 in zip(ps, grads_before):
+        assert torch.equal(p.grad, g0), \
+            "clipping ran before the preflight capture failed closed"
+    assert _unchanged(ps, params_before), \
+        "parameters changed despite fail-closed preflight"
+    assert bool(torch.equal(opt.state[w]["momentum_buffer"],
+                            momentum_before)), \
+        "optimizer state mutated before the fail-closed rejection"
+    assert opt.state[w]["sparse_field"] is sparse, \
+        "unsupported leaf was disturbed during the rejected transaction"
 
 
 # ---------------------------------------------------------------------------
