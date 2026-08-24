@@ -4,7 +4,10 @@ Status vocabulary: `HYPOTHESIS` `SCAFFOLDED` `UNIT_VERIFIED` `MODEL_VERIFIED`
 `REPLICATED` `REJECTED_BY_EVIDENCE` `BLOCKED` (plus NOT_STARTED / NOT MEASURED).
 A file or class existing is never evidence of maturity by itself.
 
-Updated: 2026-08-22 (state probe + MLX blocker probe measured).
+Updated: 2026-08-24 (execution environment aligned with owner decision —
+see VISION.md "Deployment environment truth"; all measurement rows below are
+historical results and unchanged). Earlier: 2026-08-22 (state probe + MLX
+blocker probe measured).
 
 ## Current status table
 
@@ -70,6 +73,11 @@ temporal-update checks. Stable project snapshot: separate expensive-once LCC
 path. Never instance-compilation as working memory.
 
 ## Go/no-go gates
+
+Execution environment (owner decision 2026-08-24): serious 4B/27B training
+and CUDA experiment matrices run on rented Vast.ai GPUs, only after the
+fail-closed no-spend READY gate; the local laptop runs unit/smoke tests,
+artifact validation and orchestration only (VISION.md).
 
 Proxy gate (before any 27B work): ≥1.5× end-to-end wall-clock speedup vs
 native visible CoT on reasoning-heavy deterministic tasks; ≤2 pp absolute

@@ -21,16 +21,16 @@ back to the model as working memory.
 
 ## Final target
 
-**`Qwen/Qwen3.8-27B`** — the single release target and local product
-benchmark. Runtime must not depend on closed APIs or unavailable hidden
-states. Verified 2026-08-22: model card exists (Apache-2.0), Transformers has
-a `qwen3_5` implementation module covering the hybrid architecture.
+**`Qwen/Qwen3.8-27B`** — the single release target. Runtime must not depend
+on closed APIs or unavailable hidden states. Verified 2026-08-22: model card
+exists (Apache-2.0), Transformers has a `qwen3_5` implementation module
+covering the hybrid architecture.
 
 ### Model ladder
 
 | Role | Model |
 |---|---|
-| Release target / local product benchmark | `Qwen/Qwen3.8-27B` |
+| Release target | `Qwen/Qwen3.8-27B` |
 | Primary scientific proxy | `Qwen/Qwen3.5-4B` |
 | Fast smoke/debug proxy | `Qwen/Qwen3.5-0.8B` (verified smallest open hybrid; ~1.75 GB bf16) |
 | Mock/unit backend | deterministic tiny implementation, no model |
@@ -82,13 +82,22 @@ ADR-001 and LATENT_ROADMAP.md for alternatives considered and rejected.
 
 ## Deployment environment truth
 
-Primary local machine at time of writing: Apple Silicon, 16 GB unified
-memory (measured M1 Pro; original plan assumed M4/32 GB). Consequences:
+Owner decision (2026-08-24):
 
-- small-model inference and mock experiments: local;
-- scientific training of the proxy: local-if-feasible or CUDA;
-- 27B adapter training: reproducible remote CUDA config (not yet provisioned);
-- final quantized inference benchmark: local Mac.
+- all serious 4B/27B training and CUDA experiment matrices run on rented
+  Vast.ai GPUs, and only after the fail-closed no-spend READY gate;
+- the local laptop (Apple Silicon, 16 GB unified memory; measured M1 Pro,
+  original plan assumed M4/32 GB) is for unit tests, smoke tests, artifact
+  validation, and orchestration only — it is not a 27B training or final
+  performance benchmark machine;
+- AWS is out of the active plan;
+- final 27B inference/performance validation runs later on a separate server
+  supplied by the owner on request;
+- MLX probes measured on this laptop (BLOCKERS.md B5/B6) remain valid
+  historical evidence, but MLX on this laptop is not the mandatory final
+  benchmark/backend and is not the release gate.
 
-PyTorch/Transformers is the research backend; MLX is the mandatory final
-local benchmark backend (blockers tracked in BLOCKERS.md).
+PyTorch/Transformers is the research backend for gated remote runs. No
+hardware is rented by documentation; provisioning happens only through the
+gated Vast.ai path (`latent_lab/bench/vast_provision.py`,
+`latent_lab/bench/remote_driver.sh`) and never as a side effect of docs.

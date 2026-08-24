@@ -1,6 +1,13 @@
 # Blockers — measured runtime facts
 
-Updated: 2026-08-22. Each entry: claim, measurement, status.
+Updated: 2026-08-24. Each entry: claim, measurement, status.
+
+Execution environment (owner decision 2026-08-24): serious 4B/27B training
+and CUDA experiment matrices run on rented Vast.ai GPUs behind the fail-closed
+no-spend READY gate; this laptop runs unit/smoke tests, artifact validation,
+and orchestration only; final 27B validation runs later on an owner-supplied
+server. MLX entries below are preserved as measured historical evidence — MLX
+on this laptop is not the release gate (VISION.md).
 
 ## B1 — Local hardware below original assumption
 
