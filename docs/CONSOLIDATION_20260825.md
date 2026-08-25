@@ -78,4 +78,7 @@ branch.
 - Offline live eval: successful, 13 calls spent from a hard budget of 24.
 - `uv build`: source distribution and wheel built successfully.
 - Wheel inspection: `evals` package present after the integration fix.
+- Ruff: 163 findings on the pre-consolidation base and 163 after integration;
+  the integrated `evals` package and its tests have 0 findings. The historical
+  baseline findings were not rewritten as part of consolidation.
 - No real-provider live-model evaluation or new GPU experiment was run.
