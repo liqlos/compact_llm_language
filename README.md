@@ -64,10 +64,17 @@ fail-open — so nothing happens invisibly "until the end".
 ## Tests & benchmark
 
 ```bash
-uv sync && uv run pytest          # 93 tests: unit, security, properties, integration
-uvx ruff check rcc bench tests    # lint
+uv sync && uv run pytest          # 109 tests: unit, security, properties,
+                                  # integration, live-eval harness
+uvx ruff check rcc bench tests evals    # lint
 uv run python -m bench.run_bench --exact --json .rcc_bench/results.json
+uv run python -m evals.run_live_eval --provider fake   # live-eval harness (offline fixture)
 ```
+
+Live-model evaluation (`evals/`): replays the five scenarios baseline vs
+compiled, scores fact recall / citations / constraints over real model answers
+via any OpenAI-compatible endpoint (bounded ≤ 15 calls, key env-only). Usage:
+`docs/research-context-compiler/LIVE_EVAL.md`.
 
 Measured (o200k_base, exact tokenizer): peak active context −61…−78% on
 representative scenarios; fact recall via expansion 100%; cumulative spend
@@ -88,7 +95,7 @@ representative scenarios; fact recall via expansion 100%; cumulative spend
 | 5.3 Compressor plug point + gate | interface DONE; live compressor pending provider |
 | 6 Dictionary encoding (JSONL) | DONE |
 | 7 Break-even gate | DONE (deterministic core; q/N calibration = future measurement) |
-| Live-model evaluation | NOT_STARTED — next |
+| Live-model evaluation | harness DONE + fixture-tested; real-model run pending configured provider |
 
 ```
 rcc/            core library (tokens, store, scratch, session, journal,

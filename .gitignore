@@ -4,3 +4,4 @@ __pycache__/
 .rcc_bench/
 .rcc_data/
 .venv/
+.rcc_eval/
