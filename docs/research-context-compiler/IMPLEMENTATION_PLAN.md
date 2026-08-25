@@ -1,5 +1,9 @@
 # Research Context Compiler — Implementation Plan
 
+This is a historical implementation record, not the current autonomous work
+queue. Current direction and maturity live in `VISION.md` and
+`LATENT_ROADMAP.md`; contribution rules live in `CONTRIBUTING.md`.
+
 Status legend (legacy phases): `NOT_STARTED` / `IN_PROGRESS` / `BLOCKED` / `DONE` / `REJECTED_BY_EVIDENCE`
 
 > **2026-08-22 strategic reset:** the project's end-state is now latent
@@ -216,10 +220,10 @@ When white-box access becomes available, atoms map naturally onto slot
 embeddings (one embedding per atom ≈ typed soft token), preserving the
 provenance/exactness semantics.
 
-## 8. Next highest-ROI action
+## 8. Historical next action and current status
 
-All deterministic layers are now implemented and tested (93 tests). The
-largest remaining unknown cannot be closed offline: **live-model evaluation**
+At the time of the original plan, the largest remaining unknown could not be
+closed offline: **live-model evaluation**
 — do downstream LLMs actually answer correctly over `[OBS …]` stubs + RIR/1
 blocks, and how does mode routing affect answer quality? Evidence: every
 risk in §5 that remains open ("no model has been prompted with it") blocks
@@ -240,8 +244,6 @@ scenarios do not exercise RIR/1 or the router, so claims are narrowed to the
 one focused eval-local `rir_state` case (minimal `<SCRATCH>` comprehension
 probe under EXPERT routing). Fixture-tested: parity at −62% context tokens on
 the tool channel; honest-unavailability on the closed channel. See
-`LIVE_EVAL.md`. Remaining open item: one real provider run — no provider was
+`LIVE_EVAL.md`. Remaining measurement: one real-provider run — no provider was
 already configured in this environment (no API keys, no local chat-model
-service), so it stays a documented, single-command follow-up rather than a
-code task.
-
+service). It is an owner-approved experiment, not an automatic code task.

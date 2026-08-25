@@ -4,27 +4,25 @@ Status vocabulary: `HYPOTHESIS` `SCAFFOLDED` `UNIT_VERIFIED` `MODEL_VERIFIED`
 `REPLICATED` `REJECTED_BY_EVIDENCE` `BLOCKED` (plus NOT_STARTED / NOT MEASURED).
 A file or class existing is never evidence of maturity by itself.
 
-Updated: 2026-08-24 (execution environment aligned with owner decision —
-see VISION.md "Deployment environment truth"; all measurement rows below are
-historical results and unchanged). Earlier: 2026-08-22 (state probe + MLX
-blocker probe measured).
+Updated: 2026-08-25 (live-eval harness and consolidated runtime evidence).
+Measurements remain historical snapshots unless a row names a current receipt.
 
 ## Current status table
 
 | Capability | Status | Evidence |
 |---|---|---|
-| Raw byte storage (content-addressed, hash-verified) | UNIT_VERIFIED | 102+ tests incl. tamper/roundtrip |
+| Raw byte storage (content-addressed, hash-verified) | UNIT_VERIFIED | tamper/roundtrip regression coverage |
 | Observation masking → stubs + deterministic expansion | UNIT_VERIFIED | unit + property + benchmark tests; P0 wrapper-escape/traversal/corruption fixed with regression tests |
 | Manual symbolic scratch RIR/1 | SCAFFOLDED | unit tests; no live-model comprehension check |
 | Journal checkpoint/restore | UNIT_VERIFIED | incl. dedup-index restore regression test |
 | Router / dictenc / break-even gate | SCAFFOLDED (experimental) | unit tests only; no measured task benefit |
-| Behavioral fidelity of compiled context | NOT MEASURED | no live-model run exists |
+| Behavioral fidelity of compiled context | NOT MEASURED | deterministic fixture only; no real-provider run exists |
 | Model-directed expansion (access-lossless) | HYPOTHESIS | design only |
-| Latent pipeline plumbing (latent_lab) | UNIT_VERIFIED (mock) | 39+ tests: no-decode loop contract, K causality, ablations, provenance verifier |
+| Latent pipeline plumbing (latent_lab) | UNIT_VERIFIED (mock) | no-decode loop contract, K causality, ablations, provenance verifier |
 | Toy recurrence trainer (T1 analog) | UNIT_VERIFIED | loss 7.58→0.016, acc 100% vs 6.25% under loop ablation ⇒ latent path causally used at toy scale |
 | **Real Qwen hybrid runtime control** | MODEL_VERIFIED (Qwen3.5-0.8B proxy) | state probe JSON: cache snapshot/restore exact, inputs_embeds ok, K=3 recurrence with 0 lm_head calls, 16.9 ms/step MPS fp16 |
 | MLX soft-embedding path | MEASURED / PARTIALLY BLOCKED | exact-vocab embeds bit-exact & fast; off-manifold inputs slow ~3.5–5×; hybrid prefix-cache trim unsupported |
-| Localized recurrence quality/speedup | NOT MEASURED | requires T1/T2 on proxy |
+| Localized recurrence quality/speedup | MODEL_MEASURED @ Qwen3.5-2B; causal advantage not robust; speedup not validated | T1/T2 suite v2 and ablations below; see `latent_lab/bench/GATE_SUMMARY.md` |
 | Qwen3.8-27B speedup ≥2× | NOT MEASURED | gated by proxy gate below |
 
 ## Stages

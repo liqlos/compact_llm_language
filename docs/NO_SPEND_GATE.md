@@ -140,9 +140,11 @@ The gate is read-only over an isolated private COPY of historical
 moved, deleted, executed beyond deserialization, or sent off-device. No
 cloud, GPU, training, or paid service is touched by design.
 
-## Result on this evidence set (2026-08-24)
+## Historical result on the pre-fix evidence set (2026-08-24)
 
-NOT_READY — evidence-backed, never hardcoded: an in-suite positive control
+The snapshot evaluated on 2026-08-24 was NOT_READY — evidence-backed, never
+hardcoded. This section is provenance, not the current spend authorization. An
+in-suite positive control
 (`tests/test_no_spend_gate.py::...READY_positive_control_exit0_path`)
 proves READY fires when every prerequisite genuinely holds, and the
 verdict for any given tree is recomputed from its artifacts on every run.
@@ -151,7 +153,12 @@ legacy-unbound bf16 checkpoints, unrescorable derived-only eval records
 (no raw per-candidate scores), missing trainable-precision fields,
 poisoned selection provenance, live-tree duplication of the rejected NaN
 batch, and missing per-split eval coverage/identity bindings — see the
-generated `GATE_REPORT.md` for the exact current list. The gate was NOT
+generated report for that run's exact list. The gate was NOT
 weakened to produce READY; 45 negative controls (audit-reproduced
 fail-opens) now fail closed and each is pinned by a test that fails on
 the pre-fix commit `3774569`.
+
+Later retained receipts are `.rcc_work/rcc.pre_spend.v2.json` (READY at its
+recorded revision) and `.rcc_work/rcc.canary_attempt.v1.json` (fail-stop before
+training/model contact). Neither is a standing authorization: rerun and inspect
+the gate against the exact current inputs before any new spend.

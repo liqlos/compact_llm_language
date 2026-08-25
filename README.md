@@ -2,11 +2,18 @@
 
 **Strategic direction (2026-08-22):** RCC is pivoting to latent cognition on
 open-weight Qwen (`Qwen/Qwen3.8-27B` release target; Qwen3.5 proxies).
-See `docs/research-context-compiler/VISION.md`, `ADR-001`,
-`LATENT_ROADMAP.md`, `EVALUATION_PROTOCOL.md`, `BLOCKERS.md`.
+Document authority:
+
+- current direction and decisions: `VISION.md` and `ADR-001`;
+- current maturity and gates: `LATENT_ROADMAP.md`;
+- contribution/integration process: `CONTRIBUTING.md`;
+- experiment protocols: `EVALUATION_PROTOCOL.md`, `LIVE_EVAL.md`, and
+  `docs/NO_SPEND_GATE.md`;
+- historical implementation/evidence records: `IMPLEMENTATION_PLAN.md` and
+  `BLOCKERS.md` (not an autonomous task queue).
 
 The existing package is the **evidence substrate**: it is storage-lossless,
-deterministic and auditable — but no live model has ever been run against
+deterministic and auditable — but no real-provider live model has been run against
 compiled context, so behavioral fidelity is NOT MEASURED and no speedup is
 claimed anywhere below.
 
@@ -33,7 +40,7 @@ timeline()   ─► live per-turn audit: what is inline/masked/failopen + tokens
 - **Storage-lossless**: masked ≠ lost. `expand()` returns the full original
   bytes, SHA-256 verified on every read. No referential dangling by
   construction. (Access-losslessness and behavioral fidelity are separate,
-  weaker claims — see VISION.md; both unmeasured with a live model.)
+  weaker claims — see VISION.md; both unmeasured with a real-provider model.)
 - **Prefix-stable**: stubs are written once and never rewritten; the RIR/1
   block only appends → prompt-prefix caching stays valid across turns.
 - **Fine-fact guard**: numeric tokens in machine-state atoms must appear
@@ -105,11 +112,11 @@ unreadable inputs, inputs mutated mid-run, unwritable outputs). `--out` may
 never overlap an input root. Every known fail-open is a blocker; negative
 controls for each audited fail-open are pinned in
 `tests/test_no_spend_gate.py`.
-Canonical outputs under `.rcc_work/no_spend_gate_20260824/` are byte-stable
-across reruns against unchanged inputs and contain no wall-clock value (the
-only timestamp lives in the separate `telemetry_timestamp.json`).
-Current verdict and blocker codes: see `.rcc_work/no_spend_gate_20260824/GATE_REPORT.md`
-(uncommitted evidence) and `docs/NO_SPEND_GATE.md`.
+Gate outputs are byte-stable across reruns against unchanged inputs and contain
+no wall-clock value (the timestamp is separate telemetry). Retained receipts are
+`.rcc_work/rcc.pre_spend.v2.json` and `.rcc_work/rcc.canary_attempt.v1.json`;
+rerun the gate before relying on either as current state. See
+`docs/NO_SPEND_GATE.md` for the contract and historical result.
 
 Live-model evaluation (`evals/`) replays the five benchmark scenarios plus a
 focused RIR/1+router case, baseline vs compiled, over an explicit expansion
