@@ -20,6 +20,7 @@ is adapted, so K>0 vs K=0 differences isolate the recurrence itself.
 from __future__ import annotations
 
 import contextlib
+import math
 from dataclasses import dataclass, field
 
 try:
@@ -110,15 +111,16 @@ class LoRALinear(_Base):
         for p in self.base.parameters():
             p.requires_grad_(False)
         self.scaling = alpha / r
-        dev, dt = next(base.parameters()).device, next(base.parameters()).dtype
-        self.lora_A = torch.nn.Parameter(torch.zeros(r, base.in_features,
-                                                     dtype=dt, device=dev))
-        self.lora_B = torch.nn.Parameter(torch.zeros(base.out_features, r,
-                                                     dtype=dt, device=dev))
+        # master LoRA weights are ALWAYS fp32, even over a bf16/fp16 base
+        dev = next(base.parameters()).device
+        self.lora_A = torch.nn.Parameter(torch.zeros(
+            r, base.in_features, dtype=torch.float32, device=dev))
+        self.lora_B = torch.nn.Parameter(torch.zeros(
+            base.out_features, r, dtype=torch.float32, device=dev))
         torch.nn.init.kaiming_uniform_(self.lora_A, a=5 ** 0.5)
 
     def forward(self, x):
-        # master LoRA weights stay fp32 even over a bf16 base layer
+        # fp32 LoRA math; result is cast back to the incoming activation dtype
         delta = ((x.to(self.lora_A.dtype) @ self.lora_A.transpose(0, 1))
                  @ self.lora_B.transpose(0, 1)) * self.scaling
         return self.base(x) + delta.to(x.dtype)
@@ -173,10 +175,13 @@ class LocalizedRecurrence:
 
     def __init__(self, model, tokenizer=None, *, interval, max_k=16,
                  lora_r=8, lora_alpha=16.0, use_clock=True,
-                 grad_checkpoint=True):
+                 grad_checkpoint=True, model_repo=None, model_revision=None):
         if torch is None:
             raise RuntimeError("torch required for LocalizedRecurrence")
         self.model = model
+        # explicit provenance binding (never silently defaulted by loaders)
+        self.model_repo = model_repo
+        self.model_revision = model_revision
         # frozen-backbone contract: nothing except LoRA/clock may train
         for p in model.parameters():
             p.requires_grad_(False)
@@ -199,7 +204,9 @@ class LocalizedRecurrence:
         self.guard = VocabGuard(model, tokenizer)
 
         dev = next(model.parameters()).device
-        self.clock = torch.nn.Embedding(max_k + 1, hidden, device=dev)
+        # clock trainables are ALWAYS fp32, independent of backbone dtype
+        self.clock = torch.nn.Embedding(max_k + 1, hidden, device=dev,
+                                        dtype=torch.float32)
         torch.nn.init.zeros_(self.clock.weight)
 
         self.injected = inject_lora(
@@ -365,6 +372,13 @@ class LocalizedRecurrence:
             lp = sum(float(logp[0, j, tid]) for j, tid in enumerate(cand))
             scores.append(lp)
         t3 = time.perf_counter()
+        # fail closed BEFORE ranking: a non-finite score must never decide
+        from ..train.checkpointing import NonFiniteMetricError
+        bad = [i for i, s in enumerate(scores) if not math.isfinite(s)]
+        if bad:
+            raise NonFiniteMetricError(
+                "candidate scoring produced non-finite log-probabilities "
+                f"at candidate indices {bad}; refusing to rank")
         order = sorted(range(len(scores)), key=lambda i: -scores[i])
         rep = RecurrenceReport(
             k_steps=k_steps, interval=self.interval,
@@ -417,20 +431,53 @@ class LocalizedRecurrence:
         return ps
 
     def adapter_state_dict(self):
-        """CPU clones of every trainable tensor (LoRA pairs + clock)."""
-        sd = {f"lora.{i}.A": l.lora_A.detach().to("cpu").clone()
+        """CPU fp32 clones of every trainable tensor (LoRA pairs + clock)."""
+        sd = {f"lora.{i}.A": l.lora_A.detach().to("cpu").to(
+                  torch.float32).clone()
               for i, l in enumerate(self.injected)}
-        sd.update({f"lora.{i}.B": l.lora_B.detach().to("cpu").clone()
+        sd.update({f"lora.{i}.B": l.lora_B.detach().to("cpu").to(
+                       torch.float32).clone()
                    for i, l in enumerate(self.injected)})
         if self.use_clock:
-            sd["clock.weight"] = self.clock.weight.detach().to("cpu").clone()
+            sd["clock.weight"] = self.clock.weight.detach().to("cpu").to(
+                torch.float32).clone()
         return sd
 
+    def adapter_spec(self) -> dict:
+        """Exact {key: {shape, dtype}} contract of this runtime's state."""
+        spec = {}
+        for i, l in enumerate(self.injected):
+            spec[f"lora.{i}.A"] = {"shape": tuple(l.lora_A.shape),
+                                   "dtype": str(l.lora_A.dtype)}
+            spec[f"lora.{i}.B"] = {"shape": tuple(l.lora_B.shape),
+                                   "dtype": str(l.lora_B.dtype)}
+        if self.use_clock:
+            spec["clock.weight"] = {"shape": tuple(self.clock.weight.shape),
+                                    "dtype": str(self.clock.weight.dtype)}
+        return spec
+
+    def adapter_metadata(self, extra: dict | None = None) -> dict:
+        """Provenance metadata bound to this runtime's explicit identity.
+
+        Raises unless (model_repo, model_revision) were BOTH provided —
+        model identity is never invented or defaulted here."""
+        from ..train.checkpointing import build_adapter_metadata
+        return build_adapter_metadata(
+            model_repo=self.model_repo, model_revision=self.model_revision,
+            spec=self.adapter_spec(), extra=extra)
+
     def load_adapter_state(self, sd):
+        """Prevalidate EVERYTHING before touching any runtime tensor.
+
+        Exact key set, tensor types, shapes, dtypes and finiteness are
+        checked first; a rejected payload leaves the runtime bit-identical.
+        """
+        from ..train.checkpointing import validate_adapter_state
+        validate_adapter_state(sd, self.adapter_spec())
         with torch.no_grad():
             for i, l in enumerate(self.injected):
                 l.lora_A.copy_(sd[f"lora.{i}.A"].to(l.lora_A.device))
                 l.lora_B.copy_(sd[f"lora.{i}.B"].to(l.lora_B.device))
-            if self.use_clock and "clock.weight" in sd:
+            if self.use_clock:
                 self.clock.weight.copy_(
                     sd["clock.weight"].to(self.clock.weight.device))
