@@ -23,6 +23,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from bench.scenarios import SCENARIOS
 from evals.harness import run_suite
 from evals.provider import FixtureClient, OpenAICompatClient
 from rcc import count_tokens
@@ -44,6 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="subset of scenario names (default: all five)")
     p.add_argument("--out", default=".rcc_eval/results.json",
                    help="where to write machine-readable results")
+    p.add_argument("--check", action="store_true",
+                   help="only ping the provider once and exit (no suite run)")
     return p
 
 
@@ -59,8 +62,26 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as e:  # noqa: BLE001 -- CLI boundary
             print(f"error: provider misconfigured: {e}", file=sys.stderr)
             return 2
+        if args.check:
+            try:
+                client.check()
+            except Exception as e:  # noqa: BLE001 -- CLI boundary
+                print(f"error: provider check failed: {e}", file=sys.stderr)
+                return 2
+            print(f"ok: {client.model} @ {client.base_url} answered")
+            return 0
     else:
+        if args.check:
+            print("ok: fake provider is always available")
+            return 0
         client = FixtureClient()
+
+    unknown = set(args.scenarios or []) - {sc.name for sc in SCENARIOS}
+    if unknown:
+        known = ", ".join(sorted(sc.name for sc in SCENARIOS))
+        print(f"error: unknown scenarios {sorted(unknown)}; known: {known}",
+              file=sys.stderr)
+        return 2
 
     report = run_suite(
         client,

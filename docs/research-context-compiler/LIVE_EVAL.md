@@ -53,6 +53,9 @@ No SDK or paid service is installed; a stdlib client POSTs to
 llama.cpp `llama-server`, LM Studio, vLLM.
 
 ```bash
+# optional pre-flight: one tiny completion to verify endpoint+model+auth
+uv run python -m evals.run_live_eval --provider openai-compat --check
+
 # local server (no key needed)
 RCC_EVAL_BASE_URL=http://127.0.0.1:11434/v1 RCC_EVAL_MODEL=llama3.1:8b \
     uv run python -m evals.run_live_eval --provider openai-compat \
@@ -68,6 +71,8 @@ Cost & privacy bounds, by construction:
 
 - at most `scenarios x 2 x (1 + max_expand_rounds)` completion calls
   (default ≤ 15), `temperature=0`, `--max-completion-tokens` cap (default 512);
+  transient failures (connection errors, HTTP 429/5xx) are retried with
+  bounded exponential backoff — auth/4xx errors are not retried;
 - the API key comes from args or `RCC_EVAL_API_KEY` **only**, and is never
   logged or serialized (`config.api_key` is always `null`);
 - no other environment state is touched; results land under `.rcc_eval/`
