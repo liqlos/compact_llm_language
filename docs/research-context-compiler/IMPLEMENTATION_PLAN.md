@@ -218,10 +218,18 @@ exact-fact recall / citation presence / constraint adherence per run.
 **Update (2026-08-25): harness DONE** — `evals/` implements exactly that shape,
 provider-neutral (any OpenAI-compatible endpoint or a deterministic fixture),
 with a bounded EXPAND protocol so compiled-mode facts are reachable the way
-RCC intends them to be. Fixture-tested (16 tests; parity at −64% context
-tokens, differentiation without expansion). See
-`docs/research-context-compiler/LIVE_EVAL.md`. Remaining open item: one real
-provider run — no provider was already configured in this environment (no API
-keys, no local chat-model service), so it stays a documented, single-command
-follow-up rather than a code task.
+RCC intends them to be. Ground-truth vectors + scoring dimensions from the
+support-lane spec (`GROUND_TRUTH_SPEC.md`) are incorporated: EF/CIT/CON/INJ
+dimensions, explicit expansion channel per result (tool/closed, never compared
+cross-channel), control-pair marking for the byte-identical injection case,
+hard call budget with partial-result isolation, versioned results with policy/
+tokenizer/model/context-hash/raw-response records. Scope honesty: the bench
+scenarios do not exercise RIR/1 or the router, so claims are narrowed to the
+one focused eval-local `rir_state` case (minimal `<SCRATCH>` comprehension
+probe under EXPERT routing). Fixture-tested: parity at −62% context tokens on
+the tool channel; honest-unavailability on the closed channel. See
+`LIVE_EVAL.md`. Remaining open item: one real provider run — no provider was
+already configured in this environment (no API keys, no local chat-model
+service), so it stays a documented, single-command follow-up rather than a
+code task.
 

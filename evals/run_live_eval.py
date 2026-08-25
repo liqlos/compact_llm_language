@@ -12,9 +12,13 @@ Real run (any OpenAI-compatible endpoint; local servers need no key):
     RCC_EVAL_BASE_URL=https://api.openai.com/v1 RCC_EVAL_MODEL=gpt-4o-mini \
         RCC_EVAL_API_KEY=... uv run python -m evals.run_live_eval --provider openai-compat
 
-Bounded by construction: at most scenarios x 2 x (1 + max_expand_rounds)
-completion calls (default <= 15), temperature 0, capped completion tokens.
-The API key is read from the environment only and is never logged or written.
+Expansion channels (--expansion): `tool` (default) lets the model request
+evidence via EXPAND lines; `closed` removes that option entirely -- compiled
+fact recall is never scored there, only honest unavailability (EF3); `both`
+runs each task in both channels as separate, non-comparable measurements.
+Results are versioned machine-readable JSON including policy/tokenizer/model
+params, per-result context hashes, raw responses and errors; a hard call
+budget isolates partial results when exhausted.
 """
 
 from __future__ import annotations
@@ -24,8 +28,8 @@ import sys
 from pathlib import Path
 
 from bench.scenarios import SCENARIOS
-from evals.harness import run_suite
-from evals.provider import FixtureClient, OpenAICompatClient
+from evals.harness import RIR_CASE, run_suite
+from evals.provider import FakeProvider, OpenAICompatClient
 from rcc import count_tokens
 
 
@@ -40,9 +44,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout-s", type=float, default=60.0)
     p.add_argument("--max-completion-tokens", type=int, default=512)
     p.add_argument("--max-expand-rounds", type=int, default=1,
-                   help="bounded expansion rounds per task (cost of recovery)")
+                   help="bounded expansion rounds per task (tool channel)")
+    p.add_argument("--expansion", choices=("tool", "closed", "both"), default="tool",
+                   help="expansion channel; arms are never compared cross-channel")
+    p.add_argument("--max-calls", type=int, default=None,
+                   help="hard total-call budget (default: computed suite bound)")
     p.add_argument("--scenarios", nargs="*", default=None,
-                   help="subset of scenario names (default: all five)")
+                   help="subset of scenario names (default: all six)")
     p.add_argument("--out", default=".rcc_eval/results.json",
                    help="where to write machine-readable results")
     p.add_argument("--check", action="store_true",
@@ -74,11 +82,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.check:
             print("ok: fake provider is always available")
             return 0
-        client = FixtureClient()
+        client = FakeProvider()
 
-    unknown = set(args.scenarios or []) - {sc.name for sc in SCENARIOS}
+    unknown = set(args.scenarios or []) - ({sc.name for sc in SCENARIOS} | {RIR_CASE.name})
     if unknown:
-        known = ", ".join(sorted(sc.name for sc in SCENARIOS))
+        known = ", ".join(sorted({sc.name for sc in SCENARIOS} | {RIR_CASE.name}))
         print(f"error: unknown scenarios {sorted(unknown)}; known: {known}",
               file=sys.stderr)
         return 2
@@ -89,16 +97,23 @@ def main(argv: list[str] | None = None) -> int:
         tokenizer=count_tokens,
         max_expand_rounds=args.max_expand_rounds,
         scenario_filter=args.scenarios,
+        expansion=args.expansion,
+        max_calls=args.max_calls,
     )
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(report.to_json(), encoding="utf-8")
 
-    for mode, agg in report.summary_by_mode().items():
-        print(f"{mode:<9} recall={agg['mean_fact_recall']:.2f} "
-              f"cites={agg['citations_rate']:.2f} "
+    for arm, agg in report.summary_by_arm().items():
+        print(f"{arm:<16} ef1={agg['mean_ef1_recall']:.2f} "
+              f"ef2={agg['mean_ef2_numeric_integrity']:.2f} "
+              f"crit_fail={agg['critical_fails']} "
               f"ctx_tok={agg['total_context_tokens']:,} "
-              f"expand_reads={agg['expand_reads']} errors={agg['errors']}")
+              f"expand={agg['expand_reads']} err={agg['errors']}")
+    for c in report.control_results():
+        print(f"control[{c['scenario']}/{c['mode']}/{c['expansion']}] "
+              f"sha={c['context_sha16']} error={c['error']}")
+    print(f"calls spent: {report.config['budget_spent']}/{report.config['budget_max_calls']}")
     print(f"results: {out}")
     failed = sum(1 for r in report.results if r.error)
     return 1 if failed else 0

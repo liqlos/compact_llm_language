@@ -147,16 +147,18 @@ class OpenAICompatClient:
 
 
 class FixtureClient:
-    """Deterministic offline stand-in for a live model.
+    """Deterministic offline stand-in for a live model (aka FakeProvider).
 
     Behaviour (documented contract, exercised heavily by tests):
-    - Round 1: if some required facts are not visible in the prompt AND the
-      prompt offers expansion of observation stubs, reply ONLY with
+    - Tool arm round 1: if some required facts are not visible in the prompt
+      AND observation stubs offer expansion, reply ONLY with
       ``EXPAND: <obs-id>`` lines for every stubbed id (bounded).
     - Answer phase: quote every required fact found verbatim in the current
-      prompt and cite the first observation id it can see. It never emits
-      content that is not present in its own prompt, so injection payloads can
-      never leak through this fixture.
+      prompt and cite the first observation id it can see. On the closed-book
+      arm it never asserts missing facts -- it flags unavailability instead,
+      which is exactly what EF3 scores. It never emits content that is not
+      present in its own prompt, so injection payloads can never leak through
+      this fixture.
     """
 
     def __init__(self, *, expand_cap: int = 32) -> None:
@@ -166,14 +168,28 @@ class FixtureClient:
     def complete(self, system: str, user: str, **meta: Any) -> str:
         self.calls_made += 1
         facts: tuple[str, ...] = tuple(meta.get("required_facts", ()))
+        allow_expand = bool(meta.get("allow_expand", False))
         missing = [f for f in facts if f not in user]
         stub_ids = STUB_RE.findall(user)
-        if missing and stub_ids and "EXPAND:" in system:
+        if missing and stub_ids and allow_expand and "EXPAND:" in system:
             lines = "\n".join(f"EXPAND: {oid}" for oid in stub_ids[: self.expand_cap])
             return lines
         found = [f for f in facts if f in user]
+        if found:
+            body = " | ".join(found)
+        elif facts:
+            body = "(not present in context)"
+        else:
+            body = "Done, based only on the provided context."
+        if missing and not allow_expand:
+            body += " Additional evidence is unavailable in this context."
         cite_match = STUB_RE.search(user) or re.search(r"id=(obs-\d{4})", user)
-        answer = "ANSWER: " + (" | ".join(found) if found else "(not present in context)")
+        answer = f"ANSWER: {body}"
         if cite_match:
             answer += f" [source {cite_match.group(1)}]"
         return answer
+
+
+# Audit-lane naming aliases: the client seam is provider-neutral by design.
+ModelClient = LLMClient
+FakeProvider = FixtureClient

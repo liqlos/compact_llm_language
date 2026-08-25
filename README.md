@@ -64,16 +64,21 @@ fail-open — so nothing happens invisibly "until the end".
 ## Tests & benchmark
 
 ```bash
-uv sync && uv run pytest          # 109 tests: unit, security, properties,
+uv sync && uv run pytest          # 133 tests: unit, security, properties,
                                   # integration, live-eval harness
 uvx ruff check rcc bench tests evals    # lint
 uv run python -m bench.run_bench --exact --json .rcc_bench/results.json
 uv run python -m evals.run_live_eval --provider fake   # live-eval harness (offline fixture)
 ```
 
-Live-model evaluation (`evals/`): replays the five scenarios baseline vs
-compiled, scores fact recall / citations / constraints over real model answers
-via any OpenAI-compatible endpoint (bounded ≤ 15 calls, key env-only). Usage:
+Live-model evaluation (`evals/`): replays the five benchmark scenarios plus a
+focused RIR/1+router case, baseline vs compiled, over an explicit expansion
+channel (`tool` / `closed`), scoring exact-fact recall, numeric integrity,
+citations, constraints and injection resistance per
+`docs/research-context-compiler/GROUND_TRUTH_SPEC.md`. Provider-neutral
+(OpenAI-compatible endpoints; key env-only; hard call budget). Scope note:
+the five bench scenarios do not exercise SCRATCH/router comprehension — only
+the added `rir_state` case does, minimally. Usage:
 `docs/research-context-compiler/LIVE_EVAL.md`.
 
 Measured (o200k_base, exact tokenizer): peak active context −61…−78% on
