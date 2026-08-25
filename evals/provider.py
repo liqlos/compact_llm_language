@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Protocol
@@ -28,6 +29,14 @@ EXPAND_LINE_RE = re.compile(r"^\s*EXPAND:\s*(obs-\d{4})\s*$", re.MULTILINE)
 
 class ProviderError(RuntimeError):
     """Raised when a live provider call fails or is misconfigured."""
+
+    def __init__(self, msg: str, *, retryable: bool = False) -> None:
+        super().__init__(msg)
+        self.retryable = retryable
+
+
+# Transient HTTP statuses worth a bounded retry.
+_RETRYABLE_HTTP = {429, 500, 502, 503, 504}
 
 
 class LLMClient(Protocol):
@@ -61,6 +70,8 @@ class OpenAICompatClient:
         *,
         timeout_s: float = 60.0,
         max_completion_tokens: int = 512,
+        max_retries: int = 2,
+        backoff_s: float = 0.25,
     ) -> None:
         if not base_url or not model:
             raise ProviderError("base_url and model are required")
@@ -69,9 +80,11 @@ class OpenAICompatClient:
         self.api_key = api_key
         self.timeout_s = timeout_s
         self.max_completion_tokens = max_completion_tokens
+        self.max_retries = max_retries
+        self.backoff_s = backoff_s
         self.calls_made = 0
 
-    def complete(self, system: str, user: str, **_: Any) -> str:
+    def _post_once(self, system: str, user: str) -> str:
         payload = {
             "model": self.model,
             "messages": [
@@ -92,17 +105,38 @@ class OpenAICompatClient:
         )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+                raw = resp.read().decode("utf-8")
         except urllib.error.HTTPError as e:  # keep auth material out of errors
-            raise ProviderError(f"HTTP {e.code} from {self.base_url}") from e
+            raise ProviderError(f"HTTP {e.code} from {self.base_url}",
+                                retryable=e.code in _RETRYABLE_HTTP) from e
         except (urllib.error.URLError, TimeoutError, OSError) as e:
-            raise ProviderError(f"cannot reach {self.base_url}: {e.reason if hasattr(e, 'reason') else e}") from e
+            reason = getattr(e, "reason", e)
+            raise ProviderError(
+                f"cannot reach {self.base_url}: {reason}", retryable=True) from e
         try:
+            data = json.loads(raw)
             return str(data["choices"][0]["message"]["content"])
-        except (KeyError, IndexError, TypeError) as e:
-            raise ProviderError(f"unexpected response shape from {self.base_url}") from e
-        finally:
-            self.calls_made += 1
+        except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
+            raise ProviderError(
+                f"unexpected response shape from {self.base_url}") from e
+
+    def complete(self, system: str, user: str, **_: Any) -> str:
+        err: ProviderError | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                self.calls_made += 1
+                return self._post_once(system, user)
+            except ProviderError as e:
+                err = e
+                if not e.retryable or attempt >= self.max_retries:
+                    raise
+                time.sleep(min(self.backoff_s * (2 ** attempt), 5.0))
+        raise err  # pragma: no cover -- loop always returns or raises
+
+    def check(self) -> str:
+        """One minimal completion to verify endpoint+model before a full run."""
+        return self.complete(
+            "You are a health check. Reply with the single word OK.", "ping")
 
     @classmethod
     def from_env(cls, base_url: str | None, model: str | None, **kw: Any) -> OpenAICompatClient:

@@ -246,6 +246,93 @@ def test_openai_compat_requires_base_url_and_model(monkeypatch):
         OpenAICompatClient("", "")
 
 
+def test_openai_compat_retries_transient_then_succeeds(monkeypatch):
+    calls = {"n": 0}
+
+    def flaky_urlopen(req, timeout):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise urllib.error.URLError("connection reset")
+        return _FakeResponse(json.dumps(
+            {"choices": [{"message": {"content": "ok"}}]}).encode())
+
+    monkeypatch.setattr("evals.provider.urllib.request.urlopen", flaky_urlopen)
+    c = OpenAICompatClient("http://x/v1", "m", max_retries=2, backoff_s=0)
+    assert c.complete("s", "u") == "ok"
+    assert calls["n"] == 2 and c.calls_made == 2
+
+
+def test_openai_compat_does_not_retry_auth_errors(monkeypatch):
+    def denied(req, timeout):
+        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr("evals.provider.urllib.request.urlopen", denied)
+    c = OpenAICompatClient("http://x/v1", "m", api_key="sk-x",
+                           max_retries=3, backoff_s=0)
+    with pytest.raises(ProviderError, match="HTTP 401"):
+        c.complete("s", "u")
+    assert c.calls_made == 1  # no retry on non-transient status
+
+
+def test_openai_compat_wraps_bad_response_shape(monkeypatch):
+    def garbage(req, timeout):
+        return _FakeResponse(b"<html>not json</html>")
+
+    monkeypatch.setattr("evals.provider.urllib.request.urlopen", garbage)
+    c = OpenAICompatClient("http://x/v1", "m")
+    with pytest.raises(ProviderError, match="unexpected response shape"):
+        c.complete("s", "u")
+
+
+def test_cli_check_openai_compat_ok(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "evals.provider.urllib.request.urlopen",
+        lambda req, timeout: _FakeResponse(json.dumps(
+            {"choices": [{"message": {"content": "OK"}}]}).encode()))
+    from evals.run_live_eval import main
+
+    rc = main(["--provider", "openai-compat", "--check",
+               "--base-url", "http://x/v1", "--model", "test-model"])
+    assert rc == 0
+    assert "answered" in capsys.readouterr().out
+
+
+def test_cli_check_openai_compat_unreachable(monkeypatch, capsys):
+    def dead(req, timeout):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr("evals.provider.urllib.request.urlopen", dead)
+    from evals.run_live_eval import main
+
+    rc = main(["--provider", "openai-compat", "--check",
+               "--base-url", "http://x/v1", "--model", "test-model"])
+    assert rc == 2
+    assert "check failed" in capsys.readouterr().err
+
+
+def test_cli_rejects_unknown_scenario_names(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    from evals.run_live_eval import main
+
+    assert main(["--provider", "fake", "--scenarios", "not_a_scenario"]) == 2
+
+
+# ---- scoring-vector guard ------------------------------------------------
+
+
+@pytest.mark.parametrize("name", ["long_research", "repeated_sql", "exact_facts",
+                                  "constraints", "injection"])
+def test_task_facts_are_anchored_in_baseline_context(tmp_path, name):
+    """Guard against anchor rot: every required fact must appear verbatim in
+    the baseline context of its scenario, or the task is unscoreable."""
+    from evals.tasks import score_answer
+
+    sc = next(s for s in SCENARIOS if s.name == name)
+    preps = prepare_contexts(sc, root=tmp_path, tokenizer=count_tokens)
+    res = score_answer(TASK_BY_SCENARIO[name], preps["baseline"].text)
+    assert res.fact_recall == 1.0, f"stale anchors in task {name}"
+
+
 # ---- CLI ----------------------------------------------------------------
 
 
