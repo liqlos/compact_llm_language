@@ -1,6 +1,15 @@
-# Blockers — measured runtime facts
+# Historical blockers and measured runtime facts
 
-Updated: 2026-08-22. Each entry: claim, measurement, status.
+Snapshot date: 2026-08-24. This is an evidence ledger, not the current task
+queue. Recheck environment-dependent claims before acting; current maturity and
+gates live in `LATENT_ROADMAP.md`.
+
+Execution environment (owner decision 2026-08-24): serious 4B/27B training
+and CUDA experiment matrices run on rented Vast.ai GPUs behind the fail-closed
+no-spend READY gate; this laptop runs unit/smoke tests, artifact validation,
+and orchestration only; final 27B validation runs later on an owner-supplied
+server. MLX entries below are preserved as measured historical evidence — MLX
+on this laptop is not the release gate (VISION.md).
 
 ## B1 — Local hardware below original assumption
 
@@ -11,21 +20,22 @@ Updated: 2026-08-22. Each entry: claim, measurement, status.
   is tight. Proxy experiments: feasible (Qwen3.5-0.8B ≈ 1.75 GB bf16).
 - Status: RECORDED; ladder adjusted in VISION.md.
 
-## B2 — No ML stack installed
+## B2 — ML stack was absent (RESOLVED)
 
 - Claim: latent probe can run immediately.
 - Measurement: `import torch` / `import mlx` fail in project venv
   (Python 3.14, uv-managed). tiktoken present.
 - Plan: add optional dependency group `lab` (torch, transformers,
   accelerate); keep stdlib core importable without it.
-- Status: BLOCKED → resolved this session if install succeeds.
+- Current check (2026-08-25): both `torch` and `mlx` resolve in the project
+  environment. Status: RESOLVED.
 
-## B3 — No Qwen weights cached
+## B3 — No Qwen weights cached in the 2026-08-22 snapshot
 
 - Measurement: `~/.cache/huggingface/hub` contains no Qwen models.
 - Plan: download Qwen/Qwen3.5-0.8B (~1.75 GB bf16, verified via HF API)
   only after disk check; never auto-download 27B.
-- Status: pending.
+- Status: HISTORICAL; cache state is volatile and must be checked before a run.
 
 ## B4 — Transformers GDN cached-forward bug window
 
@@ -65,12 +75,12 @@ Updated: 2026-08-22. Each entry: claim, measurement, status.
   separated from this runtime defect.
 - Status: MEASURED; two concrete mitigations identified.
 
-## B7 — Environment-dependent test counts
+## B7 — Environment-dependent test counts (RESOLVED DOC CLAIM)
 
-- Claim (README): "93 tests".
-- Measurement: 93 passed with tiktoken installed (this env). Previous review
-  observed 85 passed + 2 skipped modules without tiktoken.
-- Consequence: README/plan now phrase counts as environment-dependent.
+- Historical measurement: 93 passed with tiktoken installed; an earlier review
+  observed 85 passed + 2 skipped modules without it.
+- Consequence: durable docs no longer use that count as current evidence;
+  verification reports record the exact suite result for their own revision.
 - Status: FIXED (docs).
 
 ## B8 — State probe: RESOLVED (runtime control proven)

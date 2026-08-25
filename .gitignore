@@ -6,6 +6,7 @@ __pycache__/
 .venv/
 .rcc_work/
 !docs/research-context-compiler/PROGRESS_FORMAT.md
+.rcc_eval/
 
 # macOS metadata — never track
 .DS_Store

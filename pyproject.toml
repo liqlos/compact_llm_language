@@ -27,7 +27,7 @@ mlx = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["rcc", "latent_lab"]
+packages = ["rcc", "latent_lab", "evals"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
