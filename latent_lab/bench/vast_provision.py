@@ -121,7 +121,15 @@ def offer_rejection_reason(offer) -> str | None:
         return f"num_gpus {offer.get('num_gpus')!r} is not an integer"
     if num_gpus != NUM_GPUS:
         return f"num_gpus {num_gpus} != {NUM_GPUS}"
-    if not offer.get("verified"):
+    verification_signals = []
+    if "verified" in offer:
+        verification_signals.append(offer.get("verified") is True)
+    if "verification" in offer:
+        verification_signals.append(
+            isinstance(offer.get("verification"), str)
+            and offer["verification"].strip().lower() == "verified")
+    if (not verification_signals or not all(verification_signals)
+            or offer.get("is_vm_deverified") is True):
         return "offer is not verified"
     try:
         vram_gb = normalize_gpu_ram_gb(offer.get("gpu_ram"))

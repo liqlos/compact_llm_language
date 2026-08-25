@@ -176,6 +176,14 @@ def test_local_revalidation_rejects_each_policy_violation():
     assert r(eligible_offer(num_gpus=2))
     assert r(eligible_offer(num_gpus="one"))
     assert r(eligible_offer(verified=False))
+    real_payload = eligible_offer()
+    del real_payload["verified"]
+    real_payload.update(verification="verified", vericode=1,
+                        is_vm_deverified=False)
+    assert r(real_payload) is None
+    assert r({**real_payload, "verification": "unverified"})
+    assert r({**real_payload, "is_vm_deverified": True})
+    assert r({**real_payload, "verified": False})
     assert r(eligible_offer(gpu_arch="AMD"))
     assert r(eligible_offer(gpu_name="Tesla P40"))
     assert r(eligible_offer(gpu_name="RTX 3080"))
