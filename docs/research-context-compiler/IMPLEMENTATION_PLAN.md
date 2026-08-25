@@ -227,3 +227,13 @@ the same thing. Recommended shape: small harness replaying the existing five
 scenarios through one provider with baseline vs compiled contexts, scoring
 exact-fact recall / citation presence / constraint adherence per run.
 
+**Update (2026-08-25): harness DONE** — `evals/` implements exactly that shape,
+provider-neutral (any OpenAI-compatible endpoint or a deterministic fixture),
+with a bounded EXPAND protocol so compiled-mode facts are reachable the way
+RCC intends them to be. Fixture-tested (16 tests; parity at −64% context
+tokens, differentiation without expansion). See
+`docs/research-context-compiler/LIVE_EVAL.md`. Remaining open item: one real
+provider run — no provider was already configured in this environment (no API
+keys, no local chat-model service), so it stays a documented, single-command
+follow-up rather than a code task.
+

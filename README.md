@@ -76,10 +76,11 @@ fail-open — so nothing happens invisibly "until the end".
 ## Tests & benchmark
 
 ```bash
-uv sync && uv run pytest          # 173 tests (suite/localized/runtime included;
-                                  # torch-dependent tests skip without lab group).
-uvx ruff check rcc bench tests    # lint (legacy files may carry minor warnings)
+uv sync && uv run pytest          # full unit, security, property, integration,
+                                  # runtime, gate, and live-eval suite
+uvx ruff check rcc bench tests evals    # lint
 uv run python -m bench.run_bench --exact --json .rcc_bench/results.json
+uv run python -m evals.run_live_eval --provider fake   # live-eval harness (offline fixture)
 ```
 
 ## No-spend integrity gate (latent evidence)
@@ -109,6 +110,12 @@ across reruns against unchanged inputs and contain no wall-clock value (the
 only timestamp lives in the separate `telemetry_timestamp.json`).
 Current verdict and blocker codes: see `.rcc_work/no_spend_gate_20260824/GATE_REPORT.md`
 (uncommitted evidence) and `docs/NO_SPEND_GATE.md`.
+
+Live-model evaluation (`evals/`) replays the benchmark scenarios baseline vs
+compiled, scores fact recall, citations and constraint adherence over real
+model answers through any OpenAI-compatible endpoint, and supports a bounded
+explicit expansion channel. The deterministic fake provider is the offline
+smoke path; see `docs/research-context-compiler/LIVE_EVAL.md`.
 
 Token-savings numbers below are **synthetic token estimates**, not model
 latency or task success. They justify nothing about end-to-end speed.
@@ -140,6 +147,7 @@ representative scenarios; fact recall via expansion 100%; cumulative spend
 | Textual baselines @2B | REJECTED_BY_EVIDENCE (capability limit) | direct/thinking/capped all 0.0% acc, up to 100% NON_TERMINATION incl. 1024-token budget |
 | MLX internal-recurrence path | MEASURED: bit-exact composition, speed BLOCKED without compile | `latent_lab/bench/mlx_internal_recurrence_probe.py` |
 | Qwen3.8-27B speedup ≥2× | NOT MEASURED | gated by 4B step (MODEL_CAPABILITY_LIMIT at 2B) |
+| Live-model evaluation | UNIT_VERIFIED harness + deterministic fixture; real-provider run pending |
 
 ```
 rcc/            core library (tokens, store, scratch, session, journal,
@@ -147,6 +155,7 @@ rcc/            core library (tokens, store, scratch, session, journal,
 latent_lab/     latent-cognition experiments (protocols, mock backend,
                 state probe, bench scaffolding); optional heavy deps
 bench/          deterministic token-estimate scenarios (synthetic!)
+evals/          provider-neutral baseline-vs-compiled live-model harness
 tests/          unit / security / property / integration suites
 docs/research-context-compiler/
                 vision, ADRs, roadmap, evaluation protocol, blockers,
