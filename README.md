@@ -111,11 +111,15 @@ only timestamp lives in the separate `telemetry_timestamp.json`).
 Current verdict and blocker codes: see `.rcc_work/no_spend_gate_20260824/GATE_REPORT.md`
 (uncommitted evidence) and `docs/NO_SPEND_GATE.md`.
 
-Live-model evaluation (`evals/`) replays the benchmark scenarios baseline vs
-compiled, scores fact recall, citations and constraint adherence over real
-model answers through any OpenAI-compatible endpoint, and supports a bounded
-explicit expansion channel. The deterministic fake provider is the offline
-smoke path; see `docs/research-context-compiler/LIVE_EVAL.md`.
+Live-model evaluation (`evals/`) replays the five benchmark scenarios plus a
+focused RIR/1+router case, baseline vs compiled, over an explicit expansion
+channel (`tool` / `closed`). It scores exact-fact recall, numeric integrity,
+citations, constraints and injection resistance against
+`docs/research-context-compiler/GROUND_TRUTH_SPEC.md`. The provider interface is
+OpenAI-compatible, credentials are environment-only, and calls have a hard
+budget. The five benchmark scenarios do not exercise SCRATCH/router
+comprehension; only the added `rir_state` case does, minimally. Usage:
+`docs/research-context-compiler/LIVE_EVAL.md`.
 
 Token-savings numbers below are **synthetic token estimates**, not model
 latency or task success. They justify nothing about end-to-end speed.

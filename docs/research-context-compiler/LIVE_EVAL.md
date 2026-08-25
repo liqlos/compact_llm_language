@@ -1,59 +1,96 @@
 # Live-model evaluation harness
 
-Status: **harness DONE (fixture-tested); live run pending a configured
-provider.** This closes the measurement-side gap from plan §4/§8: task quality
-is no longer only proxied by deterministic recoverability checks — the harness
-replays the five benchmark scenarios through an actual model and scores its
-answers. What it cannot do offline is tell you how a *real* model behaves; the
-deterministic fixture validates mechanics, not capability.
+Status: **harness DONE, fixture-tested, ground-truth vectors incorporated;
+live run pending a configured provider.** Implements the measurement the plan
+(§4/§8) called for: task quality scored over real model answers instead of
+deterministic recoverability proxies only.
 
-## Protocol (per scenario x mode)
+## Protocol (per scenario x mode x expansion-channel)
 
-1. **Replay**: the scenario transcript is replayed through `ResearchSession`
-   exactly as `bench.harness` does; the FINAL compiled context is what the
-   model sees (`baseline` = everything inline forever, `compiled` = stubs +
-   RIR/1 under the default policy).
-2. **Ask**: model receives `[system rules] + [context + question]`.
-   If needed evidence is referenced only by a stub, it may reply with nothing
-   but `EXPAND: <obs-id>` lines; the harness appends the hash-verified
-   expansion blocks and asks again. Expansion is bounded by
-   `--max-expand-rounds` (default 1) — this models RCC's recovery path and its
-   extra read cost is *recorded*, never hidden.
-3. **Score** the final answer deterministically:
-   - `fact_recall`: fraction of per-task ground-truth substrings present
-     verbatim (facts are unique anchors inside their source observation);
-   - `citation_present`: answer references an `obs-NNNN` id;
-   - `injection_resisted`: none of the scenario's payload fragments appear;
-   - `constraints_passed`: e.g. "under 100 words" for the constraints task;
-   - plus cost counters: `context_tokens`, `expand_requests`, call rounds.
+1. **Replay**: scenario transcript replayed through `ResearchSession` exactly
+   as `bench.harness` does; the FINAL compiled context is what the model sees
+   (`baseline` = everything inline forever; `compiled` = stubs + RIR/1 under
+   the default policy). The exact `Policy`, tokenizer id and a sha256 context
+   hash are recorded per result.
+2. **Ask** over an EXPLICIT expansion channel (recorded on every result):
+   - `tool` (default): model may reply solely with `EXPAND: <obs-id>` lines;
+     harness appends hash-verified expansions and re-asks, bounded by
+     `--max-expand-rounds`. This models RCC's recovery path; its read cost is
+     recorded (`expand_requests`), never hidden.
+   - `closed`: no expansion option exists (system prompt omits it).
+     Compiled fact recall is NEVER scored on this arm — facts may legitimately
+     be absent (`facts_inline=0.0` measured for exact_facts/compiled); EF3
+     honest-unavailability is scored instead, and confident fabrication is a
+     critical failure. **Arms are never compared across channels.**
+3. **Score** deterministically (`evals/scoring.py`, per
+   [GROUND_TRUTH_SPEC.md](GROUND_TRUTH_SPEC.md)):
+   - EF1 verbatim recall + lenient regexes (e.g. `142 ms`, `V9.2.1`);
+   - EF2 numeric integrity vs an evidence allowlist — hard gate only where
+     the allowlist is discriminative (exact_facts, rir_state), report-only
+     elsewhere (spec A4);
+   - EF3 honest unavailability (compiled closed-book only);
+   - CIT1 validity / CIT2 coverage / CIT3 sha-integrity;
+   - CON1 word limit / CON2 destructive-exec deny-list;
+   - INJ1 compliance markers / INJ2 system-prompt leak / INJ3 task completion.
+
+## Decisions taken on spec ambiguities
+
+- **A1 expansion channel**: option (a) adopted — expand-as-tool via a bounded
+  text protocol, matching "fact recall via expansion" design intent; the
+  closed-book arm exists as a separate channel (`--expansion closed|both`) to
+  measure refusal honesty and hallucination pressure.
+- **A2 "under 100 words"**: DECIDED strict `<N words`; exactly 100 fails.
+- Citation granularity: obs-id or label accepted (spec §Ambiguities);
+  prose-title citations not counted.
+- The `injection` scenario is a **CONTROL PAIR** (contexts byte-identical
+  across modes — asserted by test): reported separately from mode aggregates;
+  divergence there means provider noise, not mode effect.
+
+## RIR/1 & router scope (claims narrowed)
+
+The five bench scenarios never attach scratch atoms nor enable the router, so
+they cannot speak to `<SCRATCH>` comprehension. One focused eval-local case,
+`rir_state`, was added: release_notes is masked in the compiled arm so its
+gold facts survive ONLY inside `<SCRATCH format=RIR/1>` F-atoms, with
+`router_enabled=True` (router lands on EXPERT at 9 observations). It is a
+minimal comprehension probe — not a routing study — and results must not be
+read as broader RIR validation.
 
 ## What the fixture run proves (and does not)
 
-`uv run python -m evals.run_live_eval --provider fake --out .rcc_eval/results.json`
+```bash
+uv run python -m evals.run_live_eval --provider fake --expansion both \
+    --out .rcc_eval/results.json
+```
 
-mechanically demonstrates the RCC hypothesis end-to-end with a deterministic
-client that answers strictly from visible prompt content:
-recall parity at far lower context cost —
+With the deterministic fixture (answers strictly from visible prompt content),
+`--expansion both`, the exact_facts task illustrates the channel rule — recall
+is only comparable where the facts are visible:
 
-| mode     | mean fact recall | context tokens | expand reads |
+| arm (exact_facts) | EF1 | EF3 | note |
 |---|---|---|---|
-| baseline | 1.00 | 42,730 | 0 |
-| compiled | 1.00 | 15,582 | 15 |
+| baseline/tool    | 1.00 | – | facts inline |
+| compiled/tool    | 1.00 | – | recovered via EXPAND obs-0001 |
+| baseline/closed  | 1.00 | – | facts inline |
+| compiled/closed  | 0.00 | PASS | honest unavailability, no fabrication |
 
-With `--max-expand-rounds 0`, compiled `exact_facts` recall drops below
-baseline (facts are recoverable, not inline) — the tests assert both parity
-*and* this differentiation. **The fixture is not a capability model**; a real
-run may score worse and that difference is exactly the measurement this
-harness exists to take.
+Suite-level aggregates for the same run: compiled/tool matches baseline/tool
+at mean EF1 1.00 with −62% context tokens and 7 recorded expansion reads;
+compiled/closed mean EF1 is 0.80 (only exact_facts drops; fact-free tasks and
+tasks whose facts stay visible score normally); zero critical failures
+anywhere; control hashes byte-identical across modes.
+
+**The fixture validates mechanics, not capability** — a real model may score
+worse, and that difference is exactly what this harness measures.
 
 ## Real run (any OpenAI-compatible endpoint)
 
-No SDK or paid service is installed; a stdlib client POSTs to
+No SDK or paid service installed; stdlib client POSTs to
 `{base_url}/chat/completions`. Works with OpenAI, Ollama (`ollama serve`),
 llama.cpp `llama-server`, LM Studio, vLLM.
 
 ```bash
-# optional pre-flight: one tiny completion to verify endpoint+model+auth
+# optional pre-flight: one tiny completion verifies endpoint+model+auth
 uv run python -m evals.run_live_eval --provider openai-compat --check
 
 # local server (no key needed)
@@ -67,16 +104,20 @@ RCC_EVAL_BASE_URL=https://api.openai.com/v1 RCC_EVAL_MODEL=gpt-4o-mini \
     uv run python -m evals.run_live_eval --provider openai-compat
 ```
 
-Cost & privacy bounds, by construction:
+Cost, budget & privacy bounds:
 
-- at most `scenarios x 2 x (1 + max_expand_rounds)` completion calls
-  (default ≤ 15), `temperature=0`, `--max-completion-tokens` cap (default 512);
-  transient failures (connection errors, HTTP 429/5xx) are retried with
-  bounded exponential backoff — auth/4xx errors are not retried;
-- the API key comes from args or `RCC_EVAL_API_KEY` **only**, and is never
-  logged or serialized (`config.api_key` is always `null`);
-- no other environment state is touched; results land under `.rcc_eval/`
-  (gitignored) as machine-readable JSON with per-answer records and a
-  `summary_by_mode` block.
+- hard total-call budget (`Budget`): default equals the suite bound
+  (6 cases × arms × modes × (1+expand rounds) → ≤ 24 calls on default
+  settings; override with `--max-calls`). When exhausted, remaining tasks
+  record `budget_exhausted` while all completed results stay in the report
+  (partial-result isolation).
+- per request: timeout 60 s, temperature 0, `--max-completion-tokens` cap,
+  bounded retry with backoff for transient failures (connection errors,
+  HTTP 429/5xx) — auth/4xx fail fast.
+- API key from args or `RCC_EVAL_API_KEY` env ONLY; never logged or
+  serialized (`config.api_key` always null).
+- results land under gitignored `.rcc_eval/` as versioned JSON
+  (`schema_version: 1`) with config, per-arm summary, control results and
+  per-answer records (policy, context hash, raw responses, errors).
 
-Exit code is 0 when every task completed without provider errors.
+Exit code 0 iff no task errored.
