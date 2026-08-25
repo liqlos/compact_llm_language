@@ -272,6 +272,10 @@ def test_driver_seal_gate_precedes_environment_tests_and_gpu_work():
     lines = _driver_lines()
     seal_idx = min(i for i, l in enumerate(lines)
                    if "sealed_env require-image" in l)
+    bootstrap_idx = next(i for i, l in enumerate(lines)
+                         if "hash-pinned bootstrap" in l)
+    live_idx = next(i for i, l in enumerate(lines)
+                    if "sealed_env verify-live" in l)
     heredoc_idx = next(i for i, l in enumerate(lines)
                        if "require(sys.version.split()[0]" in l)
     pytest_idx = next(i for i, l in enumerate(lines)
@@ -280,8 +284,10 @@ def test_driver_seal_gate_precedes_environment_tests_and_gpu_work():
                    "AutoModelForCausalLM", "model_info")
     gpu_idx = min(i for i, l in enumerate(lines)
                   if any(m in l for m in gpu_markers))
-    assert seal_idx < heredoc_idx < pytest_idx < gpu_idx, (
-        seal_idx, heredoc_idx, pytest_idx, gpu_idx)
+    assert seal_idx < bootstrap_idx < live_idx < heredoc_idx \
+        < pytest_idx < gpu_idx, (
+            seal_idx, bootstrap_idx, live_idx, heredoc_idx,
+            pytest_idx, gpu_idx)
 
 
 def test_driver_resume_contract_is_the_full_canonical_recipe():

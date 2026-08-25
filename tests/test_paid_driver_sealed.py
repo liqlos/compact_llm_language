@@ -3,27 +3,59 @@
 These tests inspect latent_lab/bench/remote_driver_4b.sh SOURCE and
 statically prove the paid-driver contract:
   * exact dependency pins (==, no ranges) incl. project uv.lock identity
-  * focused tests gate BEFORE any GPU/model work
+  * the ONLY network/bootstrap touch is the sha256-pinned uv wheel plus
+    the sha256-pinned frozen lock export (--require-hashes) into a FRESH
+    system-site venv; torch/CUDA stay owned by the verified base image
+  * image/contract gates precede bootstrap; verify-live precedes
+    focused tests, which precede ALL GPU/model work
   * preregistered seed/recipe; NO result-based selection (BEST/MEDIAN)
   * paired same-adapter K>0 / K=0 evals; bounded (one train + 4 evals)
   * resume only through full-contract validators; no existence-only skip
-  * no package installs/upgrades; no ignored failures
 The recipe-preregistration heredoc is additionally EXECUTED offline
 (no network, no GPU: layer count/suite sha are injected constants) to
 prove it reaches a real 64-hex canonical digest.
 """
 
 import hashlib
-import platform
 import re
 import shlex
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[1]
 DRIVER = REPO / "latent_lab" / "bench" / "remote_driver_4b.sh"
 UVLOCK = REPO / "uv.lock"
+
+# The one verified immutable base image and its verified runtime state.
+VERIFIED_IMAGE = ("pytorch/pytorch@sha256:"
+                  "6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f"
+                  "25e3f64b4")
+FINAL_PINS = {
+    "PIN_IMAGE": VERIFIED_IMAGE,
+    "PIN_PYTHON": "3.12.3",
+    "PIN_TORCH": "2.13.0+cu126",
+    "PIN_TORCH_CUDA": "12.6",
+}
+PINNED_UV_VERSION = "0.11.28"
+PINNED_UV_WHEEL_URL = (
+    "https://files.pythonhosted.org/packages/75/2e/"
+    "62273ee6c9fbebccd8248c153b44870f81ebf5267c31edf4c095d78537fb/"
+    "uv-0.11.28-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl")
+PINNED_UV_WHEEL_SHA256 = ("49fe42df9f42056037473f3876adec1615709b57d3470ed391"
+                          "78ff420f3afb9f")
+PINNED_REQUIREMENTS_SHA256 = ("15d25f1ca4eec6bf8ea59c4a224a8d3268897963d958f"
+                              "93516a4262526d947fd")
+EXPECTED_WHEEL_NAME = ("uv-0.11.28-py3-none-manylinux_2_17_x86_64."
+                       "manylinux2014_x86_64.whl")
+BOOTSTRAP_INSTALL_LINE = ('python -m pip install --break-system-packages '
+                          '--no-deps "$UV_WHEEL"')
+EXPORT_LINE = ('uv export --frozen --group lab --group dev '
+               '--no-emit-project --prune torch > "$REQ"')
+VENV_INSTALL_LINE = ('uv pip install --python "$SEALED_VENV/bin/python" '
+                     '--no-deps --require-hashes -r "$REQ"')
 
 
 def _src() -> str:
@@ -71,20 +103,20 @@ def test_driver_shell_syntax_is_valid():
 def test_dependency_pins_are_exact_and_match_the_project_lock():
     src = _src()
     expected = {
-        "PIN_PYTHON": platform.python_version(),
-        "PIN_TORCH": _locked_version("torch"),
+        **FINAL_PINS,
         "PIN_TRANSFORMERS": _locked_version("transformers"),
         "PIN_HUGGINGFACE_HUB": _locked_version("huggingface-hub"),
     }
     for var, locked in expected.items():
         pin = _pin(src, var)
-        assert pin == locked, (
-            f"{var}={pin} drifted from uv.lock {locked}")
+        assert pin == locked, f"{var}={pin} drifted from verified pin {locked}"
         # equality against the pin must be enforced in the env check
         assert f'"{pin}"' in src
     assert "__version__ ==" in src or "require(" in src
     assert re.search(r"require\(.*__version__", src), \
         "dependency versions are not equality-checked"
+    assert _pin(src, "PIN_TORCH").split("+", 1)[0] == \
+        _locked_version("torch"), "image torch public version drifted from lock"
     # python equality is checked too (not merely presence)
     assert 'require(sys.version.split()[0]' in src
 
@@ -99,11 +131,18 @@ def test_uvlock_identity_pin_matches_repo_lock():
 
 def test_no_installs_upgrades_or_ignored_failures():
     code = _code(_src())
-    assert "pip install" not in code, "driver installs packages"
+    assert BOOTSTRAP_INSTALL_LINE in code
+    assert VENV_INSTALL_LINE in code
+    without_allowed = code.replace(BOOTSTRAP_INSTALL_LINE, "", 1).replace(
+        VENV_INSTALL_LINE, "", 1)
+    assert "pip install" not in without_allowed, \
+        "driver contains an install outside the two sealed bootstrap steps"
     assert "pip3 install" not in code
     assert not re.search(r"\bpip\b.*\s-U\b", code), \
         "driver upgrades packages"
-    assert "uv sync" not in code and "uv pip" not in code
+    assert "uv sync" not in code
+    assert "curl " not in code, "verified base image has no curl"
+    assert "urllib.request.urlopen" in code
     assert "|| true" not in code, "driver ignores failures"
     assert "set -euo pipefail" in _src()
 

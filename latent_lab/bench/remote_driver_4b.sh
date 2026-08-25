@@ -5,9 +5,14 @@
 #   * Focused unit/integrity tests MUST pass BEFORE any GPU/model spend;
 #     any failure aborts the driver.
 #   * EXACT dependency identity (equality against pinned versions,
-#     including Python, torch, transformers, huggingface_hub AND the
-#     project uv.lock content hash): no ranges, NO installs/upgrades
-#     ("pip -U" is banned), NO ignored failures (set -euo pipefail).
+#     including Python, torch+cu126 variant, torch.version.cuda,
+#     transformers, huggingface_hub AND the project uv.lock content
+#     hash): no ranges, NO generic installs/upgrades ("pip -U" and
+#     "uv sync" are banned). The ONLY network bootstrap is the exact
+#     sha256-pinned uv wheel plus the sha256-pinned frozen lock export
+#     (--require-hashes) into a FRESH system-site venv; torch/CUDA stay
+#     owned by the verified base image. NO ignored failures
+#     (set -euo pipefail).
 #   * ONE preregistered seed/recipe fixed BELOW, before any GPU second:
 #     nothing in this driver ever inspects validation results to choose
 #     a seed, an adapter or a recipe (no BEST/MEDIAN cherry-picking).
@@ -76,15 +81,29 @@ PY_DETACH_Z0=$(py_bool "$DETACH_Z0")
   || { echo "FATAL: GRAD_CHECKPOINT must be exactly 'true': the trainer pins grad-checkpointing ON; refusing a digest/trainer mismatch" >&2
        exit 5; }
 PY_GRAD_CHECKPOINT=$(py_bool "$GRAD_CHECKPOINT")
-PIN_PYTHON="3.14.0"
-PIN_TORCH="2.13.0"
+# THE verified immutable base image (Python 3.12.3, torch
+# 2.13.0+cu126/CUDA 12.6, transformers/huggingface_hub absent): the
+# externally supplied SEALED_IMAGE must equal this digest exactly.
+PIN_IMAGE="pytorch/pytorch@sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4"
+PIN_PYTHON="3.12.3"
+PIN_TORCH="2.13.0+cu126"
+PIN_TORCH_CUDA="12.6"
 PIN_TRANSFORMERS="5.15.1"
 PIN_HUGGINGFACE_HUB="1.28.0"
 PIN_UVLOCK_SHA256="62187a854931549a8cd927537a3cf393759fd56b79152c5f400447b9c3de035f"
+# Hash-pinned bootstrap artifacts: exact uv wheel + the frozen lock
+# export bytes it must produce. NOTHING else is ever fetched/installed.
+PIN_UV_VERSION="0.11.28"
+PIN_UV_WHEEL_URL="https://files.pythonhosted.org/packages/75/2e/62273ee6c9fbebccd8248c153b44870f81ebf5267c31edf4c095d78537fb/uv-0.11.28-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+PIN_UV_WHEEL_SHA256="49fe42df9f42056037473f3876adec1615709b57d3470ed39178ff420f3afb9f"
+PIN_REQUIREMENTS_SHA256="15d25f1ca4eec6bf8ea59c4a224a8d3268897963d958f93516a4262526d947fd"
 
 ### --- sealed launch environment gate (aborts BEFORE tests/training) ---
 : "${SEALED_IMAGE:?FATAL: SEALED_IMAGE must be preregistered as an immutable repository@sha256:<64-hex> reference; no default exists}"
 : "${SEALED_ENV_CONTRACT:?FATAL: SEALED_ENV_CONTRACT must point at the preregistered sealed-environment contract JSON; no default exists}"
+[ "$SEALED_IMAGE" = "$PIN_IMAGE" ] \
+  || { echo "FATAL: SEALED_IMAGE $SEALED_IMAGE != preregistered verified image $PIN_IMAGE" >&2
+       exit 5; }
 python -m latent_lab.bench.sealed_env require-image --image "$SEALED_IMAGE"
 python -m latent_lab.bench.sealed_env verify-contract \
   --contract "$SEALED_ENV_CONTRACT" --image "$SEALED_IMAGE"
@@ -92,7 +111,7 @@ python -m latent_lab.bench.sealed_env verify-contract \
 # provisioner can never drift onto different environments
 python -m latent_lab.bench.sealed_env check-pins \
   --contract "$SEALED_ENV_CONTRACT" \
-  --pin "image=$SEALED_IMAGE" \
+  --pin "image=$PIN_IMAGE" \
   --pin "python=$PIN_PYTHON" \
   --pin "torch=$PIN_TORCH" \
   --pin "transformers=$PIN_TRANSFORMERS" \
@@ -106,8 +125,115 @@ if ! flock -n 9; then
   exit 3
 fi
 
-echo "=== sealed environment verification (EXACT pins; no installs) ==="
-python - <<PY
+echo "=== hash-pinned bootstrap: exact uv wheel -> frozen export -> fresh venv ==="
+
+# Lock identity is re-proved BEFORE anything is fetched or exported.
+ACTUAL_LOCK_SHA=$(sha256sum uv.lock | cut -d ' ' -f1)
+if [ "$ACTUAL_LOCK_SHA" != "$PIN_UVLOCK_SHA256" ]; then
+  echo "FATAL: project lock drift: uv.lock sha256 $ACTUAL_LOCK_SHA != pinned $PIN_UVLOCK_SHA256" >&2
+  exit 2
+fi
+
+BOOTSTRAP_DIR=.bootstrap4b
+mkdir -p "$BOOTSTRAP_DIR"
+EXPECTED_WHEEL_NAME="uv-${PIN_UV_VERSION}-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+[ "${PIN_UV_WHEEL_URL##*/}" = "$EXPECTED_WHEEL_NAME" ] \
+  || { echo "FATAL: uv wheel URL does not name the exact pinned artifact $EXPECTED_WHEEL_NAME" >&2
+       exit 2; }
+UV_WHEEL="$BOOTSTRAP_DIR/$EXPECTED_WHEEL_NAME"
+UV_WHEEL_URL="$PIN_UV_WHEEL_URL" UV_WHEEL_OUT="$UV_WHEEL" python - <<'PY'
+import os
+import shutil
+import time
+import urllib.request
+
+url = os.environ["UV_WHEEL_URL"]
+out = os.environ["UV_WHEEL_OUT"]
+partial = out + ".partial"
+for attempt in range(3):
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response, \
+                open(partial, "wb") as target:
+            shutil.copyfileobj(response, target)
+        os.replace(partial, out)
+        break
+    except Exception:
+        try:
+            os.unlink(partial)
+        except FileNotFoundError:
+            pass
+        if attempt == 2:
+            raise
+        time.sleep(1)
+PY
+WHEEL_SHA=$(sha256sum "$UV_WHEEL" | cut -d ' ' -f1)
+if [ "$WHEEL_SHA" != "$PIN_UV_WHEEL_SHA256" ]; then
+  echo "FATAL: downloaded uv wheel sha256 $WHEEL_SHA != pinned $PIN_UV_WHEEL_SHA256" >&2
+  exit 2
+fi
+
+# Debian system interpreter receives ONLY this exact digest-verified
+# wheel (--break-system-packages); every lab package lands in the fresh
+# sealed venv below, never in the system environment.
+python -m pip install --break-system-packages --no-deps "$UV_WHEEL"
+UV_BIN=$(command -v uv) \
+  || { echo "FATAL: uv executable not found on PATH after wheel install" >&2
+       exit 2; }
+export PATH="$(dirname "$UV_BIN"):$PATH"
+UV_REPORTED=$(uv --version)
+case "$UV_REPORTED" in
+  "uv $PIN_UV_VERSION "*) : ;;
+  *) echo "FATAL: uv version drift: got '$UV_REPORTED', need uv $PIN_UV_VERSION.*" >&2
+     exit 2 ;;
+esac
+
+# Frozen export of EXACTLY the preregistered command; its bytes are
+# digest-pinned below. uv records this invocation in the file header,
+# so even an argv drift would break the required sha256.
+REQ="$BOOTSTRAP_DIR/requirements.sealed.txt"
+uv export --frozen --group lab --group dev --no-emit-project --prune torch > "$REQ"
+REQ_SHA=$(sha256sum "$REQ" | cut -d ' ' -f1)
+if [ "$REQ_SHA" != "$PIN_REQUIREMENTS_SHA256" ]; then
+  echo "FATAL: exported requirements sha256 $REQ_SHA != pinned $PIN_REQUIREMENTS_SHA256" >&2
+  exit 2
+fi
+# Defense in depth: no actual requirement may name torch/triton/cuda*/
+# nvidia-* (comments do not count); torch+CUDA stay owned by the image.
+FORBIDDEN_RE='^(torch|triton|nvidia[-_a-z0-9.]*|cuda[-_a-z0-9.]*)[=\[@ ;]'
+if grep -Ev '^[[:space:]]*(#|$)' "$REQ" | grep -Eiq "$FORBIDDEN_RE"; then
+  echo "FATAL: exported requirements name a torch/triton/cuda/nvidia package;" \
+       "the verified base image owns torch and CUDA" >&2
+  exit 2
+fi
+
+# Fresh DETERMINISTIC venv bound to THIS image interpreter (explicit
+# interpreter + --no-managed-python forbid any uv-managed download);
+# --system-site-packages keeps the image torch/CUDA stack authoritative.
+SEALED_VENV="$PWD/.venv-sealed-4b"
+rm -rf "$SEALED_VENV"
+PYBIN=$(command -v python3)
+SYSTEM_PY_VER=$("$PYBIN" -c 'import platform; print(platform.python_version())')
+if [ "$SYSTEM_PY_VER" != "$PIN_PYTHON" ]; then
+  echo "FATAL: image interpreter $PYBIN reports Python $SYSTEM_PY_VER != pinned $PIN_PYTHON" >&2
+  exit 2
+fi
+uv venv --system-site-packages --no-managed-python --python "$PYBIN" "$SEALED_VENV"
+uv pip install --python "$SEALED_VENV/bin/python" --no-deps --require-hashes -r "$REQ"
+
+# From here to the end of the driver, ONLY the venv python is used.
+export PATH="$SEALED_VENV/bin:$PATH"
+[ "$(command -v python)" = "$SEALED_VENV/bin/python" ] \
+  || { echo "FATAL: python does not resolve into the sealed venv" >&2
+       exit 2; }
+
+echo "=== sealed live-environment verification AFTER bootstrap ==="
+python -m latent_lab.bench.sealed_env verify-live \
+  --contract "$SEALED_ENV_CONTRACT" --lockfile uv.lock --require-cuda
+
+echo "=== sealed environment identity (EXACT pins incl. provenance) ==="
+SEALED_VENV_DIR="$SEALED_VENV" python - <<PY
+import glob
+import os
 import sys
 import huggingface_hub
 import torch
@@ -118,20 +244,28 @@ def require(actual, pinned, what):
 
 require(sys.version.split()[0], "${PIN_PYTHON}", "python")
 require(torch.__version__, "${PIN_TORCH}", "torch")
+require(str(torch.version.cuda), "${PIN_TORCH_CUDA}", "torch.version.cuda")
 require(transformers.__version__, "${PIN_TRANSFORMERS}", "transformers")
 require(huggingface_hub.__version__, "${PIN_HUGGINGFACE_HUB}",
         "huggingface_hub")
+# provenance: torch must come from the IMAGE system site-packages, never
+# from anything installed into the fresh sealed venv
+venv_root = os.path.realpath(os.environ["SEALED_VENV_DIR"])
+assert not os.path.realpath(str(torch.__file__)).startswith(
+    venv_root + os.sep), (
+    "torch resolved INSIDE the sealed venv; it must come from the image "
+    "system site-packages")
+own_sites = [p for p in sys.path
+             if str(p).startswith(venv_root + os.sep)]
+invading = [os.path.basename(hit) for p in own_sites
+            for hit in glob.glob(os.path.join(p, "*"))
+            if os.path.basename(hit).lower().startswith("torch")]
+assert not invading, f"torch artifacts installed into the venv: {invading}"
 assert torch.cuda.is_available(), "CUDA unavailable"
 print("ENV_OK", sys.version.split()[0], torch.__version__,
       transformers.__version__, huggingface_hub.__version__,
       torch.cuda.get_device_name(0))
 PY
-
-ACTUAL_LOCK_SHA=$(sha256sum uv.lock | cut -d ' ' -f1)
-if [ "$ACTUAL_LOCK_SHA" != "$PIN_UVLOCK_SHA256" ]; then
-  echo "FATAL: project lock drift: uv.lock sha256 $ACTUAL_LOCK_SHA != pinned $PIN_UVLOCK_SHA256" >&2
-  exit 2
-fi
 
 echo "=== pre-spend gate: focused checks MUST pass before ANY GPU work ==="
 python -m pytest -q \
