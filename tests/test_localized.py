@@ -747,8 +747,10 @@ def test_paired_trace_alignment_cache_restore_and_loss_decomposition(
     for offset, (step_index, _target_ids) in enumerate(trace_targets):
         state, pos, delta, _token_logprobs = scored[candidate_count + offset]
         assert pos == ids.shape[1]
-        assert torch.equal(state, expected_states[step_index - 1])
-        assert torch.equal(delta, expected_states[step_index - 1] - expected_z0)
+        expected_delta = expected_states[step_index - 1] - expected_z0
+        expected_readout = expected_z0 + expected_delta
+        assert torch.equal(state, expected_readout)
+        assert torch.equal(delta, expected_delta)
 
     # Four logical paired steps restore the same prompt snapshot three times
     # each plus the loop's fail-safe final restore. Candidate scoring uses its
