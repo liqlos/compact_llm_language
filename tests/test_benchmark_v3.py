@@ -30,6 +30,7 @@ from latent_lab.bench.suite_v3 import (
     baseline_suite,
     build_suite,
     counterfactual_prompt,
+    nonterminal_counterfactual_prompt,
     parse_prompt,
     reference_solve_prompt,
     reference_trace_prompt,
@@ -207,6 +208,56 @@ def test_causal_removal_and_counterfactual_mutation_change_gold(family):
         mutated = parse_prompt(counterfactual)
         mutated_initial = {key: value for key, value in mutated.items() if key.startswith("initial") or key in {"start", "modulus", "kind"}}
         assert mutated_initial == original_initial
+
+
+def test_nonterminal_counterfactual_probe_is_early_causal_and_deterministic():
+    expected_coverage = {
+        "train": {
+            "fsm": 39,
+            "stack_queue": 24,
+            "graph_walk": 40,
+            "chain_arith": 40,
+            "rule_neg": 0,
+            "tiny_prog": 40,
+            "obj_track": 0,
+        },
+        "test_id": {
+            "fsm": 21,
+            "stack_queue": 12,
+            "graph_walk": 24,
+            "chain_arith": 24,
+            "rule_neg": 0,
+            "tiny_prog": 24,
+            "obj_track": 0,
+        },
+    }
+    observed_coverage = {split: {family: 0 for family in FAMILIES}
+                         for split in expected_coverage}
+    for split in expected_coverage:
+        for example in getattr(SUITE, split):
+            result = nonterminal_counterfactual_prompt(example)
+            assert result == nonterminal_counterfactual_prompt(example)
+            if result is None:
+                continue
+            prompt, expected = result
+            original = parse_prompt(example.prompt)
+            mutated = parse_prompt(prompt)
+            assert mutated["events"][-1] == original["events"][-1]
+            changed = [
+                index
+                for index, (before, after) in enumerate(
+                    zip(original["events"], mutated["events"], strict=True)
+                )
+                if before != after
+            ]
+            assert len(changed) == 1
+            assert changed[0] < len(original["events"]) - 1
+            assert reference_solve_prompt(prompt) == expected
+            assert expected in example.canonical_candidates
+            assert expected != example.answer
+            observed_coverage[split][example.family] += 1
+
+    assert observed_coverage == expected_coverage
 
 
 @pytest.mark.parametrize("family", tuple(family for family in FAMILIES if family != "graph_walk"))

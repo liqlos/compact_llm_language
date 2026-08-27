@@ -1003,6 +1003,73 @@ def counterfactual_prompt(example: Example) -> tuple[str, str]:
     raise RuntimeError(f"no closed-set counterfactual for {example.ex_id}")
 
 
+def nonterminal_counterfactual_prompt(example: Example) -> tuple[str, str] | None:
+    """Change the earliest causal non-final event, or report ineligibility.
+
+    The final event and all other events remain unchanged.  ``None`` means that
+    no one-event mutation before the final event changes the closed-set gold.
+    """
+    scenario = example.scenario
+    events = scenario["events"]
+    if len(events) < 2:
+        return None
+
+    def replacements(index: int) -> Iterable[Any]:
+        event = events[index]
+        if example.family == "fsm":
+            return (
+                symbol
+                for symbol in sorted(next(iter(scenario["transitions"].values())))
+                if symbol != event
+            )
+        if example.family == "stack_queue":
+            if scenario["kind"] == "stack":
+                return (
+                    {"op": "push", "item": candidate}
+                    for candidate in example.canonical_candidates
+                    if candidate != event["item"]
+                )
+            return (
+                {"op": operation, "count": count}
+                for operation in ("rotate", "swap_front")
+                for count in range(1, len(scenario["initial"]) + 1)
+                if operation != event["op"] or count != int(event.get("count", 1))
+            )
+        if example.family == "graph_walk":
+            return (
+                {"op": "hop", "count": count}
+                for count in range(1, len(scenario["successor"]) + 1)
+                if count != int(event["count"])
+            )
+        if example.family == "chain_arith":
+            modulus = int(scenario["modulus"])
+            return (
+                {**event, "b": (int(event["b"]) + delta) % modulus}
+                for delta in range(1, modulus)
+            )
+        if example.family == "tiny_prog":
+            modulus = int(scenario["modulus"])
+            return (
+                {**event, "arg": (int(event["arg"]) + delta) % modulus}
+                for delta in range(1, modulus)
+            )
+        return ()
+
+    for index in range(len(events) - 1):
+        for replacement in replacements(index):
+            changed_events = list(events)
+            changed_events[index] = replacement
+            variant = {**scenario, "events": changed_events}
+            prompt = _render_variant(example, variant)
+            new_answer = reference_solve_prompt(prompt)
+            if _replay(variant) != new_answer:
+                raise AssertionError("counterfactual replay disagrees with reference solver")
+            if new_answer == example.answer or new_answer not in example.canonical_candidates:
+                continue
+            return prompt, new_answer
+    return None
+
+
 def _position_balance(examples: Sequence[Example]) -> dict[str, Any]:
     grouped: dict[str, list[Example]] = {family: [] for family in FAMILIES}
     for example in examples:
