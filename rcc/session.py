@@ -32,7 +32,7 @@ from .gate import Usage, break_even
 from .router import TaskSignals, route
 from .scratch import Atom, Scratch
 from .store import RawStore, StoredRef, StoreError
-from .tokens import TOKENIZER_ID, count_tokens
+from .tokens import TOKENIZER_ID, count_tokens, tokenizer_identity
 
 OBS_STUB = "[OBS {obs_id} label={label} sha={sha} tok={tok}]"  # compact machine ref
 
@@ -134,11 +134,16 @@ class ResearchSession:
     # Token counter used for all budget decisions. Defaults to the
     # deterministic approximation; benchmarks may inject an exact tokenizer.
     tokenizer: Callable[[str], int] = field(default=count_tokens)
+    tokenizer_id: str | None = None
 
     def __post_init__(self) -> None:
         from .store import _check_component
 
         _check_component(self.run_id, "run_id")  # run_id becomes a directory name
+        try:
+            self.tokenizer_id = tokenizer_identity(self.tokenizer, self.tokenizer_id)
+        except ValueError as exc:
+            raise SessionError(str(exc)) from exc
         self._seq = 0
         self._obs_counter = 0
         self._turns: list[Turn] = []
@@ -170,6 +175,21 @@ class ResearchSession:
 
             self.scratch = Scratch(self)
         return self.scratch
+
+    def _count_tokens(self, text: str) -> int:
+        value = self.tokenizer(text)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise SessionError(
+                f"tokenizer {self.tokenizer_id!r} returned invalid count {value!r}"
+            )
+        return value
+
+    def _assert_owned_reference(self, item: ObservationItem) -> None:
+        if item.ref.run_id != self.run_id:
+            raise CrossRunReferenceError(
+                f"reference {item.obs_id} belongs to run {item.ref.run_id}, "
+                f"session is {self.run_id}"
+            )
 
     # ---- ingestion -------------------------------------------------
 
@@ -205,7 +225,7 @@ class ResearchSession:
                 obs_id=obs_id,
                 ref=ref,
                 label=label,
-                n_tokens=self.tokenizer(content),
+                n_tokens=self._count_tokens(content),
             )
             self._by_sha[ref.sha256] = item
         self._by_id[item.obs_id] = item
@@ -249,7 +269,7 @@ class ResearchSession:
         if self.policy.gate == "breakeven":
             decision = break_even(Usage(
                 content_tokens=it.n_tokens,
-                stub_tokens=self.tokenizer(self._stub(it)),
+                stub_tokens=self._count_tokens(self._stub(it)),
                 remaining_turns=max(1, self.policy.horizon_turns - seq),
                 expected_reads_per_turn=self.policy.expected_reads_per_turn,
             ))
@@ -264,7 +284,7 @@ class ResearchSession:
             return False
 
     def compile(self) -> CompiledContext:
-        m = CompileMetrics()
+        m = CompileMetrics(tokenizer=self.tokenizer_id)
         mode = None
         if self.policy.router_enabled:
             mode = route(TaskSignals(
@@ -284,10 +304,11 @@ class ResearchSession:
             if isinstance(t.item, MessageItem):
                 tag = "CONSTRAINT" if t.item.protected else t.item.role.upper()
                 parts.append(f"<{tag}>\n{t.item.content}\n</{tag}>")
-                m.message_tokens += self.tokenizer(t.item.content) + 2
+                m.message_tokens += self._count_tokens(t.item.content) + 2
                 continue
 
             it: ObservationItem = t.item
+            self._assert_owned_reference(it)
             dup_occurrence = it.obs_id in seen_once
             seen_once.add(it.obs_id)
 
@@ -322,11 +343,11 @@ class ResearchSession:
                     + _sanitize_untrusted(body)
                     + "\n</OBSERVATION>"
                 )
-                m.inline_observation_tokens += self.tokenizer(body) + 6
+                m.inline_observation_tokens += self._count_tokens(body) + 6
                 continue
 
             parts.append(self._stub(it))
-            stub_tok = self.tokenizer(parts[-1])
+            stub_tok = self._count_tokens(parts[-1])
             m.stub_observation_tokens += stub_tok
             if dup_occurrence:
                 m.duplicates_stubbed += 1
@@ -339,7 +360,7 @@ class ResearchSession:
             block = self.scratch.render()
             if block:
                 parts.append(block)
-                m.scratch_tokens += self.tokenizer(block)
+                m.scratch_tokens += self._count_tokens(block)
 
         m.total_tokens = (
             m.message_tokens
@@ -366,7 +387,7 @@ class ResearchSession:
                 out.append({
                     "seq": t.seq, "kind": "message", "role": t.item.role,
                     "protected": t.item.protected,
-                    "tokens": self.tokenizer(t.item.content),
+                    "tokens": self._count_tokens(t.item.content),
                 })
                 continue
             it = t.item
@@ -399,10 +420,7 @@ class ResearchSession:
         it = self._by_id.get(obs_id)
         if it is None:
             raise SessionError(f"unknown reference {obs_id!r}")
-        if it.ref.run_id != self.run_id:
-            raise CrossRunReferenceError(
-                f"reference {obs_id} belongs to run {it.ref.run_id}, session is {self.run_id}"
-            )
+        self._assert_owned_reference(it)
         content = self.store.get_text(it.ref)  # hash-verified, fail-closed
         return (
             f"<UNTRUSTED_OBSERVATION id={obs_id} label={it.label} "
@@ -413,14 +431,20 @@ class ResearchSession:
 
     def _export_state(self) -> dict:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "run_id": self.run_id,
-            "tokenizer_id": getattr(self.tokenizer, "__name__", "custom"),
+            "tokenizer_id": self.tokenizer_id,
             "policy": asdict(self.policy),
             "seq": self._seq,
             "obs_counter": self._obs_counter,
             "observations": [
-                {"obs_id": i.obs_id, "ref_json": i.ref.to_json(), "label": i.label}
+                {
+                    "obs_id": i.obs_id,
+                    "ref_json": i.ref.to_json(),
+                    "label": i.label,
+                    "n_tokens": i.n_tokens,
+                    "tokenizer_id": self.tokenizer_id,
+                }
                 for i in self._by_id.values()
             ],
             "turns": [
@@ -451,38 +475,103 @@ class ResearchSession:
         d: dict,
         store: RawStore,
         tokenizer: Callable[[str], int] | None = None,
+        tokenizer_id: str | None = None,
     ) -> ResearchSession:
-        if d.get("schema_version") != 1:
+        schema_version = d.get("schema_version")
+        if schema_version not in {1, 2}:
             raise SessionError(f"unsupported schema_version {d.get('schema_version')!r}")
-        s = cls(run_id=d["run_id"], store=store, policy=Policy(**d["policy"]),
-                tokenizer=tokenizer or count_tokens)
+        counter = tokenizer or count_tokens
+        try:
+            active_tokenizer_id = tokenizer_identity(counter, tokenizer_id)
+        except ValueError as exc:
+            raise SessionError(str(exc)) from exc
+        persisted_tokenizer_id = d.get("tokenizer_id")
+        if schema_version == 1:
+            persisted_tokenizer_id = {
+                "count_tokens": TOKENIZER_ID,
+                "count_tokens_exact": "tiktoken:o200k_base",
+            }.get(persisted_tokenizer_id, persisted_tokenizer_id)
+        if not isinstance(persisted_tokenizer_id, str) or not persisted_tokenizer_id:
+            raise SessionError("persisted state is missing tokenizer identity")
+        if persisted_tokenizer_id != active_tokenizer_id:
+            raise SessionError(
+                f"tokenizer identity mismatch: persisted {persisted_tokenizer_id!r}, "
+                f"active {active_tokenizer_id!r}"
+            )
+        try:
+            run_id = d["run_id"]
+            policy = Policy(**d["policy"])
+        except (KeyError, TypeError) as exc:
+            raise SessionError("invalid persisted session header") from exc
+        s = cls(
+            run_id=run_id,
+            store=store,
+            policy=policy,
+            tokenizer=counter,
+            tokenizer_id=active_tokenizer_id,
+        )
         s._seq = d["seq"]
         s._obs_counter = d["obs_counter"]
         for o in d["observations"]:
             ref = StoredRef.from_json(o["ref_json"])
-            n_tokens = s.tokenizer(store.get_text(ref)) if store.has(ref) else 0
+            if ref.run_id != s.run_id:
+                raise CrossRunReferenceError(
+                    f"persisted reference {o.get('obs_id')!r} belongs to run "
+                    f"{ref.run_id}, session is {s.run_id}"
+                )
+            label = o.get("label")
+            if not isinstance(label, str) or not _SAFE_LABEL_RE.match(label):
+                raise SessionError(f"unsafe persisted observation label {label!r}")
+            content = store.get_text(ref)  # missing/corrupt raw evidence fails closed
+            recomputed_tokens = s._count_tokens(content)
+            if schema_version == 2:
+                n_tokens = o.get("n_tokens")
+                if isinstance(n_tokens, bool) or not isinstance(n_tokens, int) or n_tokens < 0:
+                    raise SessionError(
+                        f"persisted observation {o.get('obs_id')!r} has invalid n_tokens"
+                    )
+                if o.get("tokenizer_id") != active_tokenizer_id:
+                    raise SessionError(
+                        f"persisted observation {o.get('obs_id')!r} tokenizer identity mismatch"
+                    )
+                if n_tokens != recomputed_tokens:
+                    raise SessionError(
+                        f"persisted observation {o.get('obs_id')!r} token count mismatch: "
+                        f"stored {n_tokens}, recomputed {recomputed_tokens}"
+                    )
+            else:
+                n_tokens = recomputed_tokens
             item = ObservationItem(
-                obs_id=o["obs_id"], ref=ref, label=o["label"], n_tokens=n_tokens,
+                obs_id=o["obs_id"], ref=ref, label=label, n_tokens=n_tokens,
             )
+            if item.obs_id in s._by_id:
+                raise SessionError(f"duplicate persisted observation id {item.obs_id!r}")
             s._by_id[o["obs_id"]] = item
             s._by_sha[ref.sha256] = item  # dedup index must survive resume
         for t in d["turns"]:
             if t["kind"] == "message":
+                if t["role"] not in _ALLOWED_ROLES:
+                    raise SessionError(f"unsafe persisted role {t['role']!r}")
                 s._turns.append(Turn(
                     MessageItem(role=t["role"], content=t["content"], protected=t["protected"]),
                     t["seq"]))
+            elif t["kind"] == "observation":
+                try:
+                    item = s._by_id[t["obs_id"]]
+                except KeyError as exc:
+                    raise SessionError(
+                        f"turn references unknown observation {t.get('obs_id')!r}"
+                    ) from exc
+                s._turns.append(Turn(item, t["seq"]))
             else:
-                s._turns.append(Turn(s._by_id[t["obs_id"]], t["seq"]))
+                raise SessionError(f"unknown persisted turn kind {t.get('kind')!r}")
         if d.get("scratch"):
             sc = s.attach_scratch()
             for a in d["scratch"]:
-                # validation ran at add()-time; store is immutable so it holds
-                sc._atoms.append(Atom(
+                sc._restore_atom(Atom(
                     aid=a["aid"], kind=a["kind"], text=a["text"],
                     src=tuple(a["src"]), conf=a.get("conf"),
                 ))
-                sc._counter[a["kind"]] = max(sc._counter.get(a["kind"], 0),
-                                             int(a["aid"][2:] or 0))
         return s
 
     @classmethod
@@ -491,6 +580,7 @@ class ResearchSession:
         path: Path | str,
         store: RawStore,
         tokenizer: Callable[[str], int] | None = None,
+        tokenizer_id: str | None = None,
     ) -> ResearchSession:
         d = json.loads(Path(path).read_text(encoding="utf-8"))
-        return cls._from_state(d, store, tokenizer)
+        return cls._from_state(d, store, tokenizer, tokenizer_id)

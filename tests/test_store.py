@@ -46,6 +46,33 @@ def test_tamper_detection_fails_closed(store):
         store.get(ref)
 
 
+def test_put_does_not_trust_corrupt_existing_content_address(store):
+    import base64
+    import json
+
+    ref = store.put("r1", "observation", "original")
+    path = store._object_path(ref)
+    envelope = json.loads(path.read_text(encoding="utf-8"))
+    envelope["content_b64"] = base64.b64encode(b"tampered").decode("ascii")
+    path.write_text(json.dumps(envelope), encoding="utf-8")
+    with pytest.raises(HashMismatchError):
+        store.put("r1", "observation", "original")
+
+
+def test_get_validates_reference_size_even_when_hash_matches(store):
+    from rcc import StoreError
+
+    ref = store.put("r1", "observation", "payload")
+    forged = StoredRef(
+        run_id=ref.run_id,
+        kind=ref.kind,
+        sha256=ref.sha256,
+        size_bytes=ref.size_bytes + 1,
+    )
+    with pytest.raises(StoreError, match="size mismatch"):
+        store.get(forged)
+
+
 def test_missing_object(store):
     ref = StoredRef(run_id="r1", kind="observation", sha256="0" * 64, size_bytes=3)
     assert not store.has(ref)

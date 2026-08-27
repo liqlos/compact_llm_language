@@ -10,19 +10,27 @@ compiled context so appends never invalidate the prompt prefix:
     </SCRATCH>
 
 Exactness guard (Telegraph English fine-facts lesson): numbers are what lossy
-rewriting destroys, so an atom may PARAPHRASE prose but every numeric token it
-contains must appear VERBATIM in referenced source observations. Violations
-raise at add() time -- fabricated or drifted digits can never enter machine
-state. Sources resolve through the hash-verified store, so validation works
-even after the observation itself has been masked out of active context.
+rewriting destroys, so an atom may PARAPHRASE prose but every normalized
+numeric token it contains must equal a complete signed decimal/exponent token
+in referenced source observations. Substring evidence is forbidden. Sources
+resolve through the hash-verified store, so validation still works after the
+observation is masked out of active context.
 """
 
 from __future__ import annotations
 
+import base64
+import json
+import math
 import re
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 
-_NUM_RE = re.compile(r"\d+(?:[.,:\-]\d+)*")
+_NUM_RE = re.compile(
+    r"(?<!\d)[+-]?(?:\d+(?:[.,]\d+)?|[.,]\d+)(?:[eE][+-]?\d+)?(?!\d)"
+)
+_AID_RE = re.compile(r"^([fqnc])(\d{2,})$")
+_UNSAFE_RENDER_RE = re.compile(r"[\x00-\x1f\x7f@<>]|conf=|b64json=")
 _KINDS = ("F", "Q", "N", "C")
 
 
@@ -39,6 +47,18 @@ class Atom:
     conf: float | None = None
 
 
+def extract_numeric_tokens(text: str) -> tuple[str, ...]:
+    """Extract signed decimal/exponent tokens at exact digit boundaries."""
+    return tuple(match.group(0) for match in _NUM_RE.finditer(text))
+
+
+def _normalized_number(token: str) -> Decimal:
+    try:
+        return Decimal(token.replace(",", "."))
+    except InvalidOperation as exc:  # defensive: the regex should preclude this
+        raise ScratchError(f"invalid numeric token {token!r}") from exc
+
+
 class Scratch:
     """Append-only symbolic state bound to one session."""
 
@@ -53,6 +73,9 @@ class Scratch:
             conf: float | None = None) -> str:
         if kind not in _KINDS:
             raise ScratchError(f"unknown atom kind {kind!r}")
+        if not isinstance(text, str):
+            raise ScratchError("atom text must be a string")
+        self._validate_confidence(conf)
         self._validate_numbers(text, src)
         self._counter[kind] = self._counter.get(kind, 0) + 1
         aid = f"{kind.lower()}{self._counter[kind]:02d}"
@@ -61,16 +84,18 @@ class Scratch:
             self._session.journal.log_atom(aid, kind, text, list(src), conf)
         return aid
 
-    def _validate_numbers(self, text: str, src: tuple[str, ...]) -> None:
-        numbers = set(_NUM_RE.findall(text))
-        if not numbers:
-            if src == () and any(ch.isdigit() for ch in text):
-                pass  # unreachable; kept for clarity
+    @staticmethod
+    def _validate_confidence(conf: float | None) -> None:
+        if conf is None:
             return
-        if not src:
-            raise ScratchError(
-                f"numeric atom without source provenance: {sorted(numbers)!r}"
-            )
+        if isinstance(conf, bool) or not isinstance(conf, (int, float)):
+            raise ScratchError("confidence must be a finite number in [0, 1]")
+        if not math.isfinite(float(conf)) or not 0.0 <= float(conf) <= 1.0:
+            raise ScratchError("confidence must be a finite number in [0, 1]")
+
+    def _validate_numbers(self, text: str, src: tuple[str, ...]) -> None:
+        if not isinstance(src, tuple) or not all(isinstance(obs_id, str) for obs_id in src):
+            raise ScratchError("source provenance must be a tuple of observation ids")
         corpus_parts = []
         for obs_id in src:
             item = self._session._by_id.get(obs_id)
@@ -81,13 +106,44 @@ class Scratch:
                     f"cross-run source {obs_id!r} ({item.ref.run_id} != {self._session.run_id})"
                 )
             corpus_parts.append(self._session.store.get_text(item.ref))  # fail-closed
+        numbers = extract_numeric_tokens(text)
+        if not numbers:
+            return
+        if not src:
+            raise ScratchError(
+                f"numeric atom without source provenance: {sorted(numbers)!r}"
+            )
         corpus = "\n".join(corpus_parts)
-        missing = sorted(n for n in numbers if n not in corpus)
+        corpus_numbers = {
+            _normalized_number(token) for token in extract_numeric_tokens(corpus)
+        }
+        missing = sorted({
+            token for token in numbers
+            if _normalized_number(token) not in corpus_numbers
+        })
         if missing:
             raise ScratchError(
-                f"numbers not verbatim in sources: {missing} "
-                "(machine state may quote, never rewrite, numbers)"
+                f"numbers not verbatim-equivalent in source numeric tokens: {missing} "
+                "(substring matches are forbidden)"
             )
+
+    def _restore_atom(self, atom: Atom) -> None:
+        """Validate and append one atom from persisted state."""
+        if atom.kind not in _KINDS:
+            raise ScratchError(f"unknown atom kind {atom.kind!r}")
+        match = _AID_RE.fullmatch(atom.aid)
+        if match is None or match.group(1) != atom.kind.lower():
+            raise ScratchError(f"invalid atom id {atom.aid!r} for kind {atom.kind!r}")
+        if any(existing.aid == atom.aid for existing in self._atoms):
+            raise ScratchError(f"duplicate atom id {atom.aid!r}")
+        if not isinstance(atom.text, str):
+            raise ScratchError("atom text must be a string")
+        self._validate_confidence(atom.conf)
+        self._validate_numbers(atom.text, atom.src)
+        self._atoms.append(atom)
+        self._counter[atom.kind] = max(
+            self._counter.get(atom.kind, 0), int(match.group(2))
+        )
 
     # ---- rendering / introspection --------------------------------------
 
@@ -99,11 +155,25 @@ class Scratch:
             return ""
         lines = ["<SCRATCH format=RIR/1>"]
         for a in self._atoms:
-            line = f"{a.kind} {a.aid} {a.text}"
-            if a.conf is not None:
-                line += f" conf={a.conf:.2f}"
-            if a.src:
-                line += " @" + ",".join(a.src)
+            if _UNSAFE_RENDER_RE.search(a.text):
+                payload = json.dumps(
+                    {
+                        "text": a.text,
+                        "conf": a.conf,
+                        "src": list(a.src),
+                    },
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                encoded = base64.urlsafe_b64encode(payload).decode("ascii")
+                line = f"{a.kind} {a.aid} b64json={encoded}"
+            else:
+                line = f"{a.kind} {a.aid} {a.text}"
+                if a.conf is not None:
+                    line += f" conf={a.conf:.2f}"
+                if a.src:
+                    line += " @" + ",".join(a.src)
             lines.append(line)
         return "\n".join(lines)
 

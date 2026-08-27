@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 
 TOKENIZER_ID = "rcc-approx-1"
+EXACT_DEFAULT_TOKENIZER_ID = "tiktoken:o200k_base"
 
 _SEGMENT_RE = re.compile(
     r"'(?:[sdmt]|ll|ve|re)|[A-Za-z]+|[0-9]|[^\sA-Za-z0-9]+|\s+"
@@ -66,3 +67,35 @@ def count_tokens_exact(text: str, encoding: str = "o200k_base") -> int:
         enc = tiktoken.get_encoding(encoding)
         _EXACT_ENCODERS[encoding] = enc
     return len(enc.encode(text))
+
+
+def tokenizer_identity(counter, explicit: str | None = None) -> str:
+    """Return a stable persisted identity for a token-counting callable.
+
+    Custom counters should pass an explicit identity.  The callable fallback
+    is deterministic enough for validation and, unlike ``__name__`` alone,
+    includes its defining module.
+    """
+    known = None
+    if counter is count_tokens:
+        known = TOKENIZER_ID
+    elif counter is count_tokens_exact:
+        known = EXACT_DEFAULT_TOKENIZER_ID
+    if known is not None:
+        if explicit is not None and explicit != known:
+            raise ValueError(
+                f"tokenizer identity {explicit!r} conflicts with known counter {known!r}"
+            )
+        return known
+    if explicit is not None:
+        if not isinstance(explicit, str) or not explicit.strip():
+            raise ValueError("tokenizer identity must be a non-empty string")
+        return explicit
+    declared = getattr(counter, "rcc_tokenizer_id", None)
+    if isinstance(declared, str) and declared.strip():
+        return declared
+    module = getattr(counter, "__module__", None)
+    qualname = getattr(counter, "__qualname__", None)
+    if not module or not qualname:
+        raise ValueError("custom tokenizer requires an explicit identity")
+    return f"callable:{module}.{qualname}"

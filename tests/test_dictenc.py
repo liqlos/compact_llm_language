@@ -1,4 +1,7 @@
-"""Dictionary encoding tests (Phase 6): lossless JSONL dictionary codec."""
+"""Dictionary encoding tests: structurally lossless JSON codec."""
+
+import json
+import random
 
 import pytest
 
@@ -39,6 +42,17 @@ def test_rejects_mixed_or_short_input():
     assert encode_json_objects(not_json) is None
     arrays = "[1]\n[2]\n[3]"
     assert encode_json_objects(arrays) is None
+    nonfinite = '{"a":NaN}\n{"a":NaN}\n{"a":NaN}'
+    assert encode_json_objects(nonfinite) is None
+
+
+def test_decoder_rejects_nonfinite_or_malformed_structural_payloads():
+    with pytest.raises(ValueError):
+        decode('["rcc.dict.v2",["a"],[[NaN]]]')
+    with pytest.raises(ValueError, match="arity"):
+        decode('["rcc.dict.v2",["a","b"],[[1]]]')
+    with pytest.raises(ValueError, match="schema"):
+        decode('["rcc.dict.v2",["a","a"],[[1,2]]]')
 
 
 def test_escapes_separators_safely():
@@ -47,6 +61,56 @@ def test_escapes_separators_safely():
     enc = encode_json_objects(text)
     assert enc is not None
     assert decode(enc[0]) == rows
+
+
+def test_structural_roundtrip_handles_all_json_edge_cases():
+    keys = [
+        "",
+        "key\nwith newline|and\\backslash/quote\"雪",
+        "arbitrary:[]=,{} key",
+    ]
+    values = [
+        "line one\nline two",
+        r"literal\n and slash/ and backslash\\ and | separator",
+        'quotes "single\' and Unicode 日本語 ✓',
+        "",
+        {"nested": [1, -2.5, True, False, None, {"x|y": "z\\n"}]},
+        [0, 1.25, -3, True, None],
+        42,
+        -0.125,
+        True,
+        False,
+        None,
+    ]
+    rows = [
+        {keys[0]: values[index % len(values)],
+         keys[1]: values[(index + 1) % len(values)],
+         keys[2]: values[(index + 2) % len(values)]}
+        for index in range(24)
+    ]
+    text = "\n".join(json.dumps(row, ensure_ascii=False, separators=(",", ":")) for row in rows)
+    encoded = encode_json_objects(text)
+    assert encoded is not None
+    assert encoded[1]["roundtrip_guarantee"] == "structural-json-equality"
+    assert decode(encoded[0]) == rows
+
+
+def test_deterministic_structural_roundtrip_property():
+    rng = random.Random(20260827)
+    atoms = [None, True, False, "", "\n", r"\n", "\\", "|", '"', "Юникод", 0, -7, 2.5]
+    for case in range(64):
+        keys = [f"long repeated key {case} {suffix}" for suffix in ("\n|", "\\/\"", "雪")]
+        rows = []
+        for row_index in range(12):
+            rows.append({
+                keys[0]: rng.choice(atoms),
+                keys[1]: [rng.choice(atoms), {"nested": rng.choice(atoms)}],
+                keys[2]: {"i": row_index, "ok": bool(row_index % 2), "none": None},
+            })
+        text = "\n".join(json.dumps(row, ensure_ascii=False, separators=(",", ":")) for row in rows)
+        encoded = encode_json_objects(text)
+        assert encoded is not None, case
+        assert decode(encoded[0]) == rows
 
 
 def test_unicode_roundtrip():
@@ -85,8 +149,8 @@ def test_flag_on_encodes_inline(store):
     s = _session(store, Policy(encode_jsonl=True))
     c = s.compile()
     assert c.metrics.jsonl_encoded >= 1
-    assert "SCHEMA id|status|amount|ts" in c.text
-    assert '"status"' not in c.text            # repeated keys gone from context
+    assert '["rcc.dict.v2",["id","status","amount","ts"]' in c.text
+    assert c.text.count('"status"') == 1       # repeated keys stated once
 
 
 def test_flag_off_verbatim(store):

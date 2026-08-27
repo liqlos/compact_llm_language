@@ -113,7 +113,15 @@ class RawStore:
         ref = StoredRef(run_id=run_id, kind=kind, sha256=digest, size_bytes=len(data))
         path = self._object_path(ref)
         if path.exists():
-            return ref  # write-once: identical content already stored
+            # A matching pathname is not evidence that the existing object is
+            # intact.  Verify its envelope, bytes, size, and content address
+            # before deduplicating; corruption must never be blessed by put().
+            existing = self.get(ref)
+            if existing != data:
+                raise HashMismatchError(
+                    f"existing object bytes differ for {ref.sha256}"
+                )
+            return ref
         path.parent.mkdir(parents=True, exist_ok=True)
         envelope = {
             "meta": meta or {},
@@ -134,7 +142,7 @@ class RawStore:
             if not isinstance(data, bytes):
                 raise TypeError("decoded payload is not bytes")
         except (json.JSONDecodeError, KeyError, TypeError, ValueError,
-                binascii.Error, UnicodeDecodeError) as e:
+                binascii.Error, UnicodeDecodeError, OSError) as e:
             # corruption must fail closed as a typed error so callers can
             # fail-open at the availability layer (session.compile)
             raise StoreError(f"corrupt object envelope for {ref.sha256}: {e!r}") from e
@@ -142,6 +150,10 @@ class RawStore:
         if actual != ref.sha256:
             raise HashMismatchError(
                 f"hash mismatch for {ref.sha256}: got {actual}"
+            )
+        if len(data) != ref.size_bytes:
+            raise StoreError(
+                f"size mismatch for {ref.sha256}: expected {ref.size_bytes}, got {len(data)}"
             )
         return data
 

@@ -1,4 +1,4 @@
-"""Lossless dictionary encoding for repetitive structured output (Phase 6).
+"""Structurally lossless dictionary encoding for repetitive JSON objects.
 
 Targets JSON-lines style payloads where every object repeats the same keys
 (tool results, test-run records, transaction dumps). The schema is stated
@@ -13,9 +13,16 @@ from __future__ import annotations
 import json
 
 
+FORMAT = "rcc.dict.v2"
+
+
+def _reject_nonfinite(value: str):
+    raise ValueError(f"non-finite JSON number {value!r} is unsupported")
+
+
 def _try_obj(line: str):
     try:
-        o = json.loads(line)
+        o = json.loads(line, parse_constant=_reject_nonfinite)
         return o if isinstance(o, dict) else None
     except (json.JSONDecodeError, ValueError):
         return None
@@ -34,22 +41,23 @@ def encode_json_objects(text: str, min_objects: int = 3) -> tuple[str, dict] | N
         return None
 
     keys = list(objs[0].keys())
-    header = "SCHEMA " + "|".join(keys)
-    rows = []
-    for o in objs:
-        vals = []
-        for k in keys:
-            # quote EVERY value: json.dumps guarantees exact type round-trip
-            sv = json.dumps(o[k], ensure_ascii=False)
-            sv = sv.replace("\n", "\\n").replace("|", "\\|")
-            vals.append(sv)
-        rows.append("ROW " + "|".join(vals))
-    encoded = "\n".join([header, *rows])
+    # A JSON array is the framing layer.  Values are never escaped by custom
+    # delimiter rules, so strings containing newlines, backslashes, pipes, or
+    # any other JSON character remain unambiguous.
+    payload = [FORMAT, keys, [[obj[key] for key in keys] for obj in objs]]
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
     meta = {
+        "format": FORMAT,
         "n_objects": len(objs),
         "keys": keys,
         "raw_chars": len(text),
         "encoded_chars": len(encoded),
+        "roundtrip_guarantee": "structural-json-equality",
     }
     # never claim a win that is not there
     if len(encoded) >= len(text):
@@ -58,42 +66,24 @@ def encode_json_objects(text: str, min_objects: int = 3) -> tuple[str, dict] | N
 
 
 def decode(encoded: str) -> list[dict]:
-    """Exact inverse of encode_json_objects."""
-    lines = [ln for ln in encoded.splitlines() if ln.strip()]
-    if not lines or not lines[0].startswith("SCHEMA "):
-        raise ValueError("not an RCC-encoded payload")
-    keys = lines[0][len("SCHEMA "):].split("|")
-    out = []
-    for ln in lines[1:]:
-        if not ln.startswith("ROW "):
-            raise ValueError(f"unexpected line {ln[:20]!r}")
-        parts = _split_row(ln[4:])
-        if len(parts) != len(keys):
+    """Decode ``rcc.dict.v2`` into structurally equal JSON objects."""
+    try:
+        payload = json.loads(encoded, parse_constant=_reject_nonfinite)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError("not an RCC dictionary payload") from exc
+    if not isinstance(payload, list) or len(payload) != 3 or payload[0] != FORMAT:
+        raise ValueError("unsupported RCC dictionary format")
+    keys, rows = payload[1], payload[2]
+    if (
+        not isinstance(keys, list)
+        or not all(isinstance(key, str) for key in keys)
+        or len(keys) != len(set(keys))
+        or not isinstance(rows, list)
+    ):
+        raise ValueError("invalid RCC dictionary schema")
+    out: list[dict] = []
+    for row in rows:
+        if not isinstance(row, list) or len(row) != len(keys):
             raise ValueError("row/schema arity mismatch")
-        rec = {}
-        for k, raw in zip(keys, parts):
-            v = raw.replace("\\|", "|").replace("\\n", "\n")
-            try:
-                v = json.loads(v)
-            except (json.JSONDecodeError, ValueError):
-                pass  # plain string value
-            rec[k] = v
-        out.append(rec)
+        out.append(dict(zip(keys, row, strict=True)))
     return out
-
-
-def _split_row(row: str) -> list[str]:
-    parts, buf, esc = [], [], False
-    for ch in row:
-        if esc:
-            buf.append("\\" + ch)
-            esc = False
-        elif ch == "\\":
-            esc = True
-        elif ch == "|":
-            parts.append("".join(buf))
-            buf = []
-        else:
-            buf.append(ch)
-    parts.append("".join(buf))
-    return parts
