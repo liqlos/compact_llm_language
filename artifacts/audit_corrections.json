@@ -1,0 +1,19 @@
+{
+  "schema_version": "r1_audit_corrections.v1",
+  "corrections": [
+    {
+      "audit_file": "artifacts/audit_before.json",
+      "field": "audit_leads[id=16]",
+      "original_status": "REFUTED",
+      "corrected_status": "CONFIRMED_WITH_PACKAGE_SCOPE",
+      "reason": "The initial check conflated latent_lab/bench with the distinct top-level bench package. The built wheel contains latent_lab/bench but README invokes python -m bench.run_bench, and no top-level bench/ entry exists in the wheel.",
+      "verification": {
+        "build_command": "uv build --wheel --out-dir /private/tmp/rcc-r1-wheel-baseline",
+        "wheel": "rcc-0.1.0-py3-none-any.whl",
+        "latent_lab_bench_present": true,
+        "top_level_bench_present": false
+      }
+    }
+  ],
+  "policy": "audit_before remains unchanged as an immutable Phase-A receipt; consumers must apply this append-only correction"
+}

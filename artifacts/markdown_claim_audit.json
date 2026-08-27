@@ -95,11 +95,11 @@
       "required_disposition": "split test tiers and make documented default install/test commands self-consistent"
     },
     {
-      "id": "BENCH_ABSENT_FROM_WHEEL",
-      "sources": [],
-      "baseline_verdict": "AUDIT_LEAD_REFUTED",
-      "evidence": "built wheel includes latent_lab/bench; pyproject packages rcc, latent_lab and evals",
-      "required_disposition": "do not create a packaging fix for a problem that is not present; document repository-root bench separately if needed"
+      "id": "TOP_LEVEL_BENCH_ABSENT_FROM_WHEEL",
+      "sources": ["README.md"],
+      "baseline_verdict": "CONFIRMED_AFTER_INSTALLED_COMMAND_DISAMBIGUATION",
+      "evidence": "wheel includes latent_lab/bench but not the distinct top-level bench package used by README command python -m bench.run_bench",
+      "required_disposition": "include top-level bench in the wheel or declare it repository-only and provide an installed-package command that works"
     },
     {
       "id": "NO_SPEND_MACHINE_VERDICT",
