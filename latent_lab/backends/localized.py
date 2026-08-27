@@ -383,7 +383,7 @@ class CandidateScoreDetail:
 class LocalizedRecurrence:
     """Frozen-backbone localized recurrence with guarded latent loop."""
 
-    RUNTIME_CONTRACT_VERSION = "localized_recurrence.runtime.v4"
+    RUNTIME_CONTRACT_VERSION = "localized_recurrence.runtime.v5"
     TRAINING_GRADIENT_SEMANTICS = (
         "hidden_state_chain_bptt_with_detached_cache_recurrence"
     )
@@ -472,6 +472,9 @@ class LocalizedRecurrence:
             "readout_state_policy": (
                 "canonical_decoder_boundary_plus_latent_delta"
                 if self.neutral_delta else "absolute_latent_carrier"),
+            "state_ablation_target": (
+                "latent_delta" if self.neutral_delta
+                else "absolute_latent_carrier"),
             "gradient_checkpointing": "UNSUPPORTED_ABSENT",
             "candidate_scoring": "autoregressive_raw_per_token_logprobs",
             "same_adapter_supported_k": list(range(self.max_k + 1)),
@@ -594,16 +597,18 @@ class LocalizedRecurrence:
         """Apply the interval K times; GUARDED: no vocab/tokenizer activity.
 
         ablate keys (strictly validated; unknown keys/modes are fatal):
-          zero_state         -> post-recurrence readout carrier z zeroed
-          noise_state        -> post-recurrence readout carrier replaced by
-                                deterministic norm-matched noise
+          zero_state         -> post-recurrence carrier zeroed; neutral-delta
+                                mode instead zeros only zK-z0
+          noise_state        -> deterministic norm-matched noise replaces the
+                                carrier, or only zK-z0 in neutral-delta mode
           clocks             -> "identity"|"off"|"reverse"|
                                 "shuffle_perm:i,j,.." (full unique perm of
                                 range(k_steps); compute-matched)
           bypass_interval    -> interval layers replaced by identity
           truncate_k         -> effective step count reduced
           swap_state         -> caller replaces post-recurrence z with the
-                                 partner's post-recurrence carrier
+                                 partner carrier, or transfers only the
+                                 partner delta in neutral-delta mode
           reset_state        -> caller restores z0 after compute-matched loop
           reset_cache        -> caller restores the prompt-only cache after the
                                 compute-matched loop, before readout
@@ -618,6 +623,7 @@ class LocalizedRecurrence:
         idxs = parse_clock_mode(mode, k_steps)[:eff_k]
 
         lo, hi = self.interval
+        z_initial = z
         prompt_cache = None
         if self.neutral_delta:
             from ..backends.hf_qwen import cache_restore, cache_snapshot
@@ -652,14 +658,15 @@ class LocalizedRecurrence:
         # immediately before readout.  Ablating z0 would let the loop rebuild
         # information from the prompt cache and could falsely look state-free.
         if ab.get("zero_state"):
-            z = torch.zeros_like(z)
+            z = z_initial if self.neutral_delta else torch.zeros_like(z)
         if ab.get("noise_state"):
+            state = z - z_initial if self.neutral_delta else z
             g = torch.Generator(device=z.device.type)
             g.manual_seed(int(ab.get("noise_seed", 1234)))
             n = torch.randn(z.shape, generator=g, device=z.device,
                             dtype=torch.float32).to(z.dtype)
-            n = n / (n.norm() + 1e-8) * (z.norm() + 1e-8)
-            z = n
+            n = n / (n.norm() + 1e-8) * (state.norm() + 1e-8)
+            z = z_initial + n if self.neutral_delta else n
         return z, pos
 
     def logits_from_hidden(self, h_prenorm):
@@ -783,22 +790,29 @@ class LocalizedRecurrence:
 
         z, pos = self.latent_steps(
             z0, cache, loop_start, k_steps, ablate=ab)
+        neutral_readout_delta = (z - z0) if self.neutral_delta else None
         if partner_input_ids is not None:
             partner_ab = dict(ab)
             partner_ab.pop("swap_state", None)
             partner_z, _partner_pos = self.latent_steps(
                 partner_z0, partner_cache, partner_input_ids.shape[1],
                 k_steps, ablate=partner_ab)
-            z = partner_z
+            if self.neutral_delta:
+                neutral_readout_delta = partner_z - partner_z0
+                z = z0 + neutral_readout_delta
+            else:
+                z = partner_z
         if ab.get("reset_state"):
             # Position/compute-matched no-recurrence carrier control: execute
             # the full loop, then discard zK and read out the original z0.
             z = z0
+            if self.neutral_delta:
+                neutral_readout_delta = torch.zeros_like(z0)
         if prompt_cache is not None:
             # Orthogonal cache control: recurrence really executed and pos
             # remains prompt_len + effective_k, but readout sees prompt cache.
             cache_restore(cache, prompt_cache)
-        latent_delta = (z - z0) if self.neutral_delta else None
+        latent_delta = neutral_readout_delta
         readout_state = z0 + latent_delta if self.neutral_delta else z
         if cuda_device is not None:
             torch.cuda.synchronize(cuda_device)
@@ -909,11 +923,15 @@ class LocalizedRecurrence:
                 "prefill_tokens": target_prefill_tokens,
                 "partner_state_prefill_tokens": partner_prefill_tokens,
                 "latent_state_source": (
-                    "partner" if partner_input_ids is not None else "target"),
+                    ("partner_delta" if self.neutral_delta else "partner")
+                    if partner_input_ids is not None else "target"),
                 "prompt_cache_source": "target",
                 "latent_state_ablation_stage": (
                     "post_recurrence_readout"
                     if carrier_intervention else None),
+                "latent_state_ablation_target": (
+                    "latent_delta" if self.neutral_delta
+                    else "absolute_latent_carrier"),
                 "recurrence_cache_ablation_stage": (
                     "post_recurrence_pre_readout"
                     if ab.get("reset_cache") else None),

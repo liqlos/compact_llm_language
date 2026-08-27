@@ -304,6 +304,76 @@ def test_neutral_delta_full_reset_is_bit_exact_k0_after_opening_adapter():
     assert report.extra["readout_position"] == ids.shape[1]
 
 
+def test_neutral_delta_zero_and_noise_intervene_on_delta_not_absolute_z():
+    _model, rec2 = build_neutral_delta()
+    ids = torch.randint(0, 250, (1, 7))
+    generator = torch.Generator().manual_seed(92)
+    with torch.no_grad():
+        rec2.step_gates.fill_(0.6)
+        rec2.clock.weight.normal_(mean=0.0, std=0.1, generator=generator)
+        for adapter in rec2.injected:
+            adapter.lora_B.copy_(torch.randn(
+                adapter.lora_B.shape, generator=generator) * 0.1)
+
+        def run(ablate=None):
+            cache, z0 = rec2._encode(ids)
+            z, _ = rec2.latent_steps(
+                z0, cache, ids.shape[1], 4, ablate=ablate)
+            return z0, z
+
+        z0, clean = run()
+        zero_z0, zero = run({"zero_state": True})
+        noise_z0, noise = run({"noise_state": True, "noise_seed": 17})
+
+    assert torch.equal(z0, zero_z0) and torch.equal(z0, noise_z0)
+    assert torch.equal(zero, z0)
+    assert not torch.equal(zero, torch.zeros_like(zero))
+    clean_delta = clean - z0
+    noise_delta = noise - z0
+    assert torch.allclose(noise_delta.norm(), clean_delta.norm(),
+                          rtol=1e-5, atol=1e-6)
+    assert not torch.equal(noise_delta, clean_delta)
+
+
+def test_neutral_delta_swap_applies_partner_delta_to_target_z0(monkeypatch):
+    _model, rec2 = build_neutral_delta()
+    target_ids = torch.randint(0, 120, (1, 7))
+    partner_ids = torch.randint(130, 250, (1, 9))
+    generator = torch.Generator().manual_seed(93)
+    with torch.no_grad():
+        rec2.step_gates.fill_(0.6)
+        rec2.clock.weight.normal_(mean=0.0, std=0.1, generator=generator)
+        for adapter in rec2.injected:
+            adapter.lora_B.copy_(torch.randn(
+                adapter.lora_B.shape, generator=generator) * 0.1)
+        _target_cache, target_z0 = rec2._encode(target_ids)
+        partner_cache, partner_z0 = rec2._encode(partner_ids)
+        partner_z, _ = rec2.latent_steps(
+            partner_z0, partner_cache, partner_ids.shape[1], 4)
+        expected_delta = partner_z - partner_z0
+
+    captured = []
+    original = rec2._score_candidate_tokens
+
+    def capture(z, cache, pos, candidate_ids, *, grad=False,
+                latent_delta=None):
+        captured.append((z.detach().clone(), latent_delta.detach().clone()))
+        return original(z, cache, pos, candidate_ids, grad=grad,
+                        latent_delta=latent_delta)
+
+    monkeypatch.setattr(rec2, "_score_candidate_tokens", capture)
+    _details, report = rec2.score_candidates(
+        target_ids, ([10, 11],), 4, ablate={"swap_state": True},
+        partner_input_ids=partner_ids)
+
+    readout, actual_delta = captured[0]
+    assert torch.equal(actual_delta, expected_delta)
+    assert torch.equal(readout, target_z0 + expected_delta)
+    assert not torch.equal(actual_delta, partner_z - target_z0)
+    assert report.extra["latent_state_source"] == "partner_delta"
+    assert report.extra["latent_state_ablation_target"] == "latent_delta"
+
+
 def test_neutral_delta_multitoken_k4_matches_direct_incremental_hf_at_init():
     model, rec2 = build_neutral_delta()
     ids = torch.randint(0, 250, (1, 8))
