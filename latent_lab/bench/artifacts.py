@@ -500,11 +500,13 @@ def _reconcile_eval_identity(where: str, d: dict, ident: dict) -> None:
     if cfgp is not None:
         if not isinstance(cfgp, dict):
             raise ValueError(f"{where}: config is not an object")
+        # ``config`` is the immutable TRAINING recipe.  Its k/seed need not
+        # equal the eval arm's k_steps/seed (K=0 on a K>0 adapter and seeded
+        # swap/noise controls are required comparisons).  Eval K and seed are
+        # already bound by identity, the selected result, and every v3 record.
         for ckey, ikey in (("model", "model_id"),
                            ("revision", "revision"),
                            ("suite_sha256", "suite_sha256"),
-                           ("seed", "seed"),
-                           ("k", "k_steps"),
                            ("max_k", "max_k"),
                            ("interval", "interval")):
             if ckey not in cfgp:

@@ -1223,8 +1223,6 @@ def _mutated_payload(mut):
     ("top_suite", lambda d: d.update(suite_sha256="12" * 32)),
     ("top_split", lambda d: d.update(split="test_ood")),
     ("top_seed", lambda d: d.update(seed=2)),
-    ("config_k_says_K0", lambda d: d.update(config={"k": 0})),
-    ("config_seed", lambda d: d.update(config={"seed": 3})),
     ("config_model", lambda d: d.update(config={"model": "Other/Model"})),
     ("config_interval", lambda d: d.update(config={"interval": [6, 18]})),
     ("config_max_k", lambda d: d.update(config={"max_k": 8})),
@@ -1253,6 +1251,15 @@ def test_validate_eval_reconciles_every_duplicated_field(tmp_path, name,
     assert any(tok in msg for tok in
                ("contradict", "unexpected selected results",
                 "no matching results entry", "not the canonical")), msg
+
+
+def test_validate_eval_distinguishes_training_k_seed_from_eval_arm(tmp_path):
+    payload, _, _ = _current_v3_eval_payload()
+    payload["config"] = {"k": 1, "seed": 99}
+    ep = tmp_path / "different-training-k-seed.json"
+    ckpt.atomic_write_json(ep, payload)
+
+    assert artifacts.validate_eval(ep) == payload
 
 
 def test_validate_eval_exact_hostile_contradictory_payload_rejected(
