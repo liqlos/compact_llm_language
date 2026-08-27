@@ -1483,6 +1483,12 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
     def _rv_path(rv) -> str:
         return f"{rv['root']}/{rv['dir']}"
 
+    def _recipe_problems(rv) -> str:
+        return ",".join(
+            problem for problem in rv["report_problems"]
+            if str(problem).startswith("recipe:")
+        )
+
     if precision_missing:
         blocker("REPORT_TRAINABLE_PRECISION_MISSING",
                 f"{len(precision_missing)}/{len(retained_runs)} retained "
@@ -1504,9 +1510,7 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
                 f"not derivable from the validated config + suite hash, or "
                 f"differing from that derivation): "
                 + "; ".join(
-                    f"{_rv_path(rv)}: "
-                    f"{','.join(p for p in rv['report_problems']
-                                if str(p).startswith('recipe:'))}"
+                    f"{_rv_path(rv)}: {_recipe_problems(rv)}"
                     for rv in sorted(recipe_failures,
                                      key=_rv_path)))
     if suite_mismatch:
