@@ -101,6 +101,7 @@ from .eval_v3 import (
     EvalV3Error,
     aggregate_records as aggregate_v3_records,
     canonical_sha256 as canonical_v3_sha256,
+    validate_record_against_current_suite,
 )
 
 GATE_SCHEMA_VERSION = 1
@@ -580,17 +581,23 @@ def validate_train_report(report: dict) -> dict:
                 selected_v3_adapter_state_sha256,
             )
             try:
+                raw_v3_records = [record for entry in hist
+                                  for record in entry["records"]]
+                for record in raw_v3_records:
+                    validate_record_against_current_suite(
+                        record, expected_split="validation")
                 raw_v3_selection = select_v3_checkpoint_from_raw_history(hist)
                 raw_selected_state_sha256 = \
                     selected_v3_adapter_state_sha256(
                         hist, expected_step=report.get("best_step"),
                         expected_metric=report.get("best_val_acc"))
             except (ValueError, EvalV3Error) as exc:
+                raw_v3_selection = None
+                raw_v3_records = []
+                raw_selected_state_sha256 = None
                 problems.append(
                     "val_history:v3_raw_records_invalid:" + str(exc))
             else:
-                raw_v3_records = [record for entry in hist
-                                  for record in entry["records"]]
                 run_id = report.get("run_id")
                 adapter_id = report.get("adapter_id")
                 provenance = report.get("selection_provenance")
@@ -675,6 +682,14 @@ def validate_train_report(report: dict) -> dict:
         sel = (raw_v3_selection
                if history_schema == EVAL_V3_SUMMARY_SCHEMA_VERSION
                else select_legacy_checkpoint(hist))
+        selection_provenance = (
+            "latent_eval.v3"
+            if history_schema == EVAL_V3_SUMMARY_SCHEMA_VERSION
+            and raw_v3_selection is not None
+            else INVALID_RECORDS
+            if history_schema == EVAL_V3_SUMMARY_SCHEMA_VERSION
+            else IRRECOVERABLE_LEGACY_SCORER
+        )
         reported_acc = report.get("best_val_acc")
         reported_step = report.get("best_step")
         if sel is not None and isinstance(reported_acc, (int, float)) \
@@ -687,10 +702,7 @@ def validate_train_report(report: dict) -> dict:
                 "recomputed_best_metric": sel.metric,
                 "reported_best_step": reported_step,
                 "reported_best_metric": float(reported_acc),
-                "provenance": ("latent_eval.v3"
-                               if history_schema
-                               == EVAL_V3_SUMMARY_SCHEMA_VERSION
-                               else IRRECOVERABLE_LEGACY_SCORER),
+                "provenance": selection_provenance,
                 "consistent_with_reported": bool(
                     sel.step == reported_step
                     and math.isclose(float(reported_acc), sel.metric,
@@ -699,10 +711,7 @@ def validate_train_report(report: dict) -> dict:
             }
         elif sel is None:
             selection = {"recomputed_best_step": None,
-                         "provenance": ("latent_eval.v3"
-                                        if history_schema
-                                        == EVAL_V3_SUMMARY_SCHEMA_VERSION
-                                        else IRRECOVERABLE_LEGACY_SCORER),
+                         "provenance": selection_provenance,
                          "consistent_with_reported": False}
     return {
         "problems": problems,
@@ -1078,6 +1087,9 @@ def evaluate_eval_file(path: Path, examples_by_id: dict | None,
             return out
         try:
             metrics = aggregate_v3_records(records)
+            for record in records:
+                validate_record_against_current_suite(
+                    record, expected_split=data["split"])
         except EvalV3Error as exc:
             out["status"] = INVALID_RECORDS
             out["detail"] = f"latent_eval.v3 validation failed: {exc}"

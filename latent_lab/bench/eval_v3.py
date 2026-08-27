@@ -16,6 +16,7 @@ import json
 import math
 import random
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -645,6 +646,103 @@ def validate_record(record: Mapping[str, Any]) -> dict[str, Any]:
     if claimed_hash != canonical_sha256(core):
         raise EvalV3Error("record_sha256 mismatch")
     return dict(data)
+
+
+@lru_cache(maxsize=1)
+def _current_suite_binding() -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build the immutable benchmark identity used by current evidence.
+
+    Schema-valid raw scores are not sufficient evidence: the record must
+    describe the exact canonical example whose id it claims.  Keeping the
+    lookup here gives artifact validation, checkpoint selection, offline
+    rescore, and the no-spend gate one record-to-suite truth.
+    """
+    from latent_lab.bench.suite_v3 import (
+        SUITE_IDENTITY,
+        SUITE_VERSION,
+        build_suite,
+    )
+
+    suite = build_suite()
+    manifest = suite.manifest()
+    suite_hash = suite.records_hash()
+    if manifest.get("suite_identity") != SUITE_IDENTITY \
+            or manifest.get("suite_version") != SUITE_VERSION \
+            or manifest.get("suite_hash") != suite_hash:
+        raise EvalV3Error("canonical behavioral-v3 suite is not self-consistent")
+    examples = {
+        example.ex_id: example
+        for split_examples in suite.splits().values()
+        for example in split_examples
+    }
+    identity = {
+        "suite_id": SUITE_IDENTITY,
+        "version": SUITE_VERSION,
+        "sha256": suite_hash,
+    }
+    return identity, examples
+
+
+def current_suite_identity() -> dict[str, Any]:
+    """Return a copy of the immutable suite identity eligible as current."""
+    identity, _ = _current_suite_binding()
+    return dict(identity)
+
+
+def validate_record_against_current_suite(
+    record: Mapping[str, Any],
+    *,
+    expected_split: str | None = None,
+) -> dict[str, Any]:
+    """Bind a valid raw record to its exact behavioral-v3 example.
+
+    The generic ``latent_eval.v3`` validator proves internal consistency.
+    This evidence-bound validator additionally proves that suite identity,
+    split membership, prompt, family, actual candidate order, permutation
+    metadata, and gold fields came from the immutable current suite.
+    """
+    data = validate_record(record)
+    suite_identity, examples = _current_suite_binding()
+    if data["suite_identity"] != suite_identity:
+        raise EvalV3Error(
+            "suite_identity does not match the canonical behavioral-v3 suite")
+    if expected_split is not None and data["split"] != expected_split:
+        raise EvalV3Error(
+            f"split {data['split']!r} does not match expected split "
+            f"{expected_split!r}")
+
+    example = examples.get(data["example_id"])
+    if example is None:
+        raise EvalV3Error(
+            f"example_id {data['example_id']!r} is absent from behavioral-v3")
+    expected_prompt_hash = hashlib.sha256(
+        example.prompt.encode("utf-8")
+    ).hexdigest()
+    checks = (
+        ("split", data["split"], example.split),
+        ("family", data["family"], example.family),
+        ("prompt_hash", data["prompt_hash"], expected_prompt_hash),
+        ("candidates", data["candidates"], list(example.candidates)),
+        (
+            "candidate_permutation_seed",
+            data["candidate_permutation_seed"],
+            example.candidate_permutation_seed,
+        ),
+        (
+            "candidate_permutation",
+            data["candidate_permutation"],
+            list(example.candidate_permutation),
+        ),
+        ("gold_answer", data["gold_answer"], example.answer),
+        ("gold_index", data["gold_index"], example.gold_index),
+    )
+    mismatches = [field for field, actual, expected in checks
+                  if actual != expected]
+    if mismatches:
+        raise EvalV3Error(
+            f"example_id {data['example_id']!r} disagrees with canonical "
+            "behavioral-v3 fields: " + ", ".join(mismatches))
+    return data
 
 
 def aggregate_records(records: Iterable[Mapping[str, Any]]) -> dict[str, Any]:

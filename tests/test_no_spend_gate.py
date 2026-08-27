@@ -294,28 +294,35 @@ class TestRescoreEligibility:
 
 
 def _gate_v3_record(ex, *, split="test_id", hit=True,
-                    checkpoint_content_hash="b" * 64):
+                    checkpoint_content_hash="b" * 64,
+                    record_overrides=None):
     from latent_lab.bench.eval_v3 import build_eval_record, canonical_sha256
 
-    scores = [([-0.01] if (candidate == ex.answer) == hit else [-2.0])
-              for candidate in ex.candidates]
     permutation = getattr(ex, "candidate_permutation", None) \
         or tuple(range(len(ex.candidates)))
     permutation_seed = getattr(ex, "candidate_permutation_seed", 0)
-    return build_eval_record(
-        run_id="run-v3", recipe_hash=canonical_sha256(_canonical_recipe()),
-        model_id="Qwen/Qwen3.5-2B", model_revision=PINNED_REV_2B,
-        adapter_id="runs/E_k4_s0", checkpoint_id="best_params.pt",
-        checkpoint_content_hash=checkpoint_content_hash,
-        suite_id="behavioral-v3", suite_version=3,
-        suite_hash=g.current_suite_sha256(), example_id=ex.ex_id,
-        split=split, family=ex.family, prompt=ex.prompt,
-        candidates=ex.candidates,
-        candidate_permutation_seed=permutation_seed,
-        candidate_permutation=permutation, gold_answer=ex.answer,
-        per_token_logprobs=scores, k=4,
-        recurrence_config={"interval": [12, 18], "trained_k": 4},
-        compute={
+    metadata = {
+        "run_id": "run-v3",
+        "recipe_hash": canonical_sha256(_canonical_recipe()),
+        "model_id": "Qwen/Qwen3.5-2B",
+        "model_revision": PINNED_REV_2B,
+        "adapter_id": "runs/E_k4_s0",
+        "checkpoint_id": "best_params.pt",
+        "checkpoint_content_hash": checkpoint_content_hash,
+        "suite_id": "behavioral-v3",
+        "suite_version": 3,
+        "suite_hash": g.current_suite_sha256(),
+        "example_id": ex.ex_id,
+        "split": split,
+        "family": ex.family,
+        "prompt": ex.prompt,
+        "candidates": ex.candidates,
+        "candidate_permutation_seed": permutation_seed,
+        "candidate_permutation": permutation,
+        "gold_answer": ex.answer,
+        "k": 4,
+        "recurrence_config": {"interval": [12, 18], "trained_k": 4},
+        "compute": {
             "prefill_layers": 12,
             "recurrence_interval_applications": 24,
             "k_loops": 4,
@@ -327,7 +334,14 @@ def _gate_v3_record(ex, *, split="test_id", hit=True,
             "peak_memory_bytes": None,
             "successful_task": True,
         },
-    )
+    }
+    metadata.update(record_overrides or {})
+    scores = [
+        ([-0.01]
+         if (candidate == metadata["gold_answer"]) == hit else [-2.0])
+        for candidate in metadata["candidates"]
+    ]
+    return build_eval_record(per_token_logprobs=scores, **metadata)
 
 
 def _gate_eval_payload(record, *, adapter="runs/E_k4_s0", records=None):
@@ -381,6 +395,30 @@ def test_gate_recognizes_only_valid_independently_rescored_v3(tmp_path):
     path.write_text(json.dumps(payload))
     rejected = g.evaluate_eval_file(path, {ex.ex_id: ex}, root_label="2b")
     assert rejected["status"] == INVALID_RECORDS
+
+
+def test_gate_rejects_real_example_id_with_fabricated_current_suite_fields(
+        tmp_path):
+    ex = _suite_ex()
+    fabricated_candidates = tuple(
+        f"fabricated-{index}" for index in range(len(ex.candidates)))
+    record = _gate_v3_record(ex, record_overrides={
+        "family": "fabricated-family",
+        "prompt": "fabricated prompt",
+        "candidates": fabricated_candidates,
+        "candidate_permutation_seed": -777,
+        "candidate_permutation": tuple(
+            reversed(range(len(fabricated_candidates)))),
+        "gold_answer": fabricated_candidates[0],
+    })
+    path = tmp_path / "malicious-current-v3.json"
+    path.write_text(json.dumps(_gate_eval_payload(record)))
+
+    rejected = g.evaluate_eval_file(
+        path, {ex.ex_id: ex}, root_label="2b")
+    assert rejected["status"] == INVALID_RECORDS
+    assert "canonical behavioral-v3 fields" in rejected["detail"]
+    assert rejected.get("evidence_class") != "VALID_CURRENT"
 
 
 def test_gate_classifies_derived_only_legacy_as_irrecoverable(tmp_path):
@@ -507,6 +545,44 @@ def test_train_report_selection_accepts_only_latent_eval_v3_history():
     rejected = g.validate_train_report(report)
     assert "selected_adapter_state_sha256:mismatch_with_selected_raw_history" \
         in rejected["problems"]
+
+
+def test_train_report_rejects_schema_valid_fabricated_validation_history():
+    from latent_lab.bench.latent_run import canonical_v3_history_entry
+
+    ex = _suite_ex("validation-")
+    fabricated_candidates = tuple(
+        f"fabricated-{index}" for index in range(len(ex.candidates)))
+    record = _gate_v3_record(
+        ex,
+        split="validation",
+        record_overrides={
+            "family": "fabricated-family",
+            "prompt": "fabricated prompt",
+            "candidates": fabricated_candidates,
+            "candidate_permutation_seed": -777,
+            "candidate_permutation": tuple(
+                reversed(range(len(fabricated_candidates)))),
+            "gold_answer": fabricated_candidates[0],
+        },
+    )
+    report = _valid_report(best_val_acc=1.0, best_step=100)
+    report["val_history"] = [canonical_v3_history_entry(100, [record])]
+    report["selected_adapter_state_sha256"] = record[
+        "checkpoint_identity"]["content_sha256"]
+
+    rejected = g.validate_train_report(report)
+    assert any(
+        problem.startswith("val_history:v3_raw_records_invalid:")
+        and "canonical behavioral-v3 fields" in problem
+        for problem in rejected["problems"]
+    )
+    assert rejected["selection_check"] == {
+        "recomputed_best_step": None,
+        "provenance": INVALID_RECORDS,
+        "consistent_with_reported": False,
+    }
+    assert rejected["identity"]["selected_adapter_state_sha256"] is None
 
 
 def _suite_ex(prefix="test_id-"):

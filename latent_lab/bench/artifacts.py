@@ -332,7 +332,12 @@ def _validate_eval_result(where: str, name: str, res, identity=None) -> None:
         raise ValueError(
             f"{where}: results[{name!r}] has no complete raw records")
     from latent_lab.bench.eval_v3 import (
-        SCHEMA_VERSION, EvalV3Error, aggregate_records)
+        SCHEMA_VERSION,
+        EvalV3Error,
+        aggregate_records,
+        current_suite_identity,
+        validate_record_against_current_suite,
+    )
     v3_flags = [isinstance(record, dict)
                 and record.get("schema_version") == SCHEMA_VERSION
                 for record in records]
@@ -346,6 +351,17 @@ def _validate_eval_result(where: str, name: str, res, identity=None) -> None:
                 f"{where}: results[{name!r}].n must equal v3 record count")
         try:
             recomputed = aggregate_records(records)
+            # Non-current suite artifacts may remain schema-valid for
+            # historical/migration inspection, but can never pass the
+            # current no-spend gate.  An envelope claiming the current suite
+            # hash must make the hard record-to-example join here.
+            if (identity or {}).get("suite_sha256") \
+                    == current_suite_identity()["sha256"]:
+                for record in records:
+                    validate_record_against_current_suite(
+                        record,
+                        expected_split=identity.get("split"),
+                    )
         except EvalV3Error as exc:
             raise ValueError(
                 f"{where}: results[{name!r}] invalid latent_eval.v3: "

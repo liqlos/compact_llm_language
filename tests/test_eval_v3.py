@@ -24,6 +24,7 @@ from latent_lab.bench.eval_v3 import (
     scorer_identity,
     select_best_checkpoint,
     validate_record,
+    validate_record_against_current_suite,
 )
 
 
@@ -94,6 +95,45 @@ def _record(*, scores=((-3.0,), (-0.1,), (-2.0,)), **metadata):
     return build_eval_record(per_token_logprobs=scores, **_metadata(**metadata))
 
 
+def _current_suite_record(**over):
+    from latent_lab.bench.suite_v3 import build_suite
+
+    suite = build_suite()
+    example = suite.validation[0]
+    metadata = {
+        "run_id": "bound-run",
+        "recipe_hash": SHA_A,
+        "model_id": "tiny-model",
+        "model_revision": "revision-1",
+        "adapter_id": "bound-adapter",
+        "checkpoint_id": "step-10",
+        "checkpoint_content_hash": SHA_B,
+        "suite_id": "behavioral-v3",
+        "suite_version": 3,
+        "suite_hash": suite.records_hash(),
+        "example_id": example.ex_id,
+        "split": example.split,
+        "family": example.family,
+        "prompt": example.prompt,
+        "candidates": example.candidates,
+        "candidate_permutation_seed": example.candidate_permutation_seed,
+        "candidate_permutation": example.candidate_permutation,
+        "gold_answer": example.answer,
+        "k": 2,
+        "recurrence_config": {
+            "interval": [2, 4], "gradient_semantics": "truncated_cache"
+        },
+        "compute": _compute(),
+    }
+    metadata.update(over)
+    scores = tuple(
+        (-0.1,) if candidate == metadata["gold_answer"] else (-2.0,)
+        for candidate in metadata["candidates"]
+    )
+    return example, build_eval_record(
+        per_token_logprobs=scores, **metadata)
+
+
 @pytest.mark.parametrize("gold_index", range(4))
 def test_gold_at_every_candidate_position_is_derived_from_answer(gold_index):
     candidates = tuple(f"c{i}" for i in range(4))
@@ -131,6 +171,62 @@ def test_candidate_permutation_preserves_semantic_verdict():
     assert first["gold_index"] != second["gold_index"]
     assert first["predicted_answer"] == second["predicted_answer"] == "green"
     assert first["correctness"] == second["correctness"] is True
+
+
+def test_current_evidence_record_binds_to_exact_canonical_example():
+    example, record = _current_suite_record()
+    assert validate_record_against_current_suite(
+        record, expected_split="validation") == record
+    assert record["example_id"] == example.ex_id
+
+
+@pytest.mark.parametrize(
+    "field,overrides",
+    [
+        ("family", {"family": "fabricated-family"}),
+        ("prompt_hash", {"prompt": "fabricated prompt"}),
+        ("candidate_permutation_seed", {"candidate_permutation_seed": -991}),
+    ],
+)
+def test_real_example_id_and_suite_hash_cannot_bind_fabricated_fields(
+        field, overrides):
+    _, record = _current_suite_record(**overrides)
+    with pytest.raises(EvalV3Error, match=field):
+        validate_record_against_current_suite(
+            record, expected_split="validation")
+
+
+def test_current_suite_binding_rejects_internally_valid_candidate_gold_and_order(
+):
+    example, _ = _current_suite_record()
+    candidates = list(example.candidates)
+    non_gold = next(i for i, value in enumerate(candidates)
+                    if value != example.answer)
+    candidates[non_gold] = "fabricated-candidate"
+    _, fabricated_candidates = _current_suite_record(
+        candidates=tuple(candidates))
+
+    wrong_gold = next(value for value in example.candidates
+                      if value != example.answer)
+    _, fabricated_gold = _current_suite_record(gold_answer=wrong_gold)
+
+    swapped_candidates = tuple(reversed(example.candidates))
+    _, corrupted_order = _current_suite_record(
+        candidates=swapped_candidates,
+        candidate_permutation=tuple(reversed(example.candidate_permutation)),
+    )
+    _, corrupted_permutation = _current_suite_record(
+        candidate_permutation=tuple(reversed(example.candidate_permutation)))
+
+    for record, expected_field in (
+        (fabricated_candidates, "candidates"),
+        (fabricated_gold, "gold_answer"),
+        (corrupted_order, "candidates"),
+        (corrupted_permutation, "candidate_permutation"),
+    ):
+        with pytest.raises(EvalV3Error, match=expected_field):
+            validate_record_against_current_suite(
+                record, expected_split="validation")
 
 
 def test_unequal_token_lengths_use_preregistered_mean_not_raw_sum():

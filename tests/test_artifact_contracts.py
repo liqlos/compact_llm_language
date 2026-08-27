@@ -637,40 +637,58 @@ def test_validate_eval_requires_full_identity_block(tmp_path):
         assert drop in str(ei.value)
 
 
-def test_validate_eval_accepts_only_self_consistent_latent_eval_v3(tmp_path):
+def _current_v3_eval_payload(**record_overrides):
     from latent_lab.bench.eval_v3 import aggregate_records, build_eval_record
+    from latent_lab.bench.suite_v3 import build_suite
 
-    payload = build_eval_payload()
+    suite = build_suite()
+    example = suite.test_id[0]
+    payload = build_eval_payload(identity={
+        **EVAL_IDENTITY,
+        "suite_sha256": suite.records_hash(),
+    })
     ident = payload["identity"]
-    record = build_eval_record(
-        run_id="run-v3", recipe_hash="a" * 64,
-        model_id=ident["model_id"], model_revision=ident["revision"],
-        adapter_id=payload["adapter"], checkpoint_id="best_params.pt",
-        checkpoint_content_hash=ident["checkpoint_content_digest"],
-        suite_id="behavioral-v3", suite_version=3,
-        suite_hash=ident["suite_sha256"], example_id="e-v3",
-        split=ident["split"], family="fsm", prompt="prompt",
-        candidates=("A", "B"), candidate_permutation_seed=1,
-        candidate_permutation=(1, 0), gold_answer="B",
-        per_token_logprobs=((-2.0,), (-0.1, -0.1)), k=ident["k_steps"],
-        recurrence_config={"interval": [12, 18],
-                           "gradient_semantics": "truncated_cache"},
-        compute={
+    metadata = {
+        "run_id": "run-v3", "recipe_hash": "a" * 64,
+        "model_id": ident["model_id"], "model_revision": ident["revision"],
+        "adapter_id": payload["adapter"], "checkpoint_id": "best_params.pt",
+        "checkpoint_content_hash": ident["checkpoint_content_digest"],
+        "suite_id": "behavioral-v3", "suite_version": 3,
+        "suite_hash": ident["suite_sha256"], "example_id": example.ex_id,
+        "split": example.split, "family": example.family,
+        "prompt": example.prompt, "candidates": example.candidates,
+        "candidate_permutation_seed": example.candidate_permutation_seed,
+        "candidate_permutation": example.candidate_permutation,
+        "gold_answer": example.answer, "k": ident["k_steps"],
+        "recurrence_config": {"interval": [12, 18],
+                              "gradient_semantics": "truncated_cache"},
+        "compute": {
             "prefill_layers": 12,
             "recurrence_interval_applications": 24,
             "k_loops": 4,
-            "candidate_tail_layers": 12,
-            "lm_head_calls": 2,
-            "tokenizer_calls": 3,
+            "candidate_tail_layers": len(example.candidates) * 6,
+            "lm_head_calls": len(example.candidates),
+            "tokenizer_calls": len(example.candidates) + 1,
             "decode_calls": 0,
             "wall_seconds": 0.1,
             "peak_memory_bytes": None,
             "successful_task": True,
         },
+    }
+    metadata.update(record_overrides)
+    scores = tuple(
+        (-0.1,) if candidate == metadata["gold_answer"] else (-2.0,)
+        for candidate in metadata["candidates"]
     )
+    record = build_eval_record(per_token_logprobs=scores, **metadata)
     payload["results"]["clean"].update(
         n=1, metrics=aggregate_records([record]), records=[record])
     payload["results"]["clean"].pop("accuracy")
+    return payload, record, example
+
+
+def test_validate_eval_accepts_only_self_consistent_latent_eval_v3(tmp_path):
+    payload, _, _ = _current_v3_eval_payload()
     ep = tmp_path / "eval-v3.json"
     ckpt.atomic_write_json(ep, payload)
     assert artifacts.validate_eval(ep) == payload
@@ -679,6 +697,34 @@ def test_validate_eval_accepts_only_self_consistent_latent_eval_v3(tmp_path):
     ckpt.atomic_write_json(ep, payload)
     with pytest.raises(ValueError, match="content_sha256"):
         artifacts.validate_eval(ep)
+
+
+def test_validate_eval_rejects_schema_valid_fabricated_current_suite_record(
+        tmp_path):
+    _, _, example = _current_v3_eval_payload()
+    fabricated_candidates = tuple(
+        f"fabricated-{index}" for index in range(len(example.candidates)))
+    payload, _, _ = _current_v3_eval_payload(
+        family="fabricated-family",
+        prompt="fabricated prompt",
+        candidates=fabricated_candidates,
+        candidate_permutation_seed=-777,
+        candidate_permutation=tuple(reversed(range(len(fabricated_candidates)))),
+        gold_answer=fabricated_candidates[
+            (example.gold_index + 1) % len(fabricated_candidates)],
+    )
+    ep = tmp_path / "malicious-v3.json"
+    ckpt.atomic_write_json(ep, payload)
+    with pytest.raises(ValueError, match="canonical behavioral-v3 fields") \
+            as exc:
+        artifacts.validate_eval(ep)
+    message = str(exc.value)
+    for field in (
+        "family", "prompt_hash", "candidates",
+        "candidate_permutation_seed", "candidate_permutation",
+        "gold_answer", "gold_index",
+    ):
+        assert field in message
 
 
 def test_validate_eval_binds_expected_split_ablation_k_seed(tmp_path):
