@@ -1027,6 +1027,18 @@ def test_ablation_parsers_reject_unknown_modes():
         validate_ablation({"clocks": "sideways"}, 4)
     assert validate_ablation({"reset_state": True}, 4) == {
         "reset_state": True}
+    assert validate_ablation({"reset_cache": True}, 4) == {
+        "reset_cache": True}
+    assert validate_ablation(
+        {"reset_state": True, "reset_cache": True}, 4) == {
+            "reset_state": True, "reset_cache": True}
+    for bad in (None, 0, 1, "true"):
+        with pytest.raises(ValueError, match="reset_cache must be a boolean"):
+            validate_ablation({"reset_cache": bad}, 4)
+    for incompatible in ("zero_state", "noise_state", "swap_state"):
+        with pytest.raises(ValueError, match="may only be combined"):
+            validate_ablation(
+                {"reset_cache": True, incompatible: True}, 4)
 
 
 def test_shuffle_requires_full_unique_compute_matched_permutation():
@@ -1138,6 +1150,80 @@ def test_readout_reset_is_compute_and_position_matched_but_restores_z0():
     assert reset_report.extra["recurrence_cache_at_readout"] == \
         "prompt_plus_target_recurrence"
     assert reset_scores != clean_scores
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_carrier_cache_reset_2x2_matches_manual_multitoken_readout():
+    """Carrier/cache axes are independent and both survive into token 2+."""
+    from latent_lab.backends.hf_qwen import cache_restore, cache_snapshot
+
+    rec = _nonzero_adapted_rec(_tiny_qwen35(17, 6), seed=23,
+                               interval=(2, 4))
+    candidates = [[100, 101, 103], [102, 104, 106]]
+    k_steps = 2
+
+    def manual(reset_state: bool, reset_cache: bool):
+        with torch.no_grad():
+            cache, z0 = rec._encode(_IDS)
+            prompt_cache = cache_snapshot(cache)
+            z, pos = rec.latent_steps(
+                z0, cache, _IDS.shape[1], k_steps)
+            if reset_state:
+                z = z0
+            if reset_cache:
+                cache_restore(cache, prompt_cache)
+            readout_cache = cache_snapshot(cache)
+            out = []
+            for candidate in candidates:
+                cache_restore(cache, readout_cache)
+                token_logprobs, _ = rec._score_candidate_tokens(
+                    z, cache, pos, torch.tensor([candidate]))
+                out.append(tuple(float(value) for value in token_logprobs))
+            return out, pos
+
+    observed = {}
+    for reset_state, reset_cache in (
+            (False, False), (True, False), (False, True), (True, True)):
+        ablate = {}
+        if reset_state:
+            ablate["reset_state"] = True
+        if reset_cache:
+            ablate["reset_cache"] = True
+        expected, expected_pos = manual(reset_state, reset_cache)
+        details, report = rec.score_candidates(
+            _IDS, candidates, k_steps, ablate=ablate)
+        actual = [detail.token_logprobs for detail in details]
+        assert actual == expected
+        assert report.extra["recurrence_effective_k"] == k_steps
+        assert report.extra["readout_position"] == expected_pos == (
+            _IDS.shape[1] + k_steps)
+        assert report.extra["recurrence_cache_at_readout"] == (
+            "target_prompt_only" if reset_cache else
+            "prompt_plus_target_recurrence")
+        assert report.extra["recurrence_cache_ablation_stage"] == (
+            "post_recurrence_pre_readout" if reset_cache else None)
+        observed[(reset_state, reset_cache)] = actual[0]
+
+    # Both axes must make a real, non-roundoff difference on a multi-token
+    # candidate, at either fixed value of the other axis.
+    for reset_state in (False, True):
+        a = torch.tensor(observed[(reset_state, False)])
+        b = torch.tensor(observed[(reset_state, True)])
+        assert float((a - b).abs().max()) > 1e-6
+    for reset_cache in (False, True):
+        a = torch.tensor(observed[(False, reset_cache)])
+        b = torch.tensor(observed[(True, reset_cache)])
+        assert float((a - b).abs().max()) > 1e-6
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_evaluation_only_resets_fail_closed_in_training_loss():
+    rec = _nonzero_adapted_rec(_tiny_qwen35(11, 6), interval=(2, 4))
+    answer = torch.tensor([_ANS])
+    for ablate in ({"reset_state": True}, {"reset_cache": True},
+                   {"reset_state": True, "reset_cache": True}):
+        with pytest.raises(ValueError, match="evaluation-only"):
+            rec.loss_on_example(_IDS, answer, 2, ablate=ablate)
 
 
 # ---------------------------------------------------------------------------

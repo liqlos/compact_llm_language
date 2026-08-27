@@ -238,7 +238,7 @@ def make_step_clock(hidden: int, max_k: int, device=None):
 CLOCK_MODES = ("identity", "off", "reverse")
 KNOWN_ABLATION_KEYS = ("zero_state", "noise_state", "noise_seed", "clocks",
                        "bypass_interval", "truncate_k", "swap_state",
-                       "reset_state")
+                       "reset_state", "reset_cache")
 
 
 def parse_clock_mode(mode, k_steps: int):
@@ -295,6 +295,8 @@ def validate_ablation(ablate, k_steps: int) -> dict:
         raise ValueError("zero_state must be a boolean")
     if "reset_state" in ab and not isinstance(ab["reset_state"], bool):
         raise ValueError("reset_state must be a boolean")
+    if "reset_cache" in ab and not isinstance(ab["reset_cache"], bool):
+        raise ValueError("reset_cache must be a boolean")
     for key in ("noise_state", "swap_state"):
         if key in ab and not isinstance(ab[key], bool):
             raise ValueError(f"{key} must be a boolean")
@@ -305,6 +307,11 @@ def validate_ablation(ablate, k_steps: int) -> dict:
         raise ValueError(
             f"state interventions are mutually exclusive: "
             f"{active_state_controls}")
+    if ab.get("reset_cache") and any(
+            ab.get(key) for key in ("zero_state", "noise_state", "swap_state")):
+        raise ValueError(
+            "reset_cache may only be combined with reset_state; "
+            "zero_state/noise_state/swap_state remain mutually exclusive")
     if "bypass_interval" in ab \
             and not isinstance(ab["bypass_interval"], bool):
         raise ValueError("bypass_interval must be a boolean")
@@ -500,8 +507,10 @@ class LocalizedRecurrence:
           bypass_interval    -> interval layers replaced by identity
           truncate_k         -> effective step count reduced
           swap_state         -> caller replaces post-recurrence z with the
-                                partner's post-recurrence carrier
+                                 partner's post-recurrence carrier
           reset_state        -> caller restores z0 after compute-matched loop
+          reset_cache        -> caller restores the prompt-only cache after the
+                                compute-matched loop, before readout
         """
         if isinstance(k_steps, bool) or not isinstance(k_steps, int) \
                 or not 0 <= k_steps <= self.max_k:
@@ -625,11 +634,12 @@ class LocalizedRecurrence:
                 "state intervention")
 
         # Cache/prompt context always belongs to the evaluated example.
-        # State interventions replace only the post-recurrence readout carrier;
-        # target recurrence cache remains fixed across clean/zero/noise/swap.
+        # Carrier interventions preserve the target recurrence cache.  The
+        # orthogonal reset_cache arm alone snapshots prompt-only cache state.
         cache, z0 = self._encode(input_ids)
+        prompt_cache = cache_snapshot(cache) if ab.get("reset_cache") else None
         partner_prefill_tokens = 0
-        state_intervention = bool(
+        carrier_intervention = bool(
             ab.get("zero_state") or ab.get("noise_state")
             or ab.get("swap_state") or ab.get("reset_state"))
         loop_start = input_ids.shape[1]
@@ -655,6 +665,10 @@ class LocalizedRecurrence:
             # Position/compute-matched no-recurrence carrier control: execute
             # the full loop, then discard zK and read out the original z0.
             z = z0
+        if prompt_cache is not None:
+            # Orthogonal cache control: recurrence really executed and pos
+            # remains prompt_len + effective_k, but readout sees prompt cache.
+            cache_restore(cache, prompt_cache)
         if cuda_device is not None:
             torch.cuda.synchronize(cuda_device)
         t2 = time.perf_counter()
@@ -761,9 +775,16 @@ class LocalizedRecurrence:
                     "partner" if partner_input_ids is not None else "target"),
                 "prompt_cache_source": "target",
                 "latent_state_ablation_stage": (
-                    "post_recurrence_readout" if state_intervention else None),
+                    "post_recurrence_readout"
+                    if carrier_intervention else None),
+                "recurrence_cache_ablation_stage": (
+                    "post_recurrence_pre_readout"
+                    if ab.get("reset_cache") else None),
                 "recurrence_cache_at_readout": (
+                    "target_prompt_only" if ab.get("reset_cache") else
                     "prompt_plus_target_recurrence"),
+                "recurrence_start_position": loop_start,
+                "readout_position": pos,
                 "prefill_layer_applications": prefill_apps,
                 "recurrence_interval_layer_applications": recurrence_apps,
                 "recurrence_effective_k": effective_k,
@@ -838,8 +859,12 @@ class LocalizedRecurrence:
         from ..backends.hf_qwen import cache_restore, cache_snapshot
 
         ab = validate_ablation(ablate or {}, k_steps)
-        if ab.get("swap_state"):
-            raise ValueError("swap_state training requires an explicit partner")
+        eval_only = [key for key in ("swap_state", "reset_state", "reset_cache")
+                     if ab.get(key)]
+        if eval_only:
+            raise ValueError(
+                f"evaluation-only ablation(s) {eval_only} are unsupported in "
+                "loss_on_example")
         cache, z0 = self._encode(input_ids, grad=True)
         if detach_z0:
             z0 = z0.detach()
