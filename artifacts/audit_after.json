@@ -222,6 +222,14 @@
       "result": "PASS"
     },
     {
+      "command_scope": "documented_default_pytest_clean_python_3_11",
+      "result": "399 passed, 166 skipped in 16.77s"
+    },
+    {
+      "command_scope": "default_pytest_project_python_3_14_venv",
+      "result": "399 passed, 345 skipped in 17.75s"
+    },
+    {
       "command_scope": "wheel_build_verify_clean_python_3_11_install_and_import",
       "result": "PASS; rcc-0.1.0-py3-none-any.whl contains bench, evals, latent_lab and rcc"
     },

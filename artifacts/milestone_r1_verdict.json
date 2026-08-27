@@ -13,6 +13,8 @@
     "python_3_14_compileall": "PASS",
     "rcc_core_python_3_11": "83 passed",
     "rcc_core_python_3_14": "83 passed",
+    "documented_default_clean_python_3_11": "399 passed, 166 skipped",
+    "project_venv_default": "399 passed, 345 skipped",
     "local_lab_and_transformer_tiers": "270 passed, 1 skipped, 473 deselected",
     "package_build_verify_clean_install_import": "PASS",
     "remote_ci": "CONFIGURED_NOT_EXECUTED"
@@ -109,7 +111,7 @@
     },
     {
       "path": "artifacts/audit_after.json",
-      "sha256": "0b480ac99116cd98236bef586a744ba70c642de7481185499f6a209349449497"
+      "sha256": "193c5398aa092f1a8e97c6a986f1c4fc6e3df5679c2dc22123a41c7d548d8670"
     },
     {
       "path": "artifacts/adversarial_review_r1.json",
