@@ -170,9 +170,11 @@ def validate_run(run_dir, *, expected: dict | None = None) -> dict:
     every remaining behavior-changing field. Unknown expectation keys
     are rejected; nothing is silently ignored.
     """
-    from latent_lab.bench.latent_run import recipe_from_config
+    from latent_lab.bench.latent_run import (
+        recipe_from_config, selected_v3_adapter_state_sha256)
     from latent_lab.train.checkpointing import (
         CHECKPOINT_FILE, TRAIN_REPORT_FILE, inspect_adapter_bundle,
+        validate_selected_adapter_state_binding,
         verify_generation,
     )
 
@@ -252,6 +254,19 @@ def validate_run(run_dir, *, expected: dict | None = None) -> dict:
         raise ValueError(
             f"{where}: checkpoint content digest {content_digest} != "
             "report checkpoint_content_digest")
+    try:
+        raw_selected_state_sha256 = selected_v3_adapter_state_sha256(
+            report.get("val_history"), expected_step=report.get("best_step"),
+            expected_metric=report.get("best_val_acc"))
+        validate_selected_adapter_state_binding(
+            report=report, manifest=manifest,
+            actual_state_sha256=bundle_meta["adapter_state_sha256"],
+            raw_selected_state_sha256=raw_selected_state_sha256,
+            where=where)
+    except Exception as exc:
+        raise ValueError(
+            f"{where}: selected checkpoint state is not bound to raw "
+            f"validation evidence: {exc}") from exc
 
     if expected:
         unknown = sorted(set(expected) - set(_EXPECT_FLAGS))

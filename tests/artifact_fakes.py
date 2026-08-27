@@ -12,6 +12,7 @@ from latent_lab.train.checkpointing import (
     CHECKPOINT_FILE,
     RUN_MANIFEST_FILE,
     TRAIN_REPORT_FILE,
+    adapter_state_sha256,
     atomic_write_json,
     save_adapter_bundle,
     sha256_file,
@@ -81,20 +82,61 @@ def build_verified_run(out_dir, *, config=None) -> dict:
     c = dict(config if config is not None else BASE_CFG)
     write_run_status(out_dir, "complete")
     ckpt_path = out_dir / CHECKPOINT_FILE
+    state = _state()
     bundle = save_adapter_bundle(
-        ckpt_path, _state(), model_id=c["model"], revision=c["revision"],
+        ckpt_path, state, model_id=c["model"], revision=c["revision"],
         recipe=recipe_from_config(c, c.get("suite_sha256", SUITE_SHA)),
         metrics={"best_val_acc": 0.5})
     recipe = bundle["recipe"]
+    state_sha256 = adapter_state_sha256(state)
+    from latent_lab.bench.eval_v3 import build_eval_record, canonical_sha256
+    from latent_lab.bench.latent_run import canonical_v3_history_entry
+
+    compute = {
+        "prefill_layers": 12,
+        "recurrence_interval_applications": 24,
+        "k_loops": 4,
+        "candidate_tail_layers": 12,
+        "lm_head_calls": 2,
+        "tokenizer_calls": 3,
+        "decode_calls": 0,
+        "wall_seconds": 0.01,
+        "peak_memory_bytes": None,
+        "successful_task": True,
+    }
+    records = []
+    for index, rows in enumerate((([-0.1], [-1.0]),
+                                  ([-2.0], [-0.2]))):
+        records.append(build_eval_record(
+            run_id="verified-test-run", recipe_hash=canonical_sha256(recipe),
+            model_id=c["model"], model_revision=c["revision"],
+            adapter_id=str(out_dir), checkpoint_id="step-100",
+            checkpoint_content_hash=state_sha256,
+            suite_id="behavioral-v3", suite_version=3,
+            suite_hash=c.get("suite_sha256", SUITE_SHA),
+            example_id=f"validation-{index}", split="validation",
+            family="fsm", prompt=f"state {index}",
+            candidates=("yes", "no"), candidate_permutation_seed=index,
+            candidate_permutation=(0, 1), gold_answer="yes",
+            per_token_logprobs=rows, k=c["k"],
+            recurrence_config={"interval": c["interval"],
+                               "trained_k": c["k"]},
+            compute=compute))
     report = {
+        "run_id": "verified-test-run",
+        "adapter_id": str(out_dir),
         "config": c,
         "model": c["model"], "revision": c["revision"],
         "suite_sha256": c.get("suite_sha256", SUITE_SHA),
         "recipe": recipe,
+        "selection_provenance":
+            "latent_eval.v3_recomputed_from_raw_validation_records",
+        "selected_adapter_state_sha256": state_sha256,
         "checkpoint_content_digest": bundle["content_digest"],
         "checkpoint_sha256": sha256_file(ckpt_path),
         "best_val_acc": 0.5, "best_step": 100,
-        "val_history": [], "final_train_loss": 0.1,
+        "val_history": [canonical_v3_history_entry(100, records)],
+        "final_train_loss": 0.1,
     }
     manifest = {
         "kind": "latent_lab.train_generation", "status": "complete",
@@ -108,6 +150,7 @@ def build_verified_run(out_dir, *, config=None) -> dict:
         "identity": {"model_id": c["model"], "revision": c["revision"]},
         "recipe": recipe,
         "suite_sha256": c.get("suite_sha256", SUITE_SHA),
+        "selected_adapter_state_sha256": state_sha256,
         "checkpoint_content_digest": bundle["content_digest"],
         "checkpoint_sha256": sha256_file(ckpt_path),
         "wall_seconds": 1.0,

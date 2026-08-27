@@ -387,6 +387,24 @@ def test_gate_classifies_derived_only_legacy_as_irrecoverable(tmp_path):
     assert verdict["status"] == g.IRRECOVERABLE_LEGACY_SCORER
 
 
+def test_old_suite_derived_only_eval_keeps_irrecoverable_classification(
+        tmp_path):
+    ex = _suite_ex()
+    path = tmp_path / "legacy-old-suite.json"
+    payload = _eval_for("runs/E_k4_s0", "test_id", [{
+        "ex_id": ex.ex_id, "family": ex.family, "depth": ex.depth,
+        "correct": 1.0, "rank_of_gold": 0,
+        "n_candidates": len(ex.candidates),
+    }])
+    payload["suite_sha256"] = "0" * 64
+    path.write_text(json.dumps(payload))
+    verdict = g.evaluate_eval_file(path, {ex.ex_id: ex}, root_label="2b")
+    assert verdict["status"] == g.IRRECOVERABLE_LEGACY_SCORER
+    assert verdict["evidence_class"] == g.IRRECOVERABLE_LEGACY_SCORER
+    assert any("suite_mismatch" in reason
+               for reason in verdict["additional_reasons"])
+
+
 # ---------------------------------------------------------------------------
 # synthetic corpus + gate end-to-end
 # ---------------------------------------------------------------------------
@@ -424,6 +442,10 @@ def _valid_report(**over) -> dict:
             **_semantic_config(),
             "device": "cuda",
             "train_examples": 490,
+            "model": "Qwen/Qwen3.5-2B",
+            "revision": PINNED_REV_2B,
+            "label": "E_k4_s0",
+            "suite_sha256": g.current_suite_sha256(),
         },
         "model": "Qwen/Qwen3.5-2B",
         "revision": PINNED_REV_2B,
@@ -465,11 +487,20 @@ def test_train_report_selection_accepts_only_latent_eval_v3_history():
         canonical_v3_history_entry(200, [record]),
         canonical_v3_history_entry(100, [record]),
     ]
+    report["selected_adapter_state_sha256"] = record[
+        "checkpoint_identity"]["content_sha256"]
     check = g.validate_train_report(report)
     assert "val_history:legacy_scorer_noncanonical" not in check["problems"]
     assert check["history_schema"] == "latent_eval.summary.v3"
     assert check["selection_check"]["consistent_with_reported"] is True
     assert check["selection_check"]["provenance"] == "latent_eval.v3"
+    assert not any("selected_adapter_state_sha256" in problem
+                   for problem in check["problems"])
+
+    report["selected_adapter_state_sha256"] = "f" * 64
+    rejected = g.validate_train_report(report)
+    assert "selected_adapter_state_sha256:mismatch_with_selected_raw_history" \
+        in rejected["problems"]
 
 
 def _suite_ex(prefix="test_id-"):
@@ -661,6 +692,25 @@ class TestGateEndToEnd:
         for b in v["blockers"]:
             assert b["smallest_next_action"].strip()
 
+    def test_old_suite_derived_only_counts_as_irrecoverable_blocker(
+            self, corpus):
+        path = (corpus[0] / "results" /
+                "ev_E_k4_s0_test_id_clean.json")
+        payload = json.loads(path.read_text())
+        payload["suite_sha256"] = "0" * 64
+        path.write_text(json.dumps(payload))
+
+        res = self.run_gate(corpus)
+        verdict = next(item for item
+                       in res.artifact_verdicts["evaluations"]
+                       if item["file"] == path.name)
+        assert verdict["status"] == g.IRRECOVERABLE_LEGACY_SCORER
+        assert res.gate_verdict["counts"][
+            "eval_files_missing_raw_prediction"] >= 1
+        assert any(
+            blocker["code"] == g.IRRECOVERABLE_LEGACY_SCORER
+            for blocker in res.gate_verdict["blockers"])
+
     def test_corrupt_checkpoint_classified_and_quarantine_analyzed(
             self, corpus):
         res = self.run_gate(corpus)
@@ -673,6 +723,63 @@ class TestGateEndToEnd:
         assert q["live_tree_duplicates_quarantine"] is True
         assert q["rejected_runs_with_nan_final_loss"] == ["E4_k1_s0"]
         assert q["live_vs_rejected_differing_files"] == []
+
+    def test_rejected_and_quarantine_duplicates_are_not_retained_or_blocking(
+            self, corpus):
+        import shutil
+
+        _, r4b = corpus
+        live = r4b / "runs" / "E4_k1_s0"
+        archived = (r4b / "quarantine" /
+                    "live_nan_duplicates_20260827" / "E4_k1_s0")
+        archived.parent.mkdir(parents=True)
+        shutil.move(str(live), str(archived))
+        # Preserved negative evals remain inventoried/classified, but must
+        # not join a current run or poison retained-evidence prerequisites.
+        negative_eval = archived / "ev_quarantined_invalid.json"
+        negative_eval.write_text("{}")
+
+        res = self.run_gate(corpus)
+        statuses = {item["id"]: item["status"]
+                    for item in res.gate_verdict["prerequisites"]}
+        assert statuses[g.PREREQ_QUARANTINE] == g.STATUS_PROVEN
+        assert not res.artifact_verdicts["duplicate_checkpoint_bindings"]
+        assert res.artifact_verdicts[
+            "preserved_negative_duplicate_bindings"]
+        four_b = [run for run in res.artifact_verdicts["runs"]
+                  if run["root"] == "4b"]
+        assert four_b and all(run["scope"] == "rejected_negative"
+                              for run in four_b)
+        eval_entry = next(
+            item for item in res.artifact_verdicts["evaluations"]
+            if item.get("artifact_rel", "").endswith(
+                "ev_quarantined_invalid.json"))
+        assert eval_entry["scope"] == "rejected_negative"
+        assert eval_entry["status"] == "invalid_metadata"
+        assert eval_entry["bound_run"] is None
+        assert eval_entry["binding_excluded_reason"]
+        counts = res.gate_verdict["counts"]
+        assert counts["eval_files_inventoried"] \
+            == counts["eval_files_checked"] + 1
+        assert counts["eval_files_rejected_negative"] == 1
+        assert not any(
+            "ev_quarantined_invalid.json" in blocker["detail"]
+            for blocker in res.gate_verdict["blockers"])
+        assert not any(
+            blocker["code"] == "DUPLICATE_CHECKPOINT_BINDING"
+            for blocker in res.gate_verdict["blockers"])
+
+        # Restoring the same bytes under runs/ makes the ambiguity/live
+        # quarantine leak current again and must block.
+        shutil.copytree(archived, live)
+        live_res = self.run_gate(corpus)
+        live_statuses = {item["id"]: item["status"]
+                         for item in live_res.gate_verdict["prerequisites"]}
+        assert live_statuses[g.PREREQ_QUARANTINE] == g.STATUS_FAILED
+        assert live_res.artifact_verdicts["duplicate_checkpoint_bindings"]
+        assert any(
+            blocker["code"] == "DUPLICATE_CHECKPOINT_BINDING"
+            for blocker in live_res.gate_verdict["blockers"])
 
     def test_strict_fp32_bundle_from_project_loader_is_LOADABLE(
             self, corpus):
@@ -947,7 +1054,9 @@ class TestGateEndToEnd:
         p.write_text(json.dumps(ev))
         res = self.run_gate(corpus)
         entry = res.artifact_verdicts["evaluations"][0]
-        assert entry["status"] == "suite_mismatch"
+        assert entry["status"] == g.IRRECOVERABLE_LEGACY_SCORER
+        assert any("suite_mismatch" in reason
+                   for reason in entry["additional_reasons"])
         codes = {b["code"] for b in res.gate_verdict["blockers"]}
         assert "EVAL_FILE_INVALID" in codes
         assert res.verdict == "NOT_READY"
@@ -1321,7 +1430,10 @@ class TestGateEndToEnd:
 
         import torch
 
-        from latent_lab.train.checkpointing import save_adapter_bundle
+        from latent_lab.train.checkpointing import (
+            adapter_state_sha256, save_adapter_bundle, sha256_file,
+            write_run_status, write_train_generation,
+        )
 
         r2b, r4b = corpus
         shutil.rmtree(r4b / "runs")           # live 4B tree holds nothing
@@ -1329,24 +1441,50 @@ class TestGateEndToEnd:
         from latent_lab.bench.latent_run import canonical_v3_history_entry
 
         val_ex = _suite_ex("validation-")
+        state = {"lora.A": torch.eye(2, dtype=torch.float32)}
+        selected_state_sha256 = adapter_state_sha256(state)
         losing = _gate_v3_record(val_ex, split="validation", hit=False,
                                  checkpoint_content_hash="1" * 64)
         winning = _gate_v3_record(val_ex, split="validation", hit=True,
-                                  checkpoint_content_hash="2" * 64)
+                                  checkpoint_content_hash=
+                                  selected_state_sha256)
         rep = _valid_report(best_val_acc=1.0, best_step=200,
                             val_history=[
                                 canonical_v3_history_entry(100, [losing]),
                                 canonical_v3_history_entry(200, [winning]),
                             ])
         rep["trainable_precision"] = "fp32"
-        (run / "train_report.json").write_text(json.dumps(rep))
+        rep["selected_adapter_state_sha256"] = selected_state_sha256
+        rep["suite_identity"] = "behavioral-v3"
+        rep["suite_version"] = 3
         os.remove(run / "best_params.pt")
         bundle = save_adapter_bundle(
-            run / "best_params.pt",
-            {"lora.A": torch.eye(2, dtype=torch.float32)},
+            run / "best_params.pt", state,
             model_id="Qwen/Qwen3.5-2B", revision=PINNED_REV_2B,
             recipe=rep["recipe"],
             metrics={"best_score": 1.0, "best_step": 200})
+        rep["checkpoint_content_digest"] = bundle["content_digest"]
+        rep["checkpoint_sha256"] = sha256_file(run / "best_params.pt")
+        manifest = {
+            "kind": "latent_lab.train_generation", "status": "complete",
+            "argv": ["python", "-m", "latent_lab.bench.latent_run",
+                     "train"],
+            "command": "python -m latent_lab.bench.latent_run train",
+            "dependencies": {"python": "test", "torch": "test"},
+            "precision": {"backbone_dtype": "torch.float32"},
+            "seed": 0, "label": "E_k4_s0",
+            "identity": {"model_id": "Qwen/Qwen3.5-2B",
+                         "revision": PINNED_REV_2B},
+            "run_id": "run-v3", "recipe": rep["recipe"],
+            "suite_identity": "behavioral-v3", "suite_version": 3,
+            "suite_sha256": g.current_suite_sha256(),
+            "selected_adapter_state_sha256": selected_state_sha256,
+            "checkpoint_content_digest": bundle["content_digest"],
+            "checkpoint_sha256": sha256_file(run / "best_params.pt"),
+            "wall_seconds": 1.0,
+        }
+        write_run_status(run, "complete")
+        write_train_generation(run, manifest=manifest, report=rep)
         # remove legacy_run's schema-violating report tree entirely
         shutil.rmtree(r2b / "runs" / "legacy_run")
 
@@ -1367,8 +1505,41 @@ class TestGateEndToEnd:
         assert v["blockers"] == []
         assert v["inputs"]["source_fingerprints"]["unchanged_during_gate"]
         fp = v["inputs"]["source_fingerprints"]["results_2b"]["files"]
-        assert fp == 2 + len(g.REQUIRED_SPLITS)
+        assert fp == 4 + len(g.REQUIRED_SPLITS)
         assert g._exit_for("READY") == 0
+
+        # A different, fully valid bundle cannot inherit the genuine raw
+        # best-step history even if every bundle/file/eval digest is
+        # coherently refreshed around it.
+        replacement = {"lora.A": torch.full((2, 2), 3.0,
+                                             dtype=torch.float32)}
+        swapped = save_adapter_bundle(
+            run / "best_params.pt", replacement,
+            model_id="Qwen/Qwen3.5-2B", revision=PINNED_REV_2B,
+            recipe=rep["recipe"],
+            metrics={"best_score": 1.0, "best_step": 200})
+        assert adapter_state_sha256(replacement) != selected_state_sha256
+        rep["checkpoint_content_digest"] = swapped["content_digest"]
+        rep["checkpoint_sha256"] = sha256_file(run / "best_params.pt")
+        manifest["checkpoint_content_digest"] = swapped["content_digest"]
+        write_train_generation(run, manifest=manifest, report=rep)
+        for split in g.REQUIRED_SPLITS:
+            records = _full_split_v3_records(
+                split, swapped["content_digest"])
+            (r2b / "results" /
+             f"ev_E_k4_s0_{split}_clean.json").write_text(
+                json.dumps(_v3_eval_for("runs/E_k4_s0", split, records)))
+
+        rejected = g.run_gate(
+            r2b, r4b, repo_root=None, skip_proof_tests=True,
+            proof_result=PROOF_OK)
+        assert rejected.gate_verdict["verdict"] != "READY"
+        current = next(
+            run_verdict for run_verdict
+            in rejected.artifact_verdicts["runs"]
+            if run_verdict["run_id"] == "E_k4_s0")
+        assert current["generation_state_binding_valid"] is False
+        assert current["checkpoint"]["classification"] == "invalid"
 
     def test_canonical_outputs_byte_stable_and_timestamp_free(
             self, corpus, tmp_path):

@@ -357,6 +357,18 @@ def discover_run_dirs(root: Path) -> list[Path]:
     return found
 
 
+def _evidence_scope(label: str, rel: str) -> str:
+    """Classify a path without hiding preserved negative evidence.
+
+    Rejected/quarantine trees remain inventoried and hashed, but only paths
+    outside those trees can participate in current report/checkpoint gates.
+    """
+    parts = Path(rel).parts
+    negative = any(part.startswith("_rejected") or part == "quarantine"
+                   for part in parts)
+    return "rejected_negative" if negative else "retained_candidate"
+
+
 def _classify_file_kind(name: str) -> str:
     if name == "train_report.json":
         return "train_report"
@@ -519,6 +531,7 @@ def validate_train_report(report: dict) -> dict:
     history_schema = None
     raw_v3_selection = None
     raw_v3_records = []
+    raw_selected_state_sha256 = None
     if not isinstance(hist, list) or not hist:
         problems.append("val_history:missing_or_empty")
     else:
@@ -556,10 +569,16 @@ def validate_train_report(report: dict) -> dict:
             # Summary labels are not evidence.  Recompute every validation
             # checkpoint from its retained raw token rows through the exact
             # helper used by the trainer before permitting selection.
-            from latent_lab.bench.latent_run import \
-                select_v3_checkpoint_from_raw_history
+            from latent_lab.bench.latent_run import (
+                select_v3_checkpoint_from_raw_history,
+                selected_v3_adapter_state_sha256,
+            )
             try:
                 raw_v3_selection = select_v3_checkpoint_from_raw_history(hist)
+                raw_selected_state_sha256 = \
+                    selected_v3_adapter_state_sha256(
+                        hist, expected_step=report.get("best_step"),
+                        expected_metric=report.get("best_val_acc"))
             except (ValueError, EvalV3Error) as exc:
                 problems.append(
                     "val_history:v3_raw_records_invalid:" + str(exc))
@@ -576,6 +595,12 @@ def validate_train_report(report: dict) -> dict:
                 if provenance != \
                         "latent_eval.v3_recomputed_from_raw_validation_records":
                     problems.append("selection_provenance:not_raw_v3")
+                declared_state = report.get(
+                    "selected_adapter_state_sha256")
+                if declared_state != raw_selected_state_sha256:
+                    problems.append(
+                        "selected_adapter_state_sha256:"
+                        "mismatch_with_selected_raw_history")
                 for index, record in enumerate(raw_v3_records):
                     checks = (
                         ("run_id", record["run_id"], run_id),
@@ -686,6 +711,10 @@ def validate_train_report(report: dict) -> dict:
             "recipe_hash": (
                 canonical_v3_sha256(derived_recipe)
                 if derived_recipe is not None else None),
+            "selected_adapter_state_sha256": (
+                raw_selected_state_sha256
+                if report.get("selected_adapter_state_sha256")
+                == raw_selected_state_sha256 else None),
             # The canonical recipe ONLY when it was derived from the
             # validated config + validated suite hash AND the report's
             # declared recipe equals it; otherwise None (fail closed).
@@ -769,6 +798,7 @@ def classify_checkpoint(path: Path, *, report_identity: dict | None,
 def _classify_bundle(raw: dict, path: Path, report_identity,
                      report_recipe: dict | None, info: dict) -> dict:
     from ..train.checkpointing import (
+        adapter_state_sha256,
         AdapterBundleIdentityError,
         AdapterBundleSchemaError,
         CheckpointError,
@@ -828,6 +858,16 @@ def _classify_bundle(raw: dict, path: Path, report_identity,
     # string claiming fp32 proves nothing.
     info["tensor_dtypes"] = sorted({str(t.dtype) for t in tensors.values()})
     info["n_tensors"] = len(tensors)
+    state_sha256 = adapter_state_sha256(tensors)
+    info["adapter_state_sha256"] = state_sha256
+    expected_state_sha256 = (report_identity or {}).get(
+        "selected_adapter_state_sha256")
+    if expected_state_sha256 is not None \
+            and state_sha256 != expected_state_sha256:
+        info["classification"] = CKPT_INVALID
+        info["reasons"].append(
+            "bundle_state_disagrees_with_selected_raw_validation_state")
+        return info
     bad_dtypes = sorted({str(t.dtype) for t in tensors.values()
                          if t.is_floating_point()
                          and str(t.dtype) != "torch.float32"})
@@ -921,12 +961,9 @@ def evaluate_eval_file(path: Path, examples_by_id: dict | None,
 
     matches = data["suite_sha256"] == current_suite_sha256()
     out["suite_sha256_matches_current_suite"] = matches
-    if not matches:
-        out["status"] = "suite_mismatch"
-        out["detail"] = (
-            f"declared suite {data['suite_sha256'][:12]}… != current "
-            f"{current_suite_sha256()[:12]}…")
-        return out
+    suite_mismatch_detail = (
+        f"declared suite {data['suite_sha256'][:12]}… != current "
+        f"{current_suite_sha256()[:12]}…") if not matches else None
 
     records: list = []
     results_obj = data.get("results")
@@ -955,6 +992,50 @@ def evaluate_eval_file(path: Path, examples_by_id: dict | None,
     id_field = "example_id" if is_v3 else "ex_id"
     out["record_ex_ids"] = sorted({str(r.get(id_field)) for r in records
                                    if isinstance(r, dict)})
+    legacy_outcome = None
+
+    # Historical schema/raw availability is classified before suite
+    # eligibility.  An old-suite derived-only artifact is specifically
+    # irrecoverable legacy evidence, not a generic suite mismatch; the suite
+    # mismatch remains an additional reason and still blocks current use.
+    if not is_v3:
+        if examples_by_id is None:
+            examples_by_id = suite_examples_by_id()
+        from .corrected_scoring import rescore_records
+
+        outcome = rescore_records(records, examples_by_id)
+        if outcome.status == RESCORED_CORRECTED:
+            out["status"] = HISTORICAL_UNBOUND_LEGACY_SCORER
+            out["evidence_class"] = HISTORICAL_UNBOUND_LEGACY_SCORER
+            out["legacy_rescore_fraction"] = outcome.corrected_accuracy
+        elif outcome.status == MISSING_RAW_PREDICTION:
+            out["status"] = IRRECOVERABLE_LEGACY_SCORER
+            out["evidence_class"] = IRRECOVERABLE_LEGACY_SCORER
+        else:
+            out["status"] = outcome.status
+        # Current-suite raw legacy rows still undergo split-membership
+        # validation below. Derived-only/invalid or old-suite legacy rows are
+        # already fully classified here.
+        if outcome.status == RESCORED_CORRECTED and matches:
+            legacy_outcome = outcome
+        reasons = []
+        if outcome.detail:
+            reasons.append(outcome.detail)
+        if suite_mismatch_detail:
+            reasons.append("suite_mismatch: " + suite_mismatch_detail)
+            out["additional_reasons"] = [
+                "suite_mismatch: " + suite_mismatch_detail]
+        if reasons:
+            out["detail"] = "; ".join(reasons)
+        if outcome.flag_counts:
+            out["flag_counts"] = outcome.flag_counts
+        if legacy_outcome is None:
+            return out
+
+    if not matches:
+        out["status"] = "suite_mismatch"
+        out["detail"] = suite_mismatch_detail
+        return out
 
     # Relational identity check: every record in a required-split file must
     # reference an example that canonically BELONGS to the preregistered
@@ -973,6 +1054,9 @@ def evaluate_eval_file(path: Path, examples_by_id: dict | None,
                 f"({len(out['record_ex_ids'])} distinct ids present): "
                 f"{shown}")
             return out
+
+    if legacy_outcome is not None:
+        return out
 
     if is_v3:
         # A handful of raw rows are insufficient if the surrounding file is
@@ -1019,26 +1103,7 @@ def evaluate_eval_file(path: Path, examples_by_id: dict | None,
         out["metrics"] = metrics
         return out
 
-    if examples_by_id is None:
-        examples_by_id = suite_examples_by_id()
-
-    from .corrected_scoring import rescore_records
-
-    outcome = rescore_records(records, examples_by_id)
-    if outcome.status == RESCORED_CORRECTED:
-        out["status"] = HISTORICAL_UNBOUND_LEGACY_SCORER
-        out["evidence_class"] = HISTORICAL_UNBOUND_LEGACY_SCORER
-        out["legacy_rescore_fraction"] = outcome.corrected_accuracy
-    elif outcome.status == MISSING_RAW_PREDICTION:
-        out["status"] = IRRECOVERABLE_LEGACY_SCORER
-        out["evidence_class"] = IRRECOVERABLE_LEGACY_SCORER
-    else:
-        out["status"] = outcome.status
-    if outcome.detail:
-        out["detail"] = outcome.detail
-    if outcome.flag_counts:
-        out["flag_counts"] = outcome.flag_counts
-    return out
+    raise AssertionError("unreachable eval schema branch")
 
 
 _SUITE_CACHE: dict | None = None
@@ -1117,6 +1182,7 @@ def analyze_quarantine(scanned: list[ScannedFile]) -> dict:
 
     live = files_under("runs/")
     rejected = files_under("_rejected_nan_batch/")
+    quarantined = files_under("quarantine/")
     marker = rejected.get("REJECTED.md")
     identical, differing, only_live, only_rej = [], [], [], []
     for rel in sorted(set(live) | set(rejected)):
@@ -1132,7 +1198,17 @@ def analyze_quarantine(scanned: list[ScannedFile]) -> dict:
             only_rej.append(rel)
     # ANY byte-identical quarantined file still present live is a blocker;
     # a differing sibling must not mask the remaining identical copies.
-    live_dupes_quarantine = bool(identical)
+    negative_by_hash: dict[str, list[str]] = {}
+    for prefix, files in (("_rejected_nan_batch/", rejected),
+                          ("quarantine/", quarantined)):
+        for rel, scanned_file in files.items():
+            negative_by_hash.setdefault(scanned_file.sha256, []).append(
+                prefix + rel)
+    live_negative_duplicates = sorted(
+        f"runs/{rel} == {negative_rel}"
+        for rel, scanned_file in live.items()
+        for negative_rel in negative_by_hash.get(scanned_file.sha256, ()))
+    live_dupes_quarantine = bool(live_negative_duplicates)
 
     nan_runs, fake_best_runs, unreadable_runs = [], [], []
     for rel, f in sorted(rejected.items()):
@@ -1182,12 +1258,16 @@ def analyze_quarantine(scanned: list[ScannedFile]) -> dict:
         "live_run_dirs": sorted({r.split("/")[0] for r in live
                                  if r.endswith("/train_report.json")}),
         "rejected_run_dirs": rejected_reports,
+        "quarantine_run_dirs": sorted({
+            r.split("/")[1] if len(r.split("/")) > 1 else r.split("/")[0]
+            for r in quarantined if r.endswith("/train_report.json")}),
         "quarantine_marker_present": marker is not None,
         "live_vs_rejected_identical_files": identical,
         "live_vs_rejected_differing_files": differing,
         "only_in_live": only_live,
         "only_in_rejected": only_rej,
         "live_tree_duplicates_quarantine": live_dupes_quarantine,
+        "live_vs_negative_identical_files": live_negative_duplicates,
         "rejected_batch_empty": not rejected_reports,
         "marker_only_empty_quarantine": marker_only_empty,
         "rejected_runs_with_nan_final_loss": sorted(set(nan_runs)),
@@ -1310,7 +1390,9 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
                         if ri.checkpoint_rel}
     orphan_ckpts = [f for f in scanned
                     if f.kind == "adapter_checkpoint"
-                    and f"{f.label}/{f.rel}" not in claimed_ckpt_ids]
+                    and f"{f.label}/{f.rel}" not in claimed_ckpt_ids
+                    and _evidence_scope(f.label, f.rel)
+                    == "retained_candidate"]
 
     # Byte-identical checkpoint payloads owned by more than one run
     # directory make checkpoint->report binding ambiguous.
@@ -1325,24 +1407,28 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
             ckpt_hash_groups.setdefault(f.sha256, []).append(
                 f"{f.label}/{f.rel}")
     dup_binding_groups: list[dict] = []
+    preserved_negative_duplicate_groups: list[dict] = []
     for digest, members in sorted(ckpt_hash_groups.items()):
         owners = sorted({owner_of.get(m, ("<orphan>", "<orphan>"))
                          for m in members})
         if len(members) > 1 and len(owners) > 1:
-            dup_binding_groups.append({
+            group = {
                 "sha256": digest,
                 "members": sorted(members),
-                "owners": [f"{o[0]}/{o[1]}" for o in owners]})
+                "owners": [f"{o[0]}/{o[1]}" for o in owners]}
+            touches_current = any(
+                _evidence_scope(*member.split("/", 1))
+                == "retained_candidate" for member in members)
+            (dup_binding_groups if touches_current
+             else preserved_negative_duplicate_groups).append(group)
 
     # ---- per-run validation + classification -----------------------------
     run_verdicts = []
     for lbl in ("2b", "4b"):
         for ri in runs[lbl]:
+            scope = _evidence_scope(ri.root, ri.dir_rel)
             rv: dict = {"run_id": ri.run_id, "root": ri.root,
-                        "dir": ri.dir_rel,
-                        "scope": ("rejected_negative"
-                                  if ri.dir_rel.startswith("_rejected")
-                                  else "retained_candidate")}
+                        "dir": ri.dir_rel, "scope": scope}
             identity = None
             if ri.report is not None:
                 report_check = validate_train_report(ri.report)
@@ -1355,6 +1441,20 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
                 declared = identity.get("suite_sha256")
                 rv["suite_sha256_matches_current_suite"] = bool(
                     declared == current_suite_sha256())
+                if report_check["history_schema"] \
+                        == EVAL_V3_SUMMARY_SCHEMA_VERSION \
+                        and scope == "retained_candidate" and not dry_run:
+                    from latent_lab.bench.artifacts import validate_run
+                    run_root = results_2b if lbl == "2b" else results_4b
+                    try:
+                        validate_run(run_root / ri.dir_rel)
+                    except Exception as exc:  # fail closed on any join fault
+                        rv["report_problems"].append(
+                            "generation_state_binding_invalid:"
+                            f"{type(exc).__name__}:{exc}")
+                        rv["generation_state_binding_valid"] = False
+                    else:
+                        rv["generation_state_binding_valid"] = True
             else:
                 rv["report_problems"] = (
                     ["train_report:malformed_json"]
@@ -1393,19 +1493,33 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
     if not dry_run:
         for f in scanned:
             if f.kind == "eval_json":
-                eval_verdicts.append(evaluate_eval_file(
-                    f.abs, None, root_label=f.label))
+                evaluated = evaluate_eval_file(
+                    f.abs, None, root_label=f.label)
+                evaluated["artifact_rel"] = f.rel
+                evaluated["scope"] = _evidence_scope(f.label, f.rel)
+                eval_verdicts.append(evaluated)
     eval_verdicts.sort(key=lambda e: (e["root"], e["file"]))
+    retained_eval_verdicts = [
+        ev for ev in eval_verdicts
+        if ev["scope"] == "retained_candidate"
+    ]
 
     # Bind every eval to a discovered run via its adapter path; unbound
     # evals prove nothing and are blockers (symmetric discovery).
-    runs_by_adapter = {(rv["root"], _norm_adapter(rv["dir"])): rv
-                       for rv in run_verdicts}
-    for ev in eval_verdicts:
+    runs_by_adapter = {
+        (rv["root"], _norm_adapter(rv["dir"])): rv
+        for rv in run_verdicts if rv["scope"] == "retained_candidate"
+    }
+    for ev in retained_eval_verdicts:
         target = runs_by_adapter.get(
             (ev["root"], _norm_adapter(ev.get("adapter"))))
         ev["bound_run"] = (f"{target['root']}/{target['dir']}"
                            if target else None)
+    for ev in eval_verdicts:
+        if ev["scope"] == "rejected_negative":
+            ev["binding_excluded_reason"] = (
+                "preserved rejected/quarantine evidence is not current "
+                "eval evidence")
 
     # ---- 4B quarantine -----------------------------------------------------
     quarantine = analyze_quarantine(scanned) if results_4b.is_dir() else {}
@@ -1427,7 +1541,9 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
             "trustworthy")
 
     # ---- prerequisites -------------------------------------------------------
-    two_b_runs = [rv for rv in run_verdicts if rv["root"] == "2b"]
+    two_b_runs = [rv for rv in run_verdicts
+                  if rv["root"] == "2b"
+                  and rv["scope"] == "retained_candidate"]
     # Retained candidates = every non-rejected run carrying a checkpoint
     # payload (the retained 2B tree AND live 4B trees); quarantined negative
     # evidence stays classified/inventoried without gating strict-load.
@@ -1505,14 +1621,15 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
             f"{len(orphan_ckpts)} orphan, {len(dup_binding_groups)} "
             f"ambiguous duplicate bindings"))
 
-    bad_evals = [e for e in eval_verdicts
+    bad_evals = [e for e in retained_eval_verdicts
                  if e.get("status") in EVAL_BAD_STATUSES]
-    membership_violations = [e for e in eval_verdicts
+    membership_violations = [e for e in retained_eval_verdicts
                              if e.get("status")
                              == SPLIT_MEMBERSHIP_VIOLATION]
-    rescored = [e for e in eval_verdicts
+    rescored = [e for e in retained_eval_verdicts
                 if e.get("status") == RESCORED_CORRECTED]
-    orphan_evals = [e for e in eval_verdicts if e.get("bound_run") is None]
+    orphan_evals = [e for e in retained_eval_verdicts
+                    if e.get("bound_run") is None]
 
     # Retained candidates in EITHER root with strictly loadable checkpoints
     # must be proven by eval evidence — live 4B checkpoints carry the same
@@ -1530,7 +1647,7 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
             rid = f"{rv['root']}/{rv['dir']}"
             ident = rv.get("identity") or {}
             covered_ids: dict[str, set] = {s: set() for s in REQUIRED_SPLITS}
-            for ev in eval_verdicts:
+            for ev in retained_eval_verdicts:
                 if ev.get("bound_run") != rid:
                     continue
                 if ev.get("status") != RESCORED_CORRECTED:
@@ -1570,10 +1687,11 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
         rescore_status, rescore_detail = STATUS_UNPROVEN, \
             "eval payload inspection skipped (dry run)"
     elif (bad_evals or orphan_evals or identity_mismatches or coverage_gaps
-            or not eligible_rvs or not eval_verdicts):
+            or not eligible_rvs or not retained_eval_verdicts):
         rescore_status = STATUS_FAILED
         parts = [
-            f"{len(rescored)}/{len(eval_verdicts)} eval files rescored",
+            f"{len(rescored)}/{len(retained_eval_verdicts)} retained eval "
+            "files rescored",
             f"{len(bad_evals)} invalid/unrescorable",
             f"{len(orphan_evals)} unbound",
             f"{len(identity_mismatches)} identity mismatches",
@@ -1739,16 +1857,18 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
         listing = "; ".join(f"{e['file']}:{e['status']}"
                             for e in bad_evals[:8])
         blocker("EVAL_FILE_INVALID",
-                f"{len(bad_evals)}/{len(eval_verdicts)} eval files cannot "
+                f"{len(bad_evals)}/{len(retained_eval_verdicts)} retained "
+                f"eval files cannot "
                 f"support the rescore prerequisite ({summary}): {listing}")
-    non_rescorable = [e for e in eval_verdicts
+    non_rescorable = [e for e in retained_eval_verdicts
                       if e.get("status") in (
                           MISSING_RAW_PREDICTION,
                           IRRECOVERABLE_LEGACY_SCORER)]
     if non_rescorable:
         listing = "; ".join(f"{e['file']}" for e in non_rescorable[:8])
         blocker(IRRECOVERABLE_LEGACY_SCORER,
-                f"{len(non_rescorable)}/{len(eval_verdicts)} eval files "
+                f"{len(non_rescorable)}/{len(retained_eval_verdicts)} "
+                f"retained eval files "
                 f"retain only derived correct/rank_of_gold (or reference "
                 f"unknown examples) — corrected rescoring impossible "
                 f"offline: {listing}")
@@ -1767,7 +1887,8 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
             f"{e['file']} declares {e['split']}"
             for e in membership_violations[:8])
         blocker("EVAL_SPLIT_MEMBERSHIP_VIOLATION",
-                f"{len(membership_violations)}/{len(eval_verdicts)} eval "
+                f"{len(membership_violations)}/"
+                f"{len(retained_eval_verdicts)} retained eval "
                 f"file(s) contain records whose ex_id is outside the "
                 f"preregistered membership of their declared split "
                 f"(relabelling cannot manufacture coverage): {listing}")
@@ -1853,10 +1974,13 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
         "checkpoints_non_fp32_stored": n_bf16,
         "checkpoints_orphan": len(orphan_ckpts),
         "checkpoints_duplicate_binding_groups": len(dup_binding_groups),
-        "eval_files_checked": len(eval_verdicts),
+        "eval_files_checked": len(retained_eval_verdicts),
+        "eval_files_inventoried": len(eval_verdicts),
+        "eval_files_rejected_negative": (
+            len(eval_verdicts) - len(retained_eval_verdicts)),
         "eval_files_rescored_corrected": len(rescored),
         "eval_files_missing_raw_prediction": len(non_rescorable := [
-            e for e in eval_verdicts
+            e for e in retained_eval_verdicts
             if e.get("status") in (
                 MISSING_RAW_PREDICTION,
                 IRRECOVERABLE_LEGACY_SCORER)]),
@@ -1901,6 +2025,8 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
         "evaluations": eval_verdicts,
         "quarantine_4b": quarantine,
         "duplicate_checkpoint_bindings": dup_binding_groups,
+        "preserved_negative_duplicate_bindings":
+            preserved_negative_duplicate_groups,
         "required_splits": list(REQUIRED_SPLITS),
         "preregistered_split_sizes": {
             s: len(expected_by_split[s]) for s in REQUIRED_SPLITS},

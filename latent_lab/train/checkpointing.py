@@ -331,6 +331,16 @@ def write_train_generation(out_dir, *, manifest: dict,
     out_dir = Path(out_dir)
     report_path = out_dir / TRAIN_REPORT_FILE
     ckpt_path = out_dir / CHECKPOINT_FILE
+    selected_state = report.get("selected_adapter_state_sha256")
+    if not isinstance(selected_state, str) \
+            or not _SHA256_RE.fullmatch(selected_state):
+        raise CheckpointError(
+            "report selected_adapter_state_sha256 is missing/malformed; "
+            "refusing to publish an unbound generation")
+    if selected_state != manifest.get("selected_adapter_state_sha256"):
+        raise CheckpointError(
+            "report/manifest selected adapter state hashes disagree; "
+            "refusing to publish an incoherent generation")
     # report first, then its digest, then the manifest as the LAST write:
     # the manifest's arrival marks the generation as verifiable
     atomic_write_json(report_path, report)
@@ -343,8 +353,8 @@ def write_train_generation(out_dir, *, manifest: dict,
 
 RUN_MANIFEST_REQUIRED_KEYS = (
     "kind", "status", "report_sha256", "checkpoint_sha256",
-    "checkpoint_content_digest", "identity", "recipe", "suite_sha256",
-    "seed", "argv", "dependencies",
+    "checkpoint_content_digest", "selected_adapter_state_sha256",
+    "identity", "recipe", "suite_sha256", "seed", "argv", "dependencies",
 )
 
 
@@ -385,7 +395,8 @@ def verify_manifest_schema(manifest, *, where: str = "manifest") -> dict:
         raise CheckpointError(
             f"{where}: status {manifest.get('status')!r} is not 'complete'")
     for key in ("report_sha256", "checkpoint_sha256",
-                "checkpoint_content_digest"):
+                "checkpoint_content_digest",
+                "selected_adapter_state_sha256"):
         v = manifest.get(key)
         if not isinstance(v, str) or not _SHA256_RE.fullmatch(v):
             raise CheckpointError(f"{where}: {key} is not a 64-hex sha256")
@@ -814,6 +825,34 @@ def adapter_state_sha256(state) -> str:
     return h.hexdigest()
 
 
+def validate_selected_adapter_state_binding(
+        *, report, manifest, actual_state_sha256: str,
+        raw_selected_state_sha256: str, where: str = "checkpoint") -> str:
+    """Require one exact selected-state identity across all evidence layers."""
+    values = {
+        "report.selected_adapter_state_sha256": (
+            report.get("selected_adapter_state_sha256")
+            if isinstance(report, dict) else None),
+        "manifest.selected_adapter_state_sha256": (
+            manifest.get("selected_adapter_state_sha256")
+            if isinstance(manifest, dict) else None),
+        "loaded adapter_state_sha256": actual_state_sha256,
+        "selected raw-history checkpoint hash": raw_selected_state_sha256,
+    }
+    malformed = [name for name, value in values.items()
+                 if not isinstance(value, str)
+                 or not _SHA256_RE.fullmatch(value)]
+    if malformed:
+        raise AdapterBundleIdentityError(
+            f"{where}: malformed/missing selected-state identity at "
+            f"{malformed}")
+    if len(set(values.values())) != 1:
+        detail = ", ".join(f"{name}={value}" for name, value in values.items())
+        raise AdapterBundleIdentityError(
+            f"{where}: selected adapter state identity mismatch: {detail}")
+    return actual_state_sha256
+
+
 def compute_content_digest(bundle_core: dict) -> str:
     """Digest over identity + recipe + metrics + every tensor byte range."""
     h = hashlib.sha256()
@@ -1028,6 +1067,9 @@ def inspect_adapter_bundle(path, *, model_id, revision, recipe) -> dict:
                                        revision=revision, recipe=recipe)
     meta = {k: v for k, v in bundle.items() if k != "tensors"}
     meta["tensor_names"] = sorted(bundle["tensors"])
+    meta["adapter_state_sha256"] = adapter_state_sha256({
+        name: entry["data"] for name, entry in bundle["tensors"].items()
+    })
     return meta
 
 

@@ -471,6 +471,37 @@ def select_v3_checkpoint_from_raw_history(history, *, expected_identity=None):
     return select_v3_checkpoint(canonical)
 
 
+def selected_v3_adapter_state_sha256(history, *, expected_step=None,
+                                      expected_metric=None) -> str:
+    """Return the state hash bound by the canonically selected raw records.
+
+    Every record at the selected validation step must name the same adapter
+    state.  This is deliberately distinct from the final bundle content
+    digest, which also covers bundle metadata and metrics.
+    """
+    selected = select_v3_checkpoint_from_raw_history(history)
+    if selected is None:
+        raise ValueError("raw v3 history selects no checkpoint")
+    if expected_step is not None and selected.step != expected_step:
+        raise ValueError(
+            "raw v3 history selected step disagrees with reported best_step")
+    if expected_metric is not None and selected.metric != expected_metric:
+        raise ValueError(
+            "raw v3 history selected metric disagrees with reported best metric")
+    entries = [entry for entry in history if entry.get("step") == selected.step]
+    if len(entries) != 1:
+        raise ValueError(
+            "raw v3 history must contain exactly one selected-step entry")
+    hashes = {
+        record["checkpoint_identity"]["content_sha256"]
+        for record in entries[0]["records"]
+    }
+    if len(hashes) != 1:
+        raise ValueError(
+            "selected-step raw records bind multiple adapter state hashes")
+    return next(iter(hashes))
+
+
 def _suite_v3_contract(suite) -> dict:
     manifest = suite.manifest()
     required = ("suite_identity", "suite_version", "suite_hash")
@@ -857,9 +888,19 @@ def _train_inner(args, out: Path, device: str, revision: str):
             "no finite validation checkpoint was accepted; refusing to "
             "report or save final state")
 
-    # reload the SELECTED BEST before reporting/saving — final state is
-    # never silently used as evidence
+    # Reload the SELECTED BEST before reporting/saving — final state is
+    # never silently used as evidence.  Re-hash the reloaded state and bind
+    # it to the selected step's raw validation records before publication.
     rec.load_adapter_state(tracker.best_state())
+    selected_raw_state_sha256 = selected_v3_adapter_state_sha256(
+        history, expected_step=tracker.best_step,
+        expected_metric=tracker.best_score)
+    selected_adapter_state_sha256 = adapter_state_sha256(
+        rec.adapter_state_dict())
+    if selected_adapter_state_sha256 != selected_raw_state_sha256:
+        raise ValueError(
+            "reloaded best adapter state disagrees with selected-step raw "
+            "validation evidence")
     bundle_path = out / "best_params.pt"
     bundle = rec.export_adapter_bundle(
         bundle_path, model_id=args.model, revision=revision,
@@ -877,6 +918,7 @@ def _train_inner(args, out: Path, device: str, revision: str):
         "selection_provenance":
             "latent_eval.v3_recomputed_from_raw_validation_records",
         "best_val_metric_definition": "micro_accuracy",
+        "selected_adapter_state_sha256": selected_adapter_state_sha256,
         "checkpoint_content_digest": bundle["content_digest"],
         "checkpoint_sha256": sha256_file(bundle_path),
         "precision": {
@@ -910,6 +952,7 @@ def _train_inner(args, out: Path, device: str, revision: str):
         "suite_identity": suite_manifest["suite_identity"],
         "suite_version": suite_manifest["suite_version"],
         "suite_sha256": suite_sha,
+        "selected_adapter_state_sha256": selected_adapter_state_sha256,
         "checkpoint_content_digest": bundle["content_digest"],
         "checkpoint_sha256": sha256_file(bundle_path),
         "wall_seconds": report["wall_seconds"],
@@ -970,10 +1013,12 @@ def cmd_eval(args):
     from latent_lab.train.checkpointing import (
         AdapterBundleError,
         AdapterBundleIdentityError,
+        adapter_state_sha256,
         atomic_write_json,
         load_adapter_bundle,
         recipe_from_config,
         require_pinned_revision,
+        validate_selected_adapter_state_binding,
         verify_generation,
     )
 
@@ -1059,6 +1104,9 @@ def cmd_eval(args):
         raise AdapterBundleIdentityError(
             f"adapter {args.adapter}: raw v3 validation history does not "
             "reproduce the reported selected checkpoint")
+    selected_raw_state_sha256 = selected_v3_adapter_state_sha256(
+        report.get("val_history"), expected_step=selected.step,
+        expected_metric=selected.metric)
     m_ident = manifest.get("identity") or {}
     if m_ident.get("model_id") != model_id \
             or require_pinned_revision(m_ident.get("revision")) != revision:
@@ -1074,6 +1122,11 @@ def cmd_eval(args):
     state = load_adapter_bundle(Path(args.adapter) / "best_params.pt",
                                 model_id=model_id, revision=revision,
                                 recipe=recipe)
+    validate_selected_adapter_state_binding(
+        report=report, manifest=manifest,
+        actual_state_sha256=adapter_state_sha256(state),
+        raw_selected_state_sha256=selected_raw_state_sha256,
+        where=f"adapter {args.adapter}")
 
     model, tok = load_model(device, model_id, revision)
     interval = tuple(cfg["interval"])

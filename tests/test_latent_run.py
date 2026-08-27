@@ -381,7 +381,8 @@ def test_evaluate_v3_consumes_runtime_ambiguous_top_tie_shape():
 def test_v3_checkpoint_selection_recomputes_raw_history():
     from latent_lab.bench.latent_run import (
         build_v3_runtime_record, canonical_v3_history_entry,
-        select_v3_checkpoint_from_raw_history)
+        select_v3_checkpoint_from_raw_history,
+        selected_v3_adapter_state_sha256)
 
     losing = build_v3_runtime_record(
         _v3_ex("v3-losing"), split="validation", k_steps=2,
@@ -417,6 +418,8 @@ def test_v3_checkpoint_selection_recomputes_raw_history():
         history, expected_identity=expected_identity)
     assert selected.step == 20
     assert selected.metric == 1.0
+    assert selected_v3_adapter_state_sha256(
+        history, expected_step=20, expected_metric=1.0) == "e" * 64
 
     with pytest.raises(ValueError, match="run_id disagrees"):
         select_v3_checkpoint_from_raw_history(
@@ -444,10 +447,14 @@ def test_cmd_eval_wiring_and_persisted_envelope_are_v3(tmp_path):
     assert "evaluate_v3(" in source
     assert "build_v3_eval_payload(" in source
     assert "rescore_records(" not in source
+    assert source.index("state = load_adapter_bundle(") < source.index(
+        "    validate_selected_adapter_state_binding(") < source.index(
+            "model, tok = load_model(")
     train_source = inspect.getsource(_train_inner)
     assert "latent_lab.bench.suite_v3" in train_source
     assert "select_v3_checkpoint_from_raw_history(" in train_source
     assert "evaluate_v3(" in train_source
+    assert "selected_adapter_state_sha256" in train_source
 
     result = evaluate_v3(
         _V3Rec(_v3_details()), _data([_v3_ex()]), 2, [0],

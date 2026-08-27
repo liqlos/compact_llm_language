@@ -421,6 +421,8 @@ def test_report_manifest_and_bundle_bind_one_canonical_recipe(tmp_path):
     assert manifest["recipe"] == report["recipe"]
     assert (manifest["checkpoint_content_digest"]
             == report["checkpoint_content_digest"])
+    assert (manifest["selected_adapter_state_sha256"]
+            == report["selected_adapter_state_sha256"])
 
     # tampering with the REPORT config breaks recipe binding everywhere
     from latent_lab.train.checkpointing import (
@@ -449,6 +451,37 @@ def test_report_manifest_and_bundle_bind_one_canonical_recipe(tmp_path):
     d["recipe"]["seed"] = 7
     atomic_write_json(manifest_path, d)
     with pytest.raises(Exception):
+        artifacts.validate_run(tmp_path)
+
+
+def test_valid_but_different_bundle_cannot_claim_selected_raw_history(
+        tmp_path):
+    """Rebinding all bundle/file digests cannot forge selected-step state."""
+    from latent_lab.train.checkpointing import (
+        CHECKPOINT_FILE, RUN_MANIFEST_FILE, TRAIN_REPORT_FILE,
+        save_adapter_bundle, sha256_file, write_train_generation,
+    )
+
+    build_verified_run(tmp_path)
+    report = json.loads((tmp_path / TRAIN_REPORT_FILE).read_text())
+    manifest = json.loads((tmp_path / RUN_MANIFEST_FILE).read_text())
+    original_selected = report["selected_adapter_state_sha256"]
+    replacement = {"lora.0.A": torch.ones(8, 4),
+                   "lora.0.B": torch.ones(4, 8)}
+    bundle = save_adapter_bundle(
+        tmp_path / CHECKPOINT_FILE, replacement,
+        model_id=report["model"], revision=report["revision"],
+        recipe=report["recipe"], metrics={"best_val_acc": 0.5})
+    assert ckpt.adapter_state_sha256(replacement) != original_selected
+
+    # Attacker coherently refreshes every legacy bundle/file digest while
+    # retaining the genuine raw validation history and its selected hash.
+    report["checkpoint_content_digest"] = bundle["content_digest"]
+    report["checkpoint_sha256"] = sha256_file(tmp_path / CHECKPOINT_FILE)
+    manifest["checkpoint_content_digest"] = bundle["content_digest"]
+    write_train_generation(tmp_path, manifest=manifest, report=report)
+
+    with pytest.raises(ValueError, match="selected checkpoint state"):
         artifacts.validate_run(tmp_path)
 
 
