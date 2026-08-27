@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import random
 import re
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+import latent_lab.bench.suite_v3 as suite_v3
 from latent_lab.bench.suite import gen_obj_track as gen_obj_track_v2
 from latent_lab.bench.suite_v3 import (
     DEFAULT_COUNTS,
@@ -19,8 +21,10 @@ from latent_lab.bench.suite_v3 import (
     SUITE_IDENTITY,
     SUITE_VERSION,
     TOKENIZER_IDENTITY,
+    TRAINING_SPLIT,
     UNTOUCHED_FINAL_SPLIT,
     _candidate_order,
+    _stable_event_permutation,
     audit_suite,
     baseline_suite,
     build_suite,
@@ -78,6 +82,29 @@ def test_independent_prompt_parser_and_reference_solver_agree(family):
         for example in examples:
             if example.family == family:
                 assert reference_solve_prompt(example.prompt) == example.answer, example.ex_id
+
+
+def test_reference_solver_survives_mutated_generation_oracle(monkeypatch):
+    example = next(example for example in SUITE.validation if example.family == "obj_track")
+    monkeypatch.setattr(suite_v3, "_replay", lambda _scenario: "MUTATED_GENERATION_ORACLE")
+    assert reference_solve_prompt(example.prompt) == example.answer
+
+
+def test_audit_detects_stored_gold_disagreement_with_reference_solver():
+    original = next(example for example in SUITE.validation if example.family == "fsm")
+    wrong_answer = next(candidate for candidate in original.candidates if candidate != original.answer)
+    corrupted = replace(
+        original,
+        answer=wrong_answer,
+        gold_index=original.candidates.index(wrong_answer),
+    )
+    validation = tuple(
+        corrupted if example.ex_id == original.ex_id else example
+        for example in SUITE.validation
+    )
+    report = audit_suite(replace(SUITE, validation=validation))
+    assert report["ok"] is False
+    assert f"{original.ex_id}: independent solver mismatch" in report["problems"]
 
 
 def test_candidate_order_metadata_roundtrips_and_gold_positions_balance():
@@ -166,7 +193,9 @@ def test_length_and_semantic_ood_are_distinct_domains():
 def test_final_test_is_excluded_from_selection_and_baseline_reporting():
     manifest = SUITE.manifest()
     assert manifest["checkpoint_selection_split"] == "validation"
+    assert manifest["training_split"] == TRAINING_SPLIT == "train"
     assert tuple(manifest["selection_eligible_splits"]) == SELECTION_ELIGIBLE_SPLITS
+    assert manifest["selection_eligible_splits"] == ["validation"]
     assert UNTOUCHED_FINAL_SPLIT in manifest["selection_ineligible_splits"]
     assert manifest["untouched_final_test"]["checkpoint_selection_allowed"] is False
     baselines = baseline_suite(SUITE)
@@ -192,6 +221,18 @@ def test_baseline_suite_contains_all_preregistered_non_model_controls():
         assert required <= set(report["splits"][split])
         assert 0 < report["splits"][split]["mean_per_example_uniform_chance"] < 0.5
         assert all(0 <= score <= 1 for score in report["splits"][split]["candidate_position"].values())
+
+
+def test_stable_event_permutation_has_a_fixed_cross_version_fixture():
+    events = [
+        {"op": "step", "value": "alpha"},
+        {"op": "step", "value": "beta"},
+        {"op": "step", "value": "gamma"},
+        {"op": "step", "value": "delta"},
+    ]
+    reordered = _stable_event_permutation(events, "behavioral-v3-test-fixture")
+    assert [event["value"] for event in reordered] == ["beta", "alpha", "delta", "gamma"]
+    assert sorted(event["value"] for event in reordered) == sorted(event["value"] for event in events)
 
 
 def test_audit_has_no_direct_shortcut_or_split_leakage_findings():

@@ -1283,10 +1283,10 @@
   "master_seed": 20260827,
   "schema_version": "behavioral_suite.v3",
   "selection_eligible_splits": [
-    "train",
     "validation"
   ],
   "selection_ineligible_splits": [
+    "train",
     "test_id",
     "test_ood_length",
     "test_ood_semantic",
@@ -1311,6 +1311,7 @@
   "suite_hash": "5cf5cbf397510ba597b59f7ccf0839cf344e6fb795a5cb29d031f39dac218254",
   "suite_identity": "behavioral-v3",
   "suite_version": 3,
+  "training_split": "train",
   "untouched_final_test": {
     "baseline_reporting_allowed": false,
     "checkpoint_selection_allowed": false,

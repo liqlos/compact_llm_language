@@ -113,7 +113,7 @@
         "initial_only_state_heuristic": 0.11904761904761904,
         "lexical_candidate_frequency": 0.19642857142857142,
         "mean_per_example_uniform_chance": 0.20472370766488412,
-        "shuffled_events_reference": 0.42857142857142855,
+        "shuffled_events_reference": 0.4583333333333333,
         "train_majority_constant_answer": 0.11904761904761904
       },
       "test_ood_length": {
@@ -209,7 +209,7 @@
         "initial_only_state_heuristic": 0.13690476190476192,
         "lexical_candidate_frequency": 0.20833333333333334,
         "mean_per_example_uniform_chance": 0.20472370766488412,
-        "shuffled_events_reference": 0.3333333333333333,
+        "shuffled_events_reference": 0.34523809523809523,
         "train_majority_constant_answer": 0.09523809523809523
       },
       "test_ood_semantic": {
@@ -324,8 +324,8 @@
         "initial_only_sha256": 0.16071428571428573,
         "initial_only_state_heuristic": 0.16071428571428573,
         "lexical_candidate_frequency": 0.24404761904761904,
-        "mean_per_example_uniform_chance": 0.19706331045003816,
-        "shuffled_events_reference": 0.42857142857142855,
+        "mean_per_example_uniform_chance": 0.19706331045003814,
+        "shuffled_events_reference": 0.4226190476190476,
         "train_majority_constant_answer": 0.10119047619047619
       },
       "train": {
@@ -421,7 +421,7 @@
         "initial_only_state_heuristic": 0.125,
         "lexical_candidate_frequency": 0.20714285714285716,
         "mean_per_example_uniform_chance": 0.20472370766488412,
-        "shuffled_events_reference": 0.425,
+        "shuffled_events_reference": 0.4357142857142857,
         "train_majority_constant_answer": 0.19285714285714287
       },
       "validation": {
@@ -516,8 +516,8 @@
         "initial_only_sha256": 0.17410714285714285,
         "initial_only_state_heuristic": 0.14732142857142858,
         "lexical_candidate_frequency": 0.23660714285714285,
-        "mean_per_example_uniform_chance": 0.20472370766488415,
-        "shuffled_events_reference": 0.40625,
+        "mean_per_example_uniform_chance": 0.20472370766488412,
+        "shuffled_events_reference": 0.45982142857142855,
         "train_majority_constant_answer": 0.09821428571428571
       }
     }

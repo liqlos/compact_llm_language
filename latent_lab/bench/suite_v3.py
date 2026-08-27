@@ -14,6 +14,7 @@ import random
 import re
 from collections import Counter
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -45,7 +46,8 @@ DEFAULT_COUNTS: Mapping[str, int] = {
     "final_test": 32,
 }
 CHECKPOINT_SELECTION_SPLIT = "validation"
-SELECTION_ELIGIBLE_SPLITS = ("train", "validation")
+TRAINING_SPLIT = "train"
+SELECTION_ELIGIBLE_SPLITS = (CHECKPOINT_SELECTION_SPLIT,)
 UNTOUCHED_FINAL_SPLIT = "final_test"
 
 _WORDS_ID = (
@@ -193,6 +195,7 @@ class Suite:
                 ],
             },
             "checkpoint_selection_split": CHECKPOINT_SELECTION_SPLIT,
+            "training_split": TRAINING_SPLIT,
             "selection_eligible_splits": list(SELECTION_ELIGIBLE_SPLITS),
             "selection_ineligible_splits": [
                 name for name in self.splits() if name not in SELECTION_ELIGIBLE_SPLITS
@@ -294,6 +297,100 @@ def _replay(scenario: Mapping[str, Any]) -> str:
                 return "ERROR"
         query = scenario["query"]
         return locations[query["name"]] if query["kind"] == "location" else holders[query["name"]]
+    raise ValueError(f"unknown family: {family}")
+
+
+def _reference_replay(scenario: Mapping[str, Any]) -> str:
+    """Second implementation of the suite semantics used only for audit/rescore.
+
+    This deliberately does not call ``_replay`` or its state-transition helpers:
+    generation and reference validation must be able to disagree.
+    """
+    family = scenario["family"]
+    events = scenario["events"]
+    if family == "fsm":
+        state = str(scenario["start"])
+        table = scenario["transitions"]
+        for symbol in events:
+            state = str(table[state][symbol])
+        return state
+    if family == "stack_queue":
+        values = [str(value) for value in scenario["initial"]]
+        kind = scenario["kind"]
+        for event in events:
+            operation = event["op"]
+            if kind == "stack":
+                if operation == "push":
+                    values = [str(event["item"]), *values]
+                elif operation == "pop" and values:
+                    values = values[1:]
+                else:
+                    return "ERROR"
+            elif kind == "queue" and len(values) >= 2:
+                count = int(event.get("count", 1))
+                if operation == "rotate":
+                    offset = count % len(values)
+                    values = values[offset:] + values[:offset]
+                elif operation == "swap_front":
+                    if count % 2:
+                        values = [values[1], values[0], *values[2:]]
+                else:
+                    return "ERROR"
+            else:
+                return "ERROR"
+        return values[0] if values else "EMPTY"
+    if family == "graph_walk":
+        node = str(scenario["start"])
+        successor = scenario["successor"]
+        total_hops = sum(int(event["count"]) for event in events)
+        for _ in range(total_hops):
+            node = str(successor[node])
+        return node
+    if family == "chain_arith":
+        result = int(scenario["start"])
+        modulus = int(scenario["modulus"])
+        for event in events:
+            result = (result * int(event["a"]) + int(event["b"])) % modulus
+        return str(result)
+    if family == "rule_neg":
+        facts = {str(scenario["initial_prop"]): bool(scenario["initial_value"])}
+        for rule in events:
+            if facts.get(str(rule["source"])) == bool(rule["source_value"]):
+                facts[str(rule["target"])] = bool(rule["target_value"])
+        query = str(scenario["query"])
+        return "unknown" if query not in facts else ("true" if facts[query] else "false")
+    if family == "tiny_prog":
+        register = int(scenario["start"])
+        modulus = int(scenario["modulus"])
+        for instruction in events:
+            argument = int(instruction["arg"])
+            if instruction["op"] == "mul":
+                register = register * argument % modulus
+            elif instruction["op"] == "add":
+                register = (register + argument) % modulus
+            else:
+                return "ERROR"
+        return str(register)
+    if family == "obj_track":
+        query = scenario["query"]
+        name = str(query["name"])
+        if query["kind"] == "location":
+            terminal = str(scenario["initial_locations"][name])
+            for event in events:
+                if event["op"] == "move" and event["person"] == name:
+                    terminal = str(event["place"])
+                elif event["op"] not in {"move", "give"}:
+                    return "ERROR"
+            return terminal
+        if query["kind"] == "holder":
+            terminal = str(scenario["initial_holders"][name])
+            for event in events:
+                if event["op"] == "give" and event["item"] == name:
+                    terminal = str(event["person"])
+                elif event["op"] not in {"move", "give"}:
+                    return "ERROR"
+            return terminal
+        return "ERROR"
     raise ValueError(f"unknown family: {family}")
 
 
@@ -459,7 +556,7 @@ def parse_prompt(prompt: str) -> dict[str, Any]:
 
 def reference_solve_prompt(prompt: str) -> str:
     """Independently parse prompt text and replay from its serialized initial state."""
-    return _replay(parse_prompt(prompt))
+    return _reference_replay(parse_prompt(prompt))
 
 
 def _candidate_order(
@@ -990,13 +1087,35 @@ def _train_majority(suite: Suite) -> dict[str, str]:
     return result
 
 
+def _stable_event_permutation(events: Sequence[Any], namespace: str) -> list[Any]:
+    """Order events using only canonical bytes, SHA-256, and their original index."""
+    decorated = [
+        (
+            _sha256_text(f"{namespace}:{index}:{_canonical_json(event)}"),
+            index,
+            event,
+        )
+        for index, event in enumerate(events)
+    ]
+    return [event for _, _, event in sorted(decorated)]
+
+
 def _shuffled_reference_guess(example: Example) -> str:
     scenario = example.scenario
-    events = list(scenario["events"])
-    random.Random(_seed_for(example.ex_id, "shuffled-events-baseline")).shuffle(events)
-    scenario["events"] = events
-    result = _replay(scenario)
+    scenario["events"] = _stable_event_permutation(
+        scenario["events"],
+        f"{example.ex_id}:shuffled-events-baseline.v1",
+    )
+    result = _reference_replay(scenario)
     return result if result in example.canonical_candidates else example.canonical_candidates[0]
+
+
+def _mean_uniform_chance(examples: Sequence[Example]) -> float:
+    """Compute the heterogeneous chance baseline without version-sensitive float sums."""
+    if not examples:
+        return 0.0
+    exact = sum((Fraction(1, len(example.candidates)) for example in examples), Fraction())
+    return float(exact / len(examples))
 
 
 def _lexical_guess(example: Example) -> str:
@@ -1066,7 +1185,7 @@ def baseline_suite(suite: Suite) -> dict[str, Any]:
                 for position in range(family_positions)
             }
         report["splits"][split] = {
-            "mean_per_example_uniform_chance": sum(1 / len(example.candidates) for example in examples) / len(examples),
+            "mean_per_example_uniform_chance": _mean_uniform_chance(examples),
             "train_majority_constant_answer": _accuracy(examples, (majority[example.family] for example in examples)),
             "candidate_position": position_scores,
             "candidate_position_by_family": position_by_family,
