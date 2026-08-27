@@ -1,22 +1,22 @@
 {
   "excluded_tracked_file_count": 2,
-  "file_count": 127,
+  "file_count": 139,
   "files_by_top_level": {
     ".github": 1,
     ".gitignore": 1,
     "CONTRIBUTING.md": 1,
     "README.md": 1,
-    "artifacts": 5,
+    "artifacts": 11,
     "bench": 5,
-    "docs": 10,
+    "docs": 11,
     "evals": 6,
-    "latent_lab": 45,
+    "latent_lab": 46,
     "pyproject.toml": 1,
     "rcc": 9,
-    "tests": 37,
-    "tools": 4,
+    "tests": 40,
+    "tools": 5,
     "uv.lock": 1
   },
   "schema_version": "rcc.review_export.v1",
-  "total_bytes": 1608457
+  "total_bytes": 2086566
 }
