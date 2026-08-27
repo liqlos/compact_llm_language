@@ -426,7 +426,11 @@ def select_v3_checkpoint_from_raw_history(history, *, expected_identity=None):
     The same canonical selector is then used by training and the no-spend
     gate.
     """
-    from latent_lab.bench.eval_v3 import aggregate_records
+    from latent_lab.bench.eval_v3 import (
+        EvalV3Error,
+        aggregate_records,
+        validate_record_against_current_suite,
+    )
 
     canonical = []
     for index, entry in enumerate(history or ()):
@@ -436,11 +440,21 @@ def select_v3_checkpoint_from_raw_history(history, *, expected_identity=None):
         if not isinstance(records, list) or not records:
             raise ValueError(
                 f"validation history[{index}] has no raw v3 records")
-        recomputed = aggregate_records(records)
+        bound_records = []
+        for record_index, record in enumerate(records):
+            try:
+                bound_records.append(validate_record_against_current_suite(
+                    record, expected_split="validation"))
+            except EvalV3Error as exc:
+                raise ValueError(
+                    f"validation history[{index}] record[{record_index}] "
+                    f"is not canonical behavioral-v3 validation evidence: "
+                    f"{exc}") from exc
+        recomputed = aggregate_records(bound_records)
         if expected_identity is not None:
             if not isinstance(expected_identity, dict):
                 raise ValueError("expected validation identity must be an object")
-            record = records[0]
+            record = bound_records[0]
             actual_identity = {
                 "run_id": record["run_id"],
                 "recipe_hash": record["recipe_hash"],

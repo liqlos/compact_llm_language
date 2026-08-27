@@ -34,6 +34,7 @@ import json
 import math
 import os
 import re
+from types import SimpleNamespace
 
 import pytest
 
@@ -726,6 +727,57 @@ PROOF_OK = {"all_passed": True, "returncode": 0,
             "nodes": list(g.PROOF_TEST_NODES)}
 
 
+def test_proof_runner_opts_in_and_rejects_skipped_transcript(
+        monkeypatch, tmp_path):
+    observed = {}
+
+    def fake_run(command, **kwargs):
+        observed["command"] = command
+        observed["kwargs"] = kwargs
+        return SimpleNamespace(
+            returncode=0,
+            stdout="16 passed, 9 skipped in 0.42s\n",
+        )
+
+    monkeypatch.setattr(g.subprocess, "run", fake_run)
+    result = g.run_proof_tests(tmp_path)
+
+    assert "--run-transformer-integration" in observed["command"]
+    override = observed["command"].index("-o")
+    assert observed["command"][override + 1] == "addopts="
+    assert result["returncode"] == 0
+    assert result["outcome_counts"]["passed"] == 16
+    assert result["outcome_counts"]["skipped"] == 9
+    assert result["summary_parsed"] is True
+    assert result["all_passed"] is False
+    assert any("9 skipped" in reason
+               for reason in result["failure_reasons"])
+
+
+@pytest.mark.parametrize(
+    "stdout,returncode,expected_reason",
+    [
+        ("7 passed in 0.1s\n", 0, None),
+        ("6 passed in 0.1s\n", 0, "only 6 passed outcomes"),
+        (".......\n", 0, "outcome summary missing"),
+        ("7 passed in 0.1s\n", 4, "pytest return code 4"),
+    ],
+)
+def test_proof_runner_requires_every_node_and_success_summary(
+        monkeypatch, tmp_path, stdout, returncode, expected_reason):
+    monkeypatch.setattr(
+        g.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=returncode, stdout=stdout),
+    )
+    result = g.run_proof_tests(tmp_path)
+    assert result["all_passed"] is (expected_reason is None)
+    if expected_reason is not None:
+        assert any(expected_reason in reason
+                   for reason in result["failure_reasons"])
+
+
 class TestGateEndToEnd:
     def run_gate(self, corpus, **kw):
         r2b, r4b = corpus
@@ -740,6 +792,27 @@ class TestGateEndToEnd:
         assert c["runs_4b_rejected"] == 1
         assert c["files_scanned"] == 10
         assert c["checkpoints_total"] == 4
+
+    def test_skipped_proof_transcript_cannot_mark_runtime_proven(self, corpus):
+        proof = {
+            "all_passed": False,
+            "returncode": 0,
+            "nodes": list(g.PROOF_TEST_NODES),
+            "outcome_counts": {"passed": 16, "skipped": 9},
+            "summary_parsed": True,
+            "failure_reasons": [
+                "required proof outcomes include 9 skipped",
+            ],
+        }
+        res = self.run_gate(corpus, proof_result=proof)
+        statuses = {item["id"]: item["status"]
+                    for item in res.gate_verdict["prerequisites"]}
+        assert statuses[g.PREREQ_RUNTIME] == g.STATUS_FAILED
+        assert any(
+            blocker["code"] == "PROOF_TESTS_FAILED"
+            and "9 skipped" in blocker["detail"]
+            for blocker in res.gate_verdict["blockers"]
+        )
 
     def test_inventory_hashes_duplicates_hardlinks(self, tmp_path, corpus):
         r2b, r4b = corpus

@@ -757,6 +757,15 @@ PROOF_TEST_NODES = (
     "tests/test_latent_run.py",
 )
 
+_PYTEST_PROOF_OUTCOME = re.compile(
+    r"(?P<count>\d+)\s+"
+    r"(?P<outcome>passed|failed|skipped|errors?|xfailed|xpassed|deselected)\b"
+)
+_PROOF_NONPASS_OUTCOMES = (
+    "failed", "skipped", "error", "errors", "xfailed", "xpassed",
+    "deselected",
+)
+
 TRUST_BOUNDARY = (
     "Gate ran read-only over an isolated private COPY of historical "
     ".rcc_work evidence. .pt payloads were loaded only via "
@@ -1301,7 +1310,8 @@ def analyze_quarantine(scanned: list[ScannedFile]) -> dict:
 
 def run_proof_tests(repo_root: Path, log_path: Path | None = None) -> dict:
     cmd = [sys.executable, "-m", "pytest", "-q", "--no-header",
-           "-p", "no:cacheprovider", *PROOF_TEST_NODES]
+           "-p", "no:cacheprovider", "-o", "addopts=",
+           "--run-transformer-integration", *PROOF_TEST_NODES]
     env = dict(os.environ)
     env["PYTHONHASHSEED"] = "0"
     proc = subprocess.run(cmd, cwd=str(repo_root), env=env,
@@ -1310,13 +1320,43 @@ def run_proof_tests(repo_root: Path, log_path: Path | None = None) -> dict:
     if log_path is not None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text(proc.stdout, encoding="utf-8")
+    outcome_counts = {
+        "passed": 0,
+        "failed": 0,
+        "skipped": 0,
+        "error": 0,
+        "errors": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+        "deselected": 0,
+    }
+    summary_matches = list(_PYTEST_PROOF_OUTCOME.finditer(proc.stdout))
+    for match in summary_matches:
+        outcome_counts[match.group("outcome")] += int(match.group("count"))
+    failure_reasons = []
+    if proc.returncode != 0:
+        failure_reasons.append(f"pytest return code {proc.returncode}")
+    if not summary_matches:
+        failure_reasons.append("pytest outcome summary missing")
+    if outcome_counts["passed"] < len(PROOF_TEST_NODES):
+        failure_reasons.append(
+            f"only {outcome_counts['passed']} passed outcomes for "
+            f"{len(PROOF_TEST_NODES)} required proof nodes")
+    for outcome in _PROOF_NONPASS_OUTCOMES:
+        if outcome_counts[outcome]:
+            failure_reasons.append(
+                f"required proof outcomes include "
+                f"{outcome_counts[outcome]} {outcome}")
     # Canonical payload deliberately excludes wall-clock/durations so that
     # reruns stay byte-identical; the full log goes to proof_tests.log.
     return {
         "command": cmd,
         "returncode": proc.returncode,
         "nodes": list(PROOF_TEST_NODES),
-        "all_passed": proc.returncode == 0,
+        "outcome_counts": outcome_counts,
+        "summary_parsed": bool(summary_matches),
+        "failure_reasons": failure_reasons,
+        "all_passed": not failure_reasons,
     }
 
 # ---------------------------------------------------------------------------
@@ -1751,15 +1791,24 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
                             "artifact-level corrected-metric selection exists")
     prereq(PREREQ_SELECTION, selection_status, selection_detail)
 
-    prereq(PREREQ_RUNTIME,
-           STATUS_PROVEN if proof and proof["all_passed"]
-           else STATUS_FAILED if proof and not proof["all_passed"]
-           else STATUS_UNPROVEN,
-           ("focused regressions passed: adapter strict metadata+roundtrip, "
+    if proof is None:
+        runtime_proof_status = STATUS_UNPROVEN
+        runtime_proof_detail = "proof tests skipped (dry-run/skip flag)"
+    elif proof["all_passed"]:
+        runtime_proof_status = STATUS_PROVEN
+        runtime_proof_detail = (
+            "focused regressions passed: adapter strict metadata+roundtrip, "
             "fp32 trainables over bf16 backbone, non-finite rejection, "
-            "cached-recurrence equivalence, gold-position scoring "
-            "invariance" if proof else
-            "proof tests skipped (dry-run/skip flag)"))
+            "cached-recurrence equivalence, gold-position scoring invariance"
+        )
+    else:
+        runtime_proof_status = STATUS_FAILED
+        runtime_proof_detail = (
+            "focused regressions did not prove runtime integrity: "
+            + "; ".join(proof.get(
+                "failure_reasons", (f"pytest rc={proof.get('returncode')}",)))
+        )
+    prereq(PREREQ_RUNTIME, runtime_proof_status, runtime_proof_detail)
 
     quarantine_ok = bool(quarantine) and \
         quarantine.get("quarantine_marker_present") and \
@@ -1944,7 +1993,11 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
                 "quarantine tree carries no rejected train_report artifacts "
                 "(marker-only empty quarantine proves nothing)")
     if proof and not proof["all_passed"]:
-        blocker("PROOF_TESTS_FAILED", f"pytest rc={proof['returncode']}")
+        blocker(
+            "PROOF_TESTS_FAILED",
+            "; ".join(proof.get(
+                "failure_reasons", (f"pytest rc={proof['returncode']}",))),
+        )
 
     verdict = VERDICT_READY if all(p["status"] == STATUS_PROVEN
                                    for p in prereqs) else VERDICT_NOT_READY

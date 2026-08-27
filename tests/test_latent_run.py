@@ -317,6 +317,52 @@ def _v3_identity():
     }
 
 
+def _current_validation_record(*, checkpoint_id="step-10",
+                               checkpoint_hash="b" * 64,
+                               winner_is_gold=True, **overrides):
+    from latent_lab.bench.eval_v3 import build_eval_record
+    from latent_lab.bench.suite_v3 import build_suite
+
+    suite = build_suite()
+    example = suite.validation[0]
+    metadata = {
+        "run_id": "run-v3",
+        "recipe_hash": "a" * 64,
+        "model_id": "tiny-model",
+        "model_revision": "d" * 40,
+        "adapter_id": "adapter-1",
+        "checkpoint_id": checkpoint_id,
+        "checkpoint_content_hash": checkpoint_hash,
+        "suite_id": "behavioral-v3",
+        "suite_version": 3,
+        "suite_hash": suite.records_hash(),
+        "example_id": example.ex_id,
+        "split": example.split,
+        "family": example.family,
+        "prompt": example.prompt,
+        "candidates": example.candidates,
+        "candidate_permutation_seed": example.candidate_permutation_seed,
+        "candidate_permutation": example.candidate_permutation,
+        "gold_answer": example.answer,
+        "k": 2,
+        "recurrence_config": {
+            "interval": [2, 4], "gradient_semantics": "truncated_cache",
+        },
+        "compute": _v3_compute(),
+    }
+    metadata.update(overrides)
+    if winner_is_gold:
+        winner = metadata["gold_answer"]
+    else:
+        winner = next(candidate for candidate in metadata["candidates"]
+                      if candidate != metadata["gold_answer"])
+    rows = tuple(
+        (-0.1,) if candidate == winner else (-2.0 - index,)
+        for index, candidate in enumerate(metadata["candidates"])
+    )
+    return example, build_eval_record(per_token_logprobs=rows, **metadata)
+
+
 class _V3Rec:
     def __init__(self, details):
         self.model = SimpleNamespace(
@@ -429,21 +475,13 @@ def test_evaluate_v3_consumes_runtime_ambiguous_top_tie_shape():
 
 def test_v3_checkpoint_selection_recomputes_raw_history():
     from latent_lab.bench.latent_run import (
-        build_v3_runtime_record, canonical_v3_history_entry,
+        canonical_v3_history_entry,
         select_v3_checkpoint_from_raw_history,
         selected_v3_adapter_state_sha256)
 
-    losing = build_v3_runtime_record(
-        _v3_ex("v3-losing"), split="validation", k_steps=2,
-        evidence_identity=_v3_identity(),
-        details=_v3_details(rows=((-0.1,), (-1.0,), (-2.0,))),
-        runtime_order=[0, 1, 2], runtime_raw_sums=[-0.1, -1.0, -2.0])
-    winning_identity = {**_v3_identity(), "checkpoint_id": "step-20",
-                        "checkpoint_content_hash": "e" * 64}
-    winning = build_v3_runtime_record(
-        _v3_ex("v3-winning"), split="validation", k_steps=2,
-        evidence_identity=winning_identity, details=_v3_details(),
-        runtime_order=[1, 0, 2], runtime_raw_sums=[-0.8, -0.4, -1.5])
+    _, losing = _current_validation_record(winner_is_gold=False)
+    _, winning = _current_validation_record(
+        checkpoint_id="step-20", checkpoint_hash="e" * 64)
     history = [
         canonical_v3_history_entry(10, [losing]),
         canonical_v3_history_entry(20, [winning]),
@@ -456,7 +494,7 @@ def test_v3_checkpoint_selection_recomputes_raw_history():
         "adapter_id": "adapter-1",
         "suite_id": "behavioral-v3",
         "suite_version": 3,
-        "suite_hash": "c" * 64,
+        "suite_hash": winning["suite_identity"]["sha256"],
         "split": "validation",
         "k": 2,
         "recurrence_config": {
@@ -482,6 +520,57 @@ def test_v3_checkpoint_selection_recomputes_raw_history():
         select_v3_checkpoint_from_raw_history([
             {"step": 1, "metrics": history[1]["metrics"]},
         ])
+
+
+@pytest.mark.parametrize(
+    "mutation,expected_field",
+    [
+        ("family", "family"),
+        ("prompt", "prompt_hash"),
+        ("candidate_value", "candidates"),
+        ("candidate_order", "candidates"),
+        ("permutation_seed", "candidate_permutation_seed"),
+        ("permutation_vector", "candidate_permutation"),
+        ("gold", "gold_answer"),
+    ],
+)
+def test_v3_checkpoint_selector_rejects_schema_valid_noncanonical_example(
+        mutation, expected_field):
+    from latent_lab.bench.latent_run import (
+        canonical_v3_history_entry, select_v3_checkpoint_from_raw_history,
+        selected_v3_adapter_state_sha256)
+
+    example, _ = _current_validation_record()
+    overrides = {}
+    if mutation == "family":
+        overrides["family"] = "fabricated-family"
+    elif mutation == "prompt":
+        overrides["prompt"] = example.prompt + " fabricated"
+    elif mutation == "candidate_value":
+        candidates = list(example.candidates)
+        index = next(i for i, value in enumerate(candidates)
+                     if value != example.answer)
+        candidates[index] = "fabricated-candidate"
+        overrides["candidates"] = tuple(candidates)
+    elif mutation == "candidate_order":
+        overrides["candidates"] = tuple(reversed(example.candidates))
+    elif mutation == "permutation_seed":
+        overrides["candidate_permutation_seed"] = (
+            example.candidate_permutation_seed + 1)
+    elif mutation == "permutation_vector":
+        permutation = tuple(example.candidate_permutation)
+        overrides["candidate_permutation"] = permutation[1:] + permutation[:1]
+    elif mutation == "gold":
+        overrides["gold_answer"] = next(
+            candidate for candidate in example.candidates
+            if candidate != example.answer)
+    _, record = _current_validation_record(**overrides)
+    history = [canonical_v3_history_entry(10, [record])]
+
+    with pytest.raises(ValueError, match=expected_field):
+        select_v3_checkpoint_from_raw_history(history)
+    with pytest.raises(ValueError, match=expected_field):
+        selected_v3_adapter_state_sha256(history)
 
 
 def test_cmd_eval_wiring_and_persisted_envelope_are_v3(tmp_path):
