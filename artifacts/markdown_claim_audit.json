@@ -1,0 +1,116 @@
+{
+  "schema_version": "r1_markdown_claim_audit.v1",
+  "phase": "B",
+  "code_first_baseline": "artifacts/audit_before.json",
+  "narrative_sources_read_after_baseline": [
+    "CONTRIBUTING.md",
+    "README.md",
+    "docs/CONSOLIDATION_20260825.md",
+    "docs/NO_SPEND_GATE.md",
+    "docs/research-context-compiler/ADR-001-OPEN-WEIGHT-LATENT-RCC.md",
+    "docs/research-context-compiler/BLOCKERS.md",
+    "docs/research-context-compiler/EVALUATION_PROTOCOL.md",
+    "docs/research-context-compiler/GROUND_TRUTH_SPEC.md",
+    "docs/research-context-compiler/IMPLEMENTATION_PLAN.md",
+    "docs/research-context-compiler/LATENT_ROADMAP.md",
+    "docs/research-context-compiler/LIVE_EVAL.md",
+    "docs/research-context-compiler/VISION.md"
+  ],
+  "claims": [
+    {
+      "id": "LATENT_2B_MODEL_MEASURED",
+      "sources": ["README.md", "docs/research-context-compiler/LATENT_ROADMAP.md"],
+      "baseline_verdict": "INVALIDATED",
+      "evidence": "50/50 latent eval files lack raw candidate evidence; pre-fix scorer ranked candidate index 0; 13 checkpoint selections cannot be corrected from stored histories",
+      "required_disposition": "remove from current maturity/headline tables and preserve only under an explicit historical invalidation record"
+    },
+    {
+      "id": "LATENT_ABOVE_CHANCE_AND_K_DOSE",
+      "sources": ["README.md", "docs/research-context-compiler/LATENT_ROADMAP.md"],
+      "baseline_verdict": "INVALIDATED",
+      "evidence": "derived metrics use the legacy scorer, heterogeneous candidates have no valid fixed chance baseline, and K runs use different adapters",
+      "required_disposition": "do not call historical values accuracy, above-chance evidence, recurrence ablation, or permission to scale"
+    },
+    {
+      "id": "TEXTUAL_2B_CAPABILITY_LIMIT",
+      "sources": ["README.md", "docs/research-context-compiler/LATENT_ROADMAP.md"],
+      "baseline_verdict": "INVALIDATED",
+      "evidence": "stored 4B direct/no-thinking observation is 97/112 ID and 84/112 OOD while native-thinking is 1/112 and 0/112; neither record set is independently rescorable under R1",
+      "required_disposition": "replace capability-limit language with historical non-rescorable observations and require a v3 rerun"
+    },
+    {
+      "id": "CONDITIONAL_GO_TO_4B_OR_27B",
+      "sources": ["docs/research-context-compiler/LATENT_ROADMAP.md"],
+      "baseline_verdict": "INVALIDATED",
+      "evidence": "full no-spend gate is NOT_READY with 12 blockers",
+      "required_disposition": "paid_spend_authorized remains false; no scaling permission"
+    },
+    {
+      "id": "BEHAVIORAL_V2_LEAKAGE_AUDITED",
+      "sources": ["docs/research-context-compiler/LATENT_ROADMAP.md"],
+      "baseline_verdict": "INVALIDATED",
+      "evidence": "obj_track renders final state as Initial situation and existing parse-back solver reproduces the same defect",
+      "required_disposition": "retain behavioral-v2 as immutable historical suite and move current claims to behavioral-v3 only"
+    },
+    {
+      "id": "RCC_DICT_ENCODING_LOSSLESS",
+      "sources": ["README.md", "docs/research-context-compiler/IMPLEMENTATION_PLAN.md"],
+      "baseline_verdict": "FALSE_AT_BASELINE",
+      "evidence": "delimiter codec fails arbitrary separator keys, actual newline, literal backslash-n and nested JSON structures",
+      "required_disposition": "fix with unambiguous structural encoding and negative/property tests before restoring claim"
+    },
+    {
+      "id": "RCC_NUMERIC_FINE_FACT_GUARD",
+      "sources": ["README.md", "docs/research-context-compiler/IMPLEMENTATION_PLAN.md"],
+      "baseline_verdict": "FALSE_AT_BASELINE",
+      "evidence": "substring matching accepts 142 from 1420 and 2 from 20.1",
+      "required_disposition": "use normalized bounded numeric tokens and positive/negative tests"
+    },
+    {
+      "id": "RCC_RUN_ISOLATION",
+      "sources": ["README.md", "docs/research-context-compiler/VISION.md"],
+      "baseline_verdict": "FALSE_AT_BASELINE",
+      "evidence": "tampered persisted top-level run_id loads and compiles a foreign StoredRef",
+      "required_disposition": "validate ref.run_id on load, compile and expand; corrupted state fails closed"
+    },
+    {
+      "id": "RAW_STORE_WRITE_ONCE_INTEGRITY",
+      "sources": ["README.md", "docs/research-context-compiler/IMPLEMENTATION_PLAN.md", "docs/research-context-compiler/VISION.md"],
+      "baseline_verdict": "OVERCLAIMED_AT_BASELINE",
+      "evidence": "RawStore.put returns an existing content-addressed path without verifying its bytes/hash",
+      "required_disposition": "verify existing object bytes before dedupe or fail closed"
+    },
+    {
+      "id": "NO_DECODE_RUNTIME_CONTRACT",
+      "sources": ["README.md", "docs/research-context-compiler/LATENT_ROADMAP.md"],
+      "baseline_verdict": "OVERCLAIMED_AT_BASELINE",
+      "evidence": "VocabGuard misses tokenizer __call__, batch_decode, apply_chat_template, generate and alternate output paths",
+      "required_disposition": "strengthen executable guard or narrow the guarantee to covered paths"
+    },
+    {
+      "id": "DEFAULT_TEST_COMMAND_REPRODUCIBLE",
+      "sources": ["README.md", "docs/research-context-compiler/IMPLEMENTATION_PLAN.md"],
+      "baseline_verdict": "FALSE_AT_BASELINE",
+      "evidence": "project declares Python >=3.11 but no_spend_gate.py does not compile on 3.11; dev group does not define the full lab test contract",
+      "required_disposition": "split test tiers and make documented default install/test commands self-consistent"
+    },
+    {
+      "id": "BENCH_ABSENT_FROM_WHEEL",
+      "sources": [],
+      "baseline_verdict": "AUDIT_LEAD_REFUTED",
+      "evidence": "built wheel includes latent_lab/bench; pyproject packages rcc, latent_lab and evals",
+      "required_disposition": "do not create a packaging fix for a problem that is not present; document repository-root bench separately if needed"
+    },
+    {
+      "id": "NO_SPEND_MACHINE_VERDICT",
+      "sources": ["README.md", "docs/NO_SPEND_GATE.md"],
+      "baseline_verdict": "CURRENT_TEXT_PARTLY_CONSISTENT",
+      "evidence": "docs say historical receipts are not standing authorization; current full gate is NOT_READY with 12 blockers",
+      "required_disposition": "make the current machine verdict the sole maturity/spend source and label historical READY receipts non-authoritative"
+    }
+  ],
+  "phase_b_verdict": {
+    "documentation_status": "FAIL_PENDING_REPAIR",
+    "paid_spend_authorized": false
+  }
+}
