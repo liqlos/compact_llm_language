@@ -1041,12 +1041,14 @@ def test_validate_eval_rejects_non_finite_numbers_nested(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_resume_rejects_old_partial_contract_structurally(tmp_path):
-    """The reproduced hole: the driver's old model/rev/seed/label/k/steps
-    allowlist accepted a coherent wrong-suite/wrong-LR/wrong-interval
-    artifact. Partial contracts are now structurally impossible."""
+    """The old allowlist omitted LR/interval; partial intent must reject.
+
+    The fixture stays on the current suite so this test reaches the expected-
+    contract shape check instead of correctly failing earlier at suite
+    evidence binding.
+    """
     d = _run_dir_named(tmp_path, "E4_k4_s0")
-    build_verified_run(d, config=fake_cfg(suite_sha256="ee" * 32,
-                                          lr=9e-4, interval=[6, 18]))
+    build_verified_run(d, config=fake_cfg(lr=9e-4, interval=[6, 18]))
     stale_partial = {"model_id": MODEL, "revision": REV_OK, "seed": 0,
                      "label": "E4_k4_s0", "k": 4, "steps": 800}
     with pytest.raises(ValueError) as ei:
@@ -1085,7 +1087,10 @@ def test_resume_binds_every_recipe_category_via_canonical_digest(
     with pytest.raises(Exception) as ei:
         artifacts.validate_run(d, expected=run_contract())
     msg = str(ei.value)
-    assert "mismatch" in msg or "canonical training identity" in msg
+    if name == "suite":
+        assert "canonical behavioral-v3" in msg
+    else:
+        assert "mismatch" in msg or "canonical training identity" in msg
 
 
 def test_full_preregistered_contract_accepts_matching_artifact(tmp_path):

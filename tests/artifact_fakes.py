@@ -5,6 +5,8 @@ artifacts that pass the full strict validators, so tests can mutate one
 field at a time and pin the exact rejection.
 """
 
+from functools import lru_cache
+
 import torch
 
 from latent_lab.bench.latent_run import recipe_from_config
@@ -39,6 +41,18 @@ BASE_CFG = {
 }
 
 
+@lru_cache(maxsize=1)
+def _current_suite():
+    """Build behavioral-v3 once for current-evidence fixture identities."""
+    from latent_lab.bench.suite_v3 import build_suite
+
+    return build_suite()
+
+
+def _current_suite_sha256() -> str:
+    return _current_suite().records_hash()
+
+
 def cfg(**over) -> dict:
     return {**BASE_CFG, **over}
 
@@ -52,7 +66,7 @@ def run_contract(config: dict | None = None, **over) -> dict:
     from latent_lab.bench.latent_run import recipe_from_config
 
     c = dict(config if config is not None else BASE_CFG)
-    suite = c.get("suite_sha256", SUITE_SHA)
+    suite = c.get("suite_sha256", _current_suite_sha256())
     recipe = recipe_from_config(c, suite)
     out = {
         "model_id": c["model"],
@@ -83,41 +97,70 @@ def build_verified_run(out_dir, *, config=None) -> dict:
     write_run_status(out_dir, "complete")
     ckpt_path = out_dir / CHECKPOINT_FILE
     state = _state()
+    suite_sha256 = c.get("suite_sha256", _current_suite_sha256())
     bundle = save_adapter_bundle(
         ckpt_path, state, model_id=c["model"], revision=c["revision"],
-        recipe=recipe_from_config(c, c.get("suite_sha256", SUITE_SHA)),
+        recipe=recipe_from_config(c, suite_sha256),
         metrics={"best_val_acc": 0.5})
     recipe = bundle["recipe"]
     state_sha256 = adapter_state_sha256(state)
     from latent_lab.bench.eval_v3 import build_eval_record, canonical_sha256
     from latent_lab.bench.latent_run import canonical_v3_history_entry
 
-    compute = {
-        "prefill_layers": 12,
-        "recurrence_interval_applications": 24,
-        "k_loops": 4,
-        "candidate_tail_layers": 12,
-        "lm_head_calls": 2,
-        "tokenizer_calls": 3,
-        "decode_calls": 0,
-        "wall_seconds": 0.01,
-        "peak_memory_bytes": None,
-        "successful_task": True,
-    }
     records = []
-    for index, rows in enumerate((([-0.1], [-1.0]),
-                                  ([-2.0], [-0.2]))):
+    current_suite = _current_suite()
+    current_examples = current_suite.validation[:2]
+    use_current_examples = suite_sha256 == current_suite.records_hash()
+    for index in range(2):
+        if use_current_examples:
+            example = current_examples[index]
+            candidates = tuple(example.candidates)
+            gold_answer = example.answer
+            winner = (next(candidate for candidate in candidates
+                           if candidate != gold_answer)
+                      if index == 0 else gold_answer)
+            rows = tuple(
+                [-0.1] if candidate == winner else [-2.0 - candidate_index]
+                for candidate_index, candidate in enumerate(candidates)
+            )
+            example_id = example.ex_id
+            family = example.family
+            prompt = example.prompt
+            permutation_seed = example.candidate_permutation_seed
+            permutation = tuple(example.candidate_permutation)
+        else:
+            candidates = ("yes", "no")
+            gold_answer = "yes"
+            rows = (([-0.1], [-1.0]), ([-2.0], [-0.2]))[index]
+            example_id = f"validation-{index}"
+            family = "fsm"
+            prompt = f"state {index}"
+            permutation_seed = index
+            permutation = (0, 1)
+        compute = {
+            "prefill_layers": 12,
+            "recurrence_interval_applications": 24,
+            "k_loops": 4,
+            "candidate_tail_layers": len(candidates) * 6,
+            "lm_head_calls": len(candidates),
+            "tokenizer_calls": len(candidates) + 1,
+            "decode_calls": 0,
+            "wall_seconds": 0.01,
+            "peak_memory_bytes": None,
+            "successful_task": True,
+        }
         records.append(build_eval_record(
             run_id="verified-test-run", recipe_hash=canonical_sha256(recipe),
             model_id=c["model"], model_revision=c["revision"],
             adapter_id=str(out_dir), checkpoint_id="step-100",
             checkpoint_content_hash=state_sha256,
             suite_id="behavioral-v3", suite_version=3,
-            suite_hash=c.get("suite_sha256", SUITE_SHA),
-            example_id=f"validation-{index}", split="validation",
-            family="fsm", prompt=f"state {index}",
-            candidates=("yes", "no"), candidate_permutation_seed=index,
-            candidate_permutation=(0, 1), gold_answer="yes",
+            suite_hash=suite_sha256,
+            example_id=example_id, split="validation",
+            family=family, prompt=prompt,
+            candidates=candidates,
+            candidate_permutation_seed=permutation_seed,
+            candidate_permutation=permutation, gold_answer=gold_answer,
             per_token_logprobs=rows, k=c["k"],
             recurrence_config={"interval": c["interval"],
                                "trained_k": c["k"]},
@@ -127,7 +170,7 @@ def build_verified_run(out_dir, *, config=None) -> dict:
         "adapter_id": str(out_dir),
         "config": c,
         "model": c["model"], "revision": c["revision"],
-        "suite_sha256": c.get("suite_sha256", SUITE_SHA),
+        "suite_sha256": suite_sha256,
         "recipe": recipe,
         "selection_provenance":
             "latent_eval.v3_recomputed_from_raw_validation_records",
@@ -149,7 +192,7 @@ def build_verified_run(out_dir, *, config=None) -> dict:
         "label": c.get("label"),
         "identity": {"model_id": c["model"], "revision": c["revision"]},
         "recipe": recipe,
-        "suite_sha256": c.get("suite_sha256", SUITE_SHA),
+        "suite_sha256": suite_sha256,
         "selected_adapter_state_sha256": state_sha256,
         "checkpoint_content_digest": bundle["content_digest"],
         "checkpoint_sha256": sha256_file(ckpt_path),
