@@ -24,6 +24,7 @@ TIERS = (
 )
 
 MODULE_TIERS = {
+    "test_artifact_classification.py": "core",
     "test_artifact_contracts.py": "lab_unit",
     "test_bench_integration.py": "core",
     "test_benchmark_v3.py": "core",
@@ -45,6 +46,7 @@ MODULE_TIERS = {
     "test_paid_driver_sealed.py": "remote_policy",
     "test_provenance_links.py": "core",
     "test_real_tokenizer.py": "core",
+    "test_r1_experiment_driver.py": "core",
     "test_router.py": "core",
     "test_runtime_scientific.py": "transformer_integration",
     "test_scratch.py": "core",
@@ -55,6 +57,7 @@ MODULE_TIERS = {
     "test_suite.py": "core",
     "test_telemetry_isolation.py": "core",
     "test_text_parsing.py": "core",
+    "test_text_evidence.py": "core",
     "test_tokens.py": "core",
     "test_vast_provision_capped_policy.py": "remote_policy",
     "test_vast_watchdog.py": "remote_policy",

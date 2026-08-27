@@ -94,9 +94,13 @@ fail-open — so nothing happens invisibly "until the end".
 ## Tests & benchmark
 
 ```bash
-uv sync && uv run pytest          # full unit, security, property, integration,
-                                  # runtime, gate, and live-eval suite
-uvx ruff check rcc bench tests evals    # lint
+uv sync --frozen --group dev --no-group lab --no-group mlx
+uv run --no-sync python -m pytest       # dependency-light core contract
+uv sync --frozen --group dev --group lab --no-group mlx
+uv run --no-sync python -m pytest \
+  --run-lab-unit --run-transformer-integration --run-remote-policy
+                                           # all local/offline opt-in tiers
+uvx ruff check rcc bench tests evals       # lint
 uv run python -m bench.run_bench --exact --json .rcc_bench/results.json
 uv run python -m evals.run_live_eval --provider fake   # live-eval harness (offline fixture)
 ```
@@ -134,7 +138,8 @@ root without copying model files into Git:
 
 ```bash
 RCC_R1_EVIDENCE_ROOT=/absolute/path/to/repository/.rcc_work
-.venv/bin/python tools/classify_r1_artifacts.py \
+uv run --frozen --group dev --group lab --no-group mlx \
+  python tools/classify_r1_artifacts.py \
   --evidence-root "$RCC_R1_EVIDENCE_ROOT"
 ```
 

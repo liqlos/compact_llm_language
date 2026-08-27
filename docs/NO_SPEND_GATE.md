@@ -64,8 +64,9 @@ uv run python -m latent_lab.bench.no_spend_gate --dry-run
 - **Per-checkpoint eval joins.** Every retained loadable checkpoint (2B
   AND live 4B) needs valid rescored raw-score evidence bound to it by
   adapter path + exact model id + pinned revision + current suite hash,
-  covering BOTH required splits (`test_id` AND `test_ood`) over the
-  COMPLETE preregistered example set of each declared split; records
+  covering every required behavioral-v3 split (`test_id`,
+  `test_ood_length`, `test_ood_semantic`, and untouched `final_test`) over
+  the COMPLETE preregistered example set of each declared split; records
   whose `ex_id` lies outside the preregistered membership of the file's
   declared split are explicit blockers. One unrelated, one-split, or
   partial eval proves nothing globally.
@@ -119,15 +120,14 @@ strings, never `NaN` tokens).
    bundle loader with fp32 verified from the payload tensors; no orphan,
    no ambiguous duplicate binding.
 4. `retained_evals_rescored_with_corrected_scorer` — every retained
-   loadable checkpoint has valid raw-score eval evidence for BOTH required
-   splits, exactly identity-bound; records holding only derived
-   `correct`/`rank_of_gold` are marked
-   `NON_RESCORABLE_MISSING_RAW_PREDICTION`; malformed/empty/
+   loadable checkpoint has valid `latent_eval.v3` raw per-token evidence for
+   all four required splits, exactly identity-bound; records holding only
+   derived `correct`/`rank_of_gold` are marked
+   `IRRECOVERABLE_LEGACY_SCORER`; malformed/empty/
    invalid-score/conflicting eval files are `EVAL_FILE_INVALID`.
-5. `checkpoint_selection_uses_corrected_metric` — best-step selection
-   reproducible from histories produced under the corrected scorer
-   (`config.scorer == "corrected-gold-aware-v1"`); stored historical
-   `best_val_acc`/`best_step` are never trusted.
+5. `checkpoint_selection_uses_corrected_metric` — best-step selection is
+   reproduced from raw validation records with canonical `latent_eval.v3`;
+   stored historical `best_val_acc`/`best_step` are never trusted.
 6. `runtime_integrity_regressions_pass` — adapter strict metadata +
    roundtrip, fp32 trainables over bf16 backbone, non-finite rejection,
    cached-recurrence equivalence, gold-position scoring invariance.

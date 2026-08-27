@@ -1,0 +1,154 @@
+{
+  "schema_version": "rcc.r1_experiment_preregistration.v1",
+  "registration_date": "2026-08-27",
+  "status": "NOT_EXECUTED",
+  "paid_spend_authorized": false,
+  "scientific_claim_status_before_run": "VALID_EXPERIMENT_PENDING",
+  "question": "Does latent recurrence provide a causal, compute-aware improvement on behavioral-v3 over non-recurrent and visible-text controls?",
+  "model": {
+    "id": "Qwen/Qwen3.5-2B",
+    "revision": "15852e8c16360a2fea060d615a32b45270f8a8fc",
+    "large_weight_download_permitted_in_r1_session": false
+  },
+  "suite": {
+    "identity": "behavioral-v3",
+    "version": 3,
+    "sha256": "5cf5cbf397510ba597b59f7ccf0839cf344e6fb795a5cb29d031f39dac218254",
+    "checkpoint_selection_split": "validation",
+    "checkpoint_selection_examples": 224,
+    "untouched_final_split": "final_test",
+    "untouched_final_examples": 224,
+    "final_test_may_be_opened": "once, after all checkpoints, arms, parsing rules, and comparisons are frozen"
+  },
+  "training": {
+    "seeds": [0, 1, 2],
+    "recurrence_adapter": {
+      "interval": "mid",
+      "trained_k": 4,
+      "steps": 800,
+      "learning_rate": 0.0001,
+      "warmup_steps": 50,
+      "optimizer": "adamw",
+      "weight_decay": 0.01,
+      "clip_norm": 0.5,
+      "lr_schedule": "constant",
+      "lora_rank": 8,
+      "lora_alpha": 16.0,
+      "gradient_semantics": "hidden_state_chain_bptt_with_detached_cache_recurrence"
+    },
+    "separately_trained_k0": {
+      "role": "secondary training control, never the primary recurrence ablation",
+      "interval": "mid",
+      "trained_k": 0,
+      "all_other_hyperparameters_match": true
+    },
+    "full_decoder_recurrence": {
+      "role": "mechanistic baseline",
+      "interval": "full",
+      "trained_k": 4,
+      "all_other_hyperparameters_match": true
+    },
+    "checkpoint_selection": {
+      "scorer": "latent_eval.v3",
+      "metric": "micro_accuracy",
+      "raw_records_required": true,
+      "test_splits_forbidden": true,
+      "tie_policy": "earliest_step_only_after_equal_canonical_validation_metric"
+    }
+  },
+  "evaluation": {
+    "same_recurrence_adapter_k_values": [0, 1, 2, 4, 8],
+    "primary_candidate_score": "mean_candidate_token_logprob_v1",
+    "secondary_candidate_score": "raw_summed_logprob",
+    "candidate_permutation_fixed_by_suite": true,
+    "paired_examples_required": true,
+    "raw_latent_eval_v3_records_required": true,
+    "baselines": [
+      "direct_no_thinking_textual",
+      "visible_scratch_greedy_max_64_generated_tokens",
+      "same_adapter_k0",
+      "separately_trained_k0_secondary",
+      "full_decoder_recurrence",
+      "compute_matched_clock_permutation"
+    ],
+    "causal_ablations": [
+      "zero_state",
+      "noise_state_seed_1234",
+      "swap_state_fixed_next_example",
+      "bypass_interval"
+    ],
+    "reported_metrics": [
+      "micro_accuracy",
+      "macro_by_family_accuracy",
+      "per_family_accuracy",
+      "mean_per_example_uniform_chance",
+      "chance_normalized_accuracy",
+      "nontermination_or_error_rate",
+      "paired_bootstrap_confidence_interval",
+      "wall_clock_seconds_per_successful_task",
+      "all_runtime_compute_counters"
+    ],
+    "confidence_interval": {
+      "method": "paired_example_bootstrap",
+      "confidence": 0.95,
+      "resamples": 10000,
+      "bootstrap_seed": 20260827
+    }
+  },
+  "primary_success_criteria": {
+    "micro_accuracy_point_delta_minimum": 0.05,
+    "micro_accuracy_paired_ci_lower_bound_must_exceed": 0.03,
+    "macro_by_family_point_delta_minimum": 0.03,
+    "comparators": [
+      "same_adapter_k0",
+      "direct_no_thinking_textual"
+    ],
+    "leave_one_family_out_micro_delta_must_remain_positive": true,
+    "each_causal_ablation_clean_minus_ablation_point_delta_minimum": 0.03,
+    "each_causal_ablation_paired_ci_lower_bound_must_exceed": 0.0,
+    "nontermination_or_error_rate_maximum": 0.02,
+    "finite_records_required": true,
+    "checkpoint_selection_reproducible_from_raw_records": true,
+    "candidate_permutation_semantic_verdict_invariant": true,
+    "wall_clock_per_successful_task_must_beat_strongest_successful_text_baseline": true,
+    "all_criteria_conjunctive": true
+  },
+  "stop_criteria": [
+    "no reproducible gain across all three seeds",
+    "gain disappears after candidate permutation",
+    "gain is explained by one family",
+    "K-dose is inconsistent or K=0 is not worse",
+    "zero/noise/swap/bypass ablations do not reduce the result",
+    "full-decoder or direct baseline is stronger at comparable compute",
+    "no wall-clock-per-successful-task advantage",
+    "any NaN or Inf appears",
+    "nontermination_or_error_rate exceeds 0.02",
+    "checkpoint selection or final verdict cannot be independently recomputed from raw records"
+  ],
+  "compute_accounting_required": [
+    "prefill_layer_applications",
+    "recurrence_interval_layer_applications",
+    "k_loops",
+    "per_candidate_tail_layer_applications",
+    "lm_head_calls",
+    "tokenizer_encode_calls",
+    "tokenizer_decode_calls",
+    "wall_clock_seconds",
+    "peak_memory_when_available",
+    "successful_task_denominator"
+  ],
+  "budget_policy_for_future_authorized_run": {
+    "source": "preregistered cap, not a live market-price claim",
+    "max_on_demand_rate_usd_per_hour": 0.45,
+    "estimated_gpu_hours": 18,
+    "estimated_compute_cost_at_rate_cap_usd": 8.10,
+    "max_wall_hours_per_seed": 8,
+    "max_seeds": 3,
+    "max_compute_cost_usd": 10.80,
+    "hard_total_cost_cap_usd": 12.00,
+    "provisioning_included_in_this_session": false
+  },
+  "local_smoke_command": "uv run --frozen --group dev --group lab --no-group mlx python -m pytest -q --run-lab-unit --run-transformer-integration tests/test_benchmark_v3.py tests/test_eval_v3.py tests/test_latent_runtime_integrity.py tests/test_latent_run.py tests/test_no_spend_gate.py tests/test_dictenc.py tests/test_provenance_links.py tests/test_scratch.py tests/test_session.py tests/test_store.py tests/test_tokens.py",
+  "potential_remote_command": "RCC_PAID_SPEND_AUTHORIZED=1 RCC_R1_PREREG_ACK=5cf5cbf397510ba597b59f7ccf0839cf344e6fb795a5cb29d031f39dac218254 bash latent_lab/bench/r1_experiment_driver.sh --seeds 0,1,2 --device cuda --out .rcc_work/r1_experiment",
+  "potential_remote_command_executed": false
+}

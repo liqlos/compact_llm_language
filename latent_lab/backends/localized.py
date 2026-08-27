@@ -223,7 +223,7 @@ def parse_clock_mode(mode, k_steps: int):
 
     Accepts:
       "identity" -> [0..k)
-      "off"      -> [] (no step embeddings applied)
+      "off"      -> [0..k) (all loop layers still run; step embeddings omitted)
       "reverse"  -> [k-1..0]
       "shuffle_perm:i,j,..." -> an EXPLICIT full unique permutation of
           range(k_steps). Anything else (wrong length, repeats, omissions,

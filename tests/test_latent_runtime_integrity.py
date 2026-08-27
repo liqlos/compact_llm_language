@@ -83,7 +83,7 @@ TRAIN_CFG = {
     "lr": 2e-4, "steps": 600, "seed": 0,
     "optimizer": "adamw", "weight_decay": 0.01,
     "lr_schedule": "constant", "warmup": 30, "clip": 0.5,
-    "detach_z0": False, "grad_checkpoint": True,
+    "detach_z0": False,
 }
 
 
@@ -974,6 +974,7 @@ def test_shuffle_requires_full_unique_compute_matched_permutation():
     # identity/reverse stay available and compute-matched
     assert parse_clock_mode("reverse", 4) == [3, 2, 1, 0]
     assert parse_clock_mode("identity", 4) == [0, 1, 2, 3]
+    assert parse_clock_mode("off", 4) == [0, 1, 2, 3]
 
 
 @pytest.mark.filterwarnings("ignore")
