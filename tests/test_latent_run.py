@@ -280,6 +280,7 @@ def _v3_compute():
         "wall_seconds": 0.1,
         "peak_memory_bytes": None,
         "successful_task": True,
+        "eval_ablation": {},
     }
 
 

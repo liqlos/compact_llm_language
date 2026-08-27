@@ -383,6 +383,23 @@ def test_paired_bootstrap_rejects_mismatched_prompt_or_permutation(
         paired_comparison(treatment, control, bootstrap_samples=10)
 
 
+@pytest.mark.parametrize(
+    ("overrides", "field"),
+    [
+        ({"run_id": "different-run"}, "run_id"),
+        ({"checkpoint_id": "step-99"}, "checkpoint_identity"),
+        ({"recurrence_config": {"interval": [0, 4]}},
+         "recurrence_config"),
+    ],
+)
+def test_paired_bootstrap_rejects_different_mechanism_identity(
+        overrides, field):
+    treatment = [_record(example_id="a")]
+    control = [_record(example_id="a", **overrides)]
+    with pytest.raises(EvalV3Error, match=field):
+        paired_comparison(treatment, control, bootstrap_samples=10)
+
+
 def test_selector_accepts_only_canonical_summaries_and_earliest_tie():
     records = [_record()]
     low = checkpoint_history_entry(10, records)

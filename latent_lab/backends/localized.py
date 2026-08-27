@@ -676,7 +676,10 @@ class LocalizedRecurrence:
                 raise NonFiniteCandidateScores(
                     f"candidate {len(details)} token logprobs at positions "
                     f"{bad} are not finite; refusing to aggregate")
-            raw_sum = sum(token_logprobs)
+            # Must match the canonical v3 scorer bit-for-bit.  Built-in sum
+            # can round differently from math.fsum and fabricate/remove an
+            # exact top tie in real-model evidence.
+            raw_sum = math.fsum(token_logprobs)
             details.append(CandidateScoreDetail(
                 token_ids=tuple(int(value) for value in candidate),
                 token_logprobs=token_logprobs,
@@ -728,6 +731,10 @@ class LocalizedRecurrence:
             "wall_seconds": wall_seconds,
             "peak_memory_bytes": peak_memory_bytes,
             "successful_task": True,
+            # This object is sealed into each latent_eval.v3 record hash.  It
+            # prevents a clean record from being relabeled as an intervention
+            # by changing only the surrounding eval envelope.
+            "eval_ablation": dict(ab),
         }
         rep = RecurrenceReport(
             k_steps=k_steps,
@@ -802,7 +809,8 @@ class LocalizedRecurrence:
         rep.extra["primary_score_definition"] = (
             "mean_candidate_token_logprob_v1")
         rep.extra["primary_scores"] = primary
-        rep.extra["exact_top_tie_indices"] = tied_top
+        rep.extra["exact_top_tie_indices"] = (
+            tied_top if len(tied_top) > 1 else [])
         if len(tied_top) != 1:
             raise AmbiguousTopTie(
                 f"exact top tie under mean_candidate_token_logprob_v1 at "

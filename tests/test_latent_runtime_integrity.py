@@ -996,6 +996,14 @@ def test_paired_k0_vs_kpositive_same_adapter_seed_suite():
     assert all(isinstance(s, float) for s in scores_k0 + scores_k1)
 
 
+@pytest.mark.filterwarnings("ignore")
+def test_unique_runtime_winner_is_not_mislabeled_as_an_exact_tie():
+    rec = _nonzero_adapted_rec(_tiny_qwen35(11, 6))
+    order, _scores, report = rec.rank_candidates(_IDS, _CANDS, 1)
+    assert len(order) == len(_CANDS)
+    assert report.extra["exact_top_tie_indices"] == []
+
+
 # ---------------------------------------------------------------------------
 # strict ablation parsing; shuffle permutation proof; zero_state reset
 # ---------------------------------------------------------------------------

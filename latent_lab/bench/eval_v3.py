@@ -832,7 +832,9 @@ def paired_comparison(
     for example_id in ids:
         left, right = treatment[example_id], control[example_id]
         for field in (
-            "suite_identity", "split", "family", "prompt_hash", "candidates",
+            "run_id", "recipe_hash", "model_identity", "checkpoint_identity",
+            "recurrence_config", "suite_identity", "split", "family",
+            "prompt_hash", "candidates",
             "candidate_permutation_seed", "candidate_permutation",
             "gold_answer",
         ):

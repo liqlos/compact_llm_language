@@ -327,7 +327,9 @@ def build_v3_runtime_record(ex, *, split, k_steps, evidence_identity,
     if not isinstance(claimed_top_tie, list) \
             or sorted(claimed_top_tie) != sorted(expected_top_tie):
         raise ValueError(
-            "runtime exact-top-tie claim disagrees with canonical v3")
+            "runtime exact-top-tie claim disagrees with canonical v3: "
+            f"claimed={claimed_top_tie!r} expected={expected_top_tie!r} "
+            f"normalized_scores={record['normalized_scores']!r}")
     if runtime_tie_error is not None \
             and bool(runtime_tie_error) != bool(expected_top_tie):
         raise ValueError(

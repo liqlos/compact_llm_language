@@ -371,6 +371,7 @@ def _validate_eval_result(where: str, name: str, res, identity=None) -> None:
                 f"{where}: results[{name!r}].metrics disagree with "
                 "independent latent_eval.v3 rescore")
         if identity is not None:
+            expected_ablation = res.get("ablate") or {}
             for index, record in enumerate(records):
                 expected_model = {
                     "model_id": identity["model_id"],
@@ -387,6 +388,9 @@ def _validate_eval_result(where: str, name: str, res, identity=None) -> None:
                      identity["checkpoint_content_digest"]),
                     ("split", record["split"], identity["split"]),
                     ("k", record["k"], identity["k_steps"]),
+                    ("compute.eval_ablation",
+                     record["compute"].get("eval_ablation"),
+                     expected_ablation),
                 )
                 for field, actual, expected in checks:
                     if actual != expected:

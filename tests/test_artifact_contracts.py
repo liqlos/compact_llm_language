@@ -673,6 +673,7 @@ def _current_v3_eval_payload(**record_overrides):
             "wall_seconds": 0.1,
             "peak_memory_bytes": None,
             "successful_task": True,
+            "eval_ablation": {},
         },
     }
     metadata.update(record_overrides)
@@ -696,6 +697,20 @@ def test_validate_eval_accepts_only_self_consistent_latent_eval_v3(tmp_path):
     payload["identity"]["checkpoint_content_digest"] = "0" * 64
     ckpt.atomic_write_json(ep, payload)
     with pytest.raises(ValueError, match="content_sha256"):
+        artifacts.validate_eval(ep)
+
+
+def test_validate_eval_rejects_relabelled_v3_ablation(tmp_path):
+    payload, _, _ = _current_v3_eval_payload()
+    result = payload["results"].pop("clean")
+    payload["identity"]["ablation"] = "zero_state"
+    result["ablate"] = {"zero_state": True}
+    result["tag"] = "E-localized|test_id|zero_state|K=4"
+    payload["results"]["zero_state"] = result
+    ep = tmp_path / "relabelled-ablation.json"
+    ckpt.atomic_write_json(ep, payload)
+
+    with pytest.raises(ValueError, match="compute.eval_ablation"):
         artifacts.validate_eval(ep)
 
 
