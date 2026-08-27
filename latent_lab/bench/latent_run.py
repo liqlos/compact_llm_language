@@ -31,6 +31,7 @@ from pathlib import Path
 from latent_lab.backends.localized import (
     CANDIDATE_CE_MODE_SUFFIX,
     NEUTRAL_DELTA_MODE_SUFFIX,
+    PAIRED_DELTA_MODE_SUFFIX,
     RECURRENCE_ONLY_LORA_MODE_SUFFIX,
     TRAINING_OBJECTIVES,
     training_objective_from_config,
@@ -619,6 +620,43 @@ def _neutral_delta_mode(mode: str, neutral_delta: bool) -> str:
     return core + objective_suffix + recurrence_suffix
 
 
+def _paired_delta_mode(mode: str, paired_delta: bool) -> str:
+    """Seal paired-delta in the architecture slot, replacing neutral-delta."""
+    if not isinstance(paired_delta, bool):
+        raise ValueError("paired_delta must be a boolean")
+    recurrence_count = mode.count(RECURRENCE_ONLY_LORA_MODE_SUFFIX)
+    if recurrence_count > 1 or (recurrence_count == 1 and not mode.endswith(
+            RECURRENCE_ONLY_LORA_MODE_SUFFIX)):
+        raise ValueError("mode carries a malformed recurrence-only suffix")
+    recurrence_suffix = (RECURRENCE_ONLY_LORA_MODE_SUFFIX
+                         if recurrence_count else "")
+    core = mode.removesuffix(recurrence_suffix)
+    objective_count = core.count(CANDIDATE_CE_MODE_SUFFIX)
+    if objective_count > 1 or (objective_count == 1 and not core.endswith(
+            CANDIDATE_CE_MODE_SUFFIX)):
+        raise ValueError("mode carries a malformed candidate-CE suffix")
+    objective_suffix = CANDIDATE_CE_MODE_SUFFIX if objective_count else ""
+    core = core.removesuffix(objective_suffix)
+    paired_count = core.count(PAIRED_DELTA_MODE_SUFFIX)
+    neutral_count = core.count(NEUTRAL_DELTA_MODE_SUFFIX)
+    if paired_count > 1 or (paired_count == 1 and not core.endswith(
+            PAIRED_DELTA_MODE_SUFFIX)):
+        raise ValueError("mode carries a malformed paired-delta suffix")
+    if neutral_count:
+        raise ValueError(
+            "paired_delta replaces, and cannot coexist with, neutral-delta mode")
+    if paired_delta:
+        base = core.removesuffix(PAIRED_DELTA_MODE_SUFFIX)
+        if base != "D-full":
+            raise ValueError("paired_delta requires D-full mode")
+        if not paired_count:
+            core += PAIRED_DELTA_MODE_SUFFIX
+        return core + objective_suffix + recurrence_suffix
+    if paired_count:
+        raise ValueError("mode claims paired_delta but paired_delta is false")
+    return core + objective_suffix + recurrence_suffix
+
+
 def _recurrence_only_lora_from_config(cfg: dict) -> bool:
     """Recover and cross-check the policy sealed into the recipe's mode."""
     value = cfg.get("recurrence_only_lora", False)
@@ -657,7 +695,7 @@ def _recurrence_only_lora_from_config(cfg: dict) -> bool:
 
 
 def _neutral_delta_from_config(cfg: dict) -> bool:
-    """Recover neutral-delta and reject suffix/order/config disagreement."""
+    """Recover the neutral readout shared by gated and paired recurrence."""
     value = cfg.get("neutral_delta", False)
     if not isinstance(value, bool):
         raise ValueError("config.neutral_delta must be a boolean")
@@ -670,10 +708,19 @@ def _neutral_delta_from_config(cfg: dict) -> bool:
         raise ValueError(
             "config.mode carries malformed neutral-delta suffix ordering")
     core = core.removesuffix(CANDIDATE_CE_MODE_SUFFIX)
-    count = mode.count(NEUTRAL_DELTA_MODE_SUFFIX)
-    sealed = count == 1 and core.endswith(NEUTRAL_DELTA_MODE_SUFFIX)
-    if count > 1 or (count == 1 and not sealed):
+    count = core.count(NEUTRAL_DELTA_MODE_SUFFIX)
+    paired_count = core.count(PAIRED_DELTA_MODE_SUFFIX)
+    gated_sealed = count == 1 and core.endswith(NEUTRAL_DELTA_MODE_SUFFIX)
+    paired_sealed = (paired_count == 1
+                     and core.endswith(PAIRED_DELTA_MODE_SUFFIX))
+    if count > 1 or (count == 1 and not gated_sealed):
         raise ValueError("config.mode carries a malformed neutral-delta suffix")
+    if paired_count > 1 or (paired_count == 1 and not paired_sealed):
+        raise ValueError("config.mode carries a malformed paired-delta suffix")
+    if count and paired_count:
+        raise ValueError(
+            "config.mode cannot carry both neutral- and paired-delta suffixes")
+    sealed = gated_sealed or paired_sealed
     if value != sealed:
         raise ValueError(
             "config mode and neutral_delta disagree; refusing an unsealed "
@@ -682,7 +729,9 @@ def _neutral_delta_from_config(cfg: dict) -> bool:
         if cfg.get("recurrence_only_lora") is not True:
             raise ValueError(
                 "neutral_delta requires recurrence_only_lora=true")
-        base = core.removesuffix(NEUTRAL_DELTA_MODE_SUFFIX)
+        suffix = (PAIRED_DELTA_MODE_SUFFIX if paired_sealed
+                  else NEUTRAL_DELTA_MODE_SUFFIX)
+        base = core.removesuffix(suffix)
         if base != "D-full":
             raise ValueError("neutral_delta requires D-full mode")
         interval = cfg.get("interval")
@@ -693,6 +742,67 @@ def _neutral_delta_from_config(cfg: dict) -> bool:
     return value
 
 
+def _paired_delta_from_config(cfg: dict) -> bool:
+    """Recover paired recurrence and verify its executable runtime contract."""
+    value = cfg.get("paired_delta", False)
+    if not isinstance(value, bool):
+        raise ValueError("config.paired_delta must be a boolean")
+    mode = cfg.get("mode")
+    if not isinstance(mode, str):
+        raise ValueError("config.mode must be a string")
+    core = mode.removesuffix(RECURRENCE_ONLY_LORA_MODE_SUFFIX)
+    if CANDIDATE_CE_MODE_SUFFIX in core \
+            and not core.endswith(CANDIDATE_CE_MODE_SUFFIX):
+        raise ValueError(
+            "config.mode carries malformed paired-delta suffix ordering")
+    core = core.removesuffix(CANDIDATE_CE_MODE_SUFFIX)
+    count = core.count(PAIRED_DELTA_MODE_SUFFIX)
+    sealed = count == 1 and core.endswith(PAIRED_DELTA_MODE_SUFFIX)
+    if count > 1 or (count == 1 and not sealed):
+        raise ValueError("config.mode carries a malformed paired-delta suffix")
+    if value != sealed:
+        raise ValueError(
+            "config mode and paired_delta disagree; refusing an unsealed "
+            "paired recurrence architecture")
+    if not value:
+        return False
+    if training_objective_from_config(cfg) != "candidate_ce":
+        raise ValueError("paired_delta requires training_objective=candidate_ce")
+    if cfg.get("neutral_delta") is not True:
+        raise ValueError("paired_delta requires neutral_delta=true")
+    if cfg.get("recurrence_only_lora") is not True:
+        raise ValueError("paired_delta requires recurrence_only_lora=true")
+    if core.removesuffix(PAIRED_DELTA_MODE_SUFFIX) != "D-full":
+        raise ValueError("paired_delta requires D-full mode")
+    interval = cfg.get("interval")
+    if not isinstance(interval, (list, tuple)) or len(interval) != 2 \
+            or interval[0] != 0:
+        raise ValueError(
+            "paired_delta requires a full decoder interval beginning at 0")
+    contract = cfg.get("runtime_contract")
+    if not isinstance(contract, dict):
+        raise ValueError("paired_delta config lacks sealed runtime_contract metadata")
+    expected = {
+        "paired_delta": True,
+        "neutral_delta": True,
+        "recurrence_passes_per_step": 2,
+        "paired_base_adapter_active": False,
+        "paired_adapted_adapter_active": True,
+        "paired_clock_branch": "adapted_only",
+        "paired_cache_semantics": (
+            "restore_same_prompt_snapshot_before_base_and_adapted_"
+            "passes_and_after_update"),
+        "recurrence_update_semantics": (
+            "z_next=z+(adapted(z+clock)-base(z))"),
+    }
+    observed = {key: contract.get(key) for key in expected}
+    if observed != expected:
+        raise ValueError(
+            "config.runtime_contract disagrees with paired-delta semantics: "
+            f"expected {expected}, got {observed}")
+    return True
+
+
 def _recurrence_config(cfg: dict) -> dict:
     """Measured recurrence settings; unsupported flags cannot enter v3."""
     if cfg.get("grad_checkpoint") not in (None, False):
@@ -700,7 +810,8 @@ def _recurrence_config(cfg: dict) -> dict:
     training_objective_from_config(cfg)
     recurrence_only_lora = _recurrence_only_lora_from_config(cfg)
     neutral_delta = _neutral_delta_from_config(cfg)
-    return {
+    paired_delta = _paired_delta_from_config(cfg)
+    recurrence = {
         "mode": cfg["mode"],
         "interval": list(cfg["interval"]),
         "trained_k": cfg["k"],
@@ -713,6 +824,9 @@ def _recurrence_config(cfg: dict) -> dict:
         "adapter_activation_policy": (
             "recurrence_only" if recurrence_only_lora else "all_stages"),
     }
+    if paired_delta:
+        recurrence["paired_delta"] = True
+    return recurrence
 
 
 def _training_run_id(out: Path, recipe_hash: str, seed: int, *,
@@ -810,15 +924,22 @@ def recipe_from_config(cfg: dict, suite_sha256: str) -> dict:
 def mode_from_spec(interval_spec: str, k: int,
                    recurrence_only_lora: bool = False,
                    training_objective: str = "gold_nll",
-                   neutral_delta: bool = False) -> str:
+                   neutral_delta: bool = False,
+                   paired_delta: bool = False) -> str:
     """The preregistered mode implied by the interval spec and K."""
     base = ("D-full" if interval_spec == "full"
             else "F-control" if k == 0 else "E-localized")
+    if paired_delta:
+        if training_objective != "candidate_ce":
+            raise ValueError("paired_delta requires training_objective=candidate_ce")
+        neutral_delta = True
+        recurrence_only_lora = True
     if neutral_delta and (interval_spec != "full" or
                           not recurrence_only_lora):
         raise ValueError(
             "neutral_delta requires interval='full' and recurrence-only LoRA")
-    base = _neutral_delta_mode(base, neutral_delta)
+    base = (_paired_delta_mode(base, True) if paired_delta
+            else _neutral_delta_mode(base, neutral_delta))
     objective_mode = _training_objective_mode(base, training_objective)
     return _adapter_policy_mode(objective_mode, recurrence_only_lora)
 
@@ -829,7 +950,8 @@ def train_recipe_digest(*, mode, interval, k, max_k, lora_r, lora_alpha,
                          suite_sha256, grad_checkpoint=None,
                          recurrence_only_lora=False,
                          training_objective="gold_nll",
-                         neutral_delta=False) -> str:
+                         neutral_delta=False,
+                         paired_delta=False) -> str:
     """ONE canonical digest binding EVERY behavior-changing field.
 
     The single source of truth shared by the trainer and the paid
@@ -839,12 +961,20 @@ def train_recipe_digest(*, mode, interval, k, max_k, lora_r, lora_alpha,
     ``grad_checkpoint`` keyword is accepted only as a false migration input;
     checkpointing.recipe_from_config rejects true and never persists it.
     """
+    if paired_delta:
+        if training_objective != "candidate_ce":
+            raise ValueError("paired_delta requires training_objective=candidate_ce")
+        neutral_delta = True
+        recurrence_only_lora = True
     if neutral_delta and not recurrence_only_lora:
         raise ValueError("neutral_delta requires recurrence_only_lora=true")
+    architecture_mode = (
+        _paired_delta_mode(mode, True) if paired_delta
+        else _neutral_delta_mode(mode, neutral_delta))
     cfg = {
         "mode": _adapter_policy_mode(
             _training_objective_mode(
-                _neutral_delta_mode(mode, neutral_delta), training_objective),
+                architecture_mode, training_objective),
             recurrence_only_lora),
         "interval": list(interval), "k": k, "max_k": max_k,
         "lora_r": lora_r, "lora_alpha": lora_alpha,
@@ -982,16 +1112,22 @@ def _train_inner(args, out: Path, device: str, revision: str):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    neutral_delta = getattr(args, "neutral_delta", False)
-    if not isinstance(neutral_delta, bool):
+    requested_neutral_delta = getattr(args, "neutral_delta", False)
+    if not isinstance(requested_neutral_delta, bool):
         raise ValueError("--neutral-delta must be a boolean flag")
+    paired_delta = getattr(args, "paired_delta", False)
+    if not isinstance(paired_delta, bool):
+        raise ValueError("--paired-delta must be a boolean flag")
+    neutral_delta = requested_neutral_delta or paired_delta
     if neutral_delta and args.interval != "full":
-        raise ValueError("--neutral-delta requires --interval full")
+        raise ValueError("--neutral-delta/--paired-delta requires --interval full")
     # Neutral-delta is defined with adapters active only in its proposal loop.
     recurrence_only_lora = (
         getattr(args, "recurrence_only_lora", False) or neutral_delta)
     training_objective = getattr(args, "training_objective", "gold_nll")
     _training_objective_mode("D-full", training_objective)
+    if paired_delta and training_objective != "candidate_ce":
+        raise ValueError("--paired-delta requires --training-objective candidate_ce")
     if recurrence_only_lora and args.k == 0:
         raise ValueError(
             "--recurrence-only-lora requires --k > 0 for training; "
@@ -1003,7 +1139,8 @@ def _train_inner(args, out: Path, device: str, revision: str):
     rec = LocalizedRecurrence(model, None, interval=interval, max_k=args.max_k,
                               lora_r=args.lora_r, lora_alpha=args.lora_alpha,
                               recurrence_only_lora=recurrence_only_lora,
-                              neutral_delta=neutral_delta)
+                              neutral_delta=neutral_delta,
+                              paired_delta=paired_delta)
     rec.clock.to(device)
     params = [p for p in rec.trainable_parameters()]
     if args.optimizer != "adamw":
@@ -1017,7 +1154,8 @@ def _train_inner(args, out: Path, device: str, revision: str):
     suite_sha = suite_manifest["suite_hash"]
     mode = mode_from_spec(
         args.interval, args.k, recurrence_only_lora=recurrence_only_lora,
-        training_objective=training_objective, neutral_delta=neutral_delta)
+        training_objective=training_objective, neutral_delta=neutral_delta,
+        paired_delta=paired_delta)
     cfg = {
         "mode": mode,
         "model": args.model, "revision": revision,
@@ -1031,6 +1169,7 @@ def _train_inner(args, out: Path, device: str, revision: str):
         "training_objective": training_objective,
         "recurrence_only_lora": recurrence_only_lora,
         "neutral_delta": neutral_delta,
+        "paired_delta": paired_delta,
         "runtime_contract": rec.runtime_contract(),
         "device": device,
         "label": getattr(args, "label", None),
@@ -1285,6 +1424,7 @@ def cmd_eval(args):
     training_objective_from_config(cfg)
     recurrence_only_lora = _recurrence_only_lora_from_config(cfg)
     neutral_delta = _neutral_delta_from_config(cfg)
+    paired_delta = _paired_delta_from_config(cfg)
     model_id = cfg.get("model")
     if not isinstance(model_id, str) or not model_id:
         raise ValueError(
@@ -1391,7 +1531,8 @@ def cmd_eval(args):
                                max_k=cfg["max_k"], lora_r=cfg["lora_r"],
                                lora_alpha=float(cfg.get("lora_alpha", 16.0)),
                                recurrence_only_lora=recurrence_only_lora,
-                               neutral_delta=neutral_delta)
+                               neutral_delta=neutral_delta,
+                               paired_delta=paired_delta)
     stored_runtime_contract = cfg.get("runtime_contract")
     if stored_runtime_contract is not None \
             and stored_runtime_contract != rec.runtime_contract():
@@ -1479,6 +1620,10 @@ def main():
         "--neutral-delta", action="store_true",
         help="full-decoder ReZero delta recurrence at fixed prompt-end cache; "
              "implies recurrence-only LoRA")
+    tr.add_argument(
+        "--paired-delta", action="store_true",
+        help="full-decoder adapted-minus-base residual recurrence; implies "
+             "neutral delta readout, recurrence-only LoRA, and candidate CE")
     tr.add_argument("--label", default=None,
                     help="preregistered run label (bound into evidence; "
                     "never derived from output path)")

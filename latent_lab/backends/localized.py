@@ -166,6 +166,7 @@ LORA_TARGET_SUFFIXES = (
 RECURRENCE_ONLY_LORA_MODE_SUFFIX = "+recurrence-only-lora"
 CANDIDATE_CE_MODE_SUFFIX = "+candidate-ce"
 NEUTRAL_DELTA_MODE_SUFFIX = "+neutral-delta"
+PAIRED_DELTA_MODE_SUFFIX = "+paired-delta"
 TRAINING_OBJECTIVES = ("gold_nll", "candidate_ce")
 
 
@@ -390,12 +391,15 @@ class LocalizedRecurrence:
 
     def __init__(self, model, tokenizer=None, *, interval, max_k=16,
                  lora_r=8, lora_alpha=16.0, use_clock=True,
-                 recurrence_only_lora=False, neutral_delta=False):
+                 recurrence_only_lora=False, neutral_delta=False,
+                 paired_delta=False):
         _require_torch("LocalizedRecurrence")
         if not isinstance(recurrence_only_lora, bool):
             raise ValueError("recurrence_only_lora must be a boolean")
         if not isinstance(neutral_delta, bool):
             raise ValueError("neutral_delta must be a boolean")
+        if not isinstance(paired_delta, bool):
+            raise ValueError("paired_delta must be a boolean")
         self.model = model
         # frozen-backbone contract: nothing except LoRA/clock may train
         for p in model.parameters():
@@ -420,12 +424,14 @@ class LocalizedRecurrence:
         if not (0 <= lo < hi <= self.n_layers):
             raise ValueError(f"bad interval {interval} for {self.n_layers}L")
         self.interval = (lo, hi)
-        if neutral_delta and self.interval != (0, self.n_layers):
+        if (neutral_delta or paired_delta) \
+                and self.interval != (0, self.n_layers):
             raise ValueError(
-                "neutral_delta requires full-decoder interval=(0, n_layers)")
-        if neutral_delta and not recurrence_only_lora:
+                "neutral/paired delta requires full-decoder "
+                "interval=(0, n_layers)")
+        if (neutral_delta or paired_delta) and not recurrence_only_lora:
             raise ValueError(
-                "neutral_delta requires recurrence_only_lora=True")
+                "neutral/paired delta requires recurrence_only_lora=True")
         if isinstance(max_k, bool) or not isinstance(max_k, int) or max_k < 0:
             raise ValueError("max_k must be a non-negative integer")
         self.max_k = max_k
@@ -436,9 +442,14 @@ class LocalizedRecurrence:
         dev = next(model.parameters()).device
         # clock trainables are explicitly fp32; never the global default dtype
         self.clock = make_step_clock(hidden, max_k, device=dev)
-        self.neutral_delta = neutral_delta
+        # Paired recurrence shares the neutral delta readout and causal state
+        # controls, but replaces the ReZero gate with an adapted-minus-base
+        # residual.  Keep the public architecture flag separate so bundles can
+        # never confuse the two mechanisms.
+        self.paired_delta = paired_delta
+        self.neutral_delta = neutral_delta or paired_delta
         self.step_gates = None
-        if self.neutral_delta:
+        if self.neutral_delta and not self.paired_delta:
             self.step_gates = torch.nn.Parameter(torch.zeros(
                 max_k, device=dev, dtype=torch.float32))
 
@@ -454,8 +465,10 @@ class LocalizedRecurrence:
 
     def runtime_contract(self) -> dict:
         """Executable scientific metadata; generic RCC ABI is not this path."""
-        return {
-            "contract_version": self.RUNTIME_CONTRACT_VERSION,
+        contract = {
+            "contract_version": (
+                "localized_recurrence.runtime.paired_delta.v1"
+                if self.paired_delta else self.RUNTIME_CONTRACT_VERSION),
             "evidence_runtime": "LocalizedRecurrence",
             "generic_state_controller_abi": "SCAFFOLD_NOT_EVIDENCE_PATH",
             "training_gradient_semantics": self.TRAINING_GRADIENT_SEMANTICS,
@@ -479,6 +492,20 @@ class LocalizedRecurrence:
             "candidate_scoring": "autoregressive_raw_per_token_logprobs",
             "same_adapter_supported_k": list(range(self.max_k + 1)),
         }
+        if self.paired_delta:
+            contract.update({
+                "paired_delta": True,
+                "recurrence_passes_per_step": 2,
+                "paired_base_adapter_active": False,
+                "paired_adapted_adapter_active": True,
+                "paired_clock_branch": "adapted_only",
+                "paired_cache_semantics": (
+                    "restore_same_prompt_snapshot_before_base_and_adapted_"
+                    "passes_and_after_update"),
+                "recurrence_update_semantics": (
+                    "z_next=z+(adapted(z+clock)-base(z))"),
+            })
+        return contract
 
     def _set_lora_enabled(self, enabled: bool) -> None:
         """Toggle every injected adapter or fail before executing a stage."""
@@ -628,29 +655,61 @@ class LocalizedRecurrence:
         if self.neutral_delta:
             from ..backends.hf_qwen import cache_restore, cache_snapshot
             prompt_cache = cache_snapshot(cache)
-        with self.guard.window(), self._lora_scope(True):
+        with self.guard.window():
             pos = start_pos
             try:
                 for ci in idxs:
                     if self.neutral_delta:
                         cache_restore(cache, prompt_cache)
-                    zz = z
-                    if self.use_clock and mode != "off":
-                        tok = torch.tensor([ci + 1], device=z.device)
-                        zz = zz + self.clock(tok).view(1, 1, -1).to(z.dtype)
-                    if ab.get("bypass_interval"):
-                        proposal = zz
-                    else:
-                        proposal = self._run_layers(
-                            range(lo, hi), zz, cache, start_pos if
-                            self.neutral_delta else pos, grad=grad)
-                    if self.neutral_delta:
-                        gate = torch.tanh(self.step_gates[ci]).to(z.dtype)
-                        z = z + gate * (proposal - z)
+                    if self.paired_delta:
+                        # A common-mode subtraction makes the recurrence exactly
+                        # neutral when the zero-init adapter and clock contribute
+                        # nothing.  Both branches retain the live hidden-state
+                        # gradient; only cache storage remains detached by
+                        # _run_layers.  Each branch sees the exact same prompt
+                        # snapshot and fixed prompt-end position.
+                        if ab.get("bypass_interval"):
+                            base_proposal = z
+                        else:
+                            with self._lora_scope(False):
+                                base_proposal = self._run_layers(
+                                    range(lo, hi), z, cache, start_pos,
+                                    grad=grad)
+                        cache_restore(cache, prompt_cache)
+                        adapted_input = z
+                        if self.use_clock and mode != "off":
+                            tok = torch.tensor([ci + 1], device=z.device)
+                            adapted_input = adapted_input + self.clock(tok).view(
+                                1, 1, -1).to(z.dtype)
+                        if ab.get("bypass_interval"):
+                            adapted_proposal = adapted_input
+                        else:
+                            with self._lora_scope(True):
+                                adapted_proposal = self._run_layers(
+                                    range(lo, hi), adapted_input, cache,
+                                    start_pos, grad=grad)
+                        z = z + (adapted_proposal - base_proposal)
                         cache_restore(cache, prompt_cache)
                     else:
-                        z = proposal
-                        pos += 1
+                        zz = z
+                        if self.use_clock and mode != "off":
+                            tok = torch.tensor([ci + 1], device=z.device)
+                            zz = zz + self.clock(tok).view(
+                                1, 1, -1).to(z.dtype)
+                        if ab.get("bypass_interval"):
+                            proposal = zz
+                        else:
+                            with self._lora_scope(True):
+                                proposal = self._run_layers(
+                                    range(lo, hi), zz, cache, start_pos if
+                                    self.neutral_delta else pos, grad=grad)
+                        if self.neutral_delta:
+                            gate = torch.tanh(self.step_gates[ci]).to(z.dtype)
+                            z = z + gate * (proposal - z)
+                            cache_restore(cache, prompt_cache)
+                        else:
+                            z = proposal
+                            pos += 1
             finally:
                 if self.neutral_delta:
                     cache_restore(cache, prompt_cache)
@@ -852,7 +911,8 @@ class LocalizedRecurrence:
 
         effective_k = min(int(ab.get("truncate_k", k_steps)), k_steps)
         recurrence_multiplier = 2 if partner_input_ids is not None else 1
-        recurrence_apps = recurrence_multiplier * (
+        recurrence_passes = 2 if self.paired_delta else 1
+        recurrence_apps = recurrence_multiplier * recurrence_passes * (
             0 if ab.get("bypass_interval") else
             (self.interval[1] - self.interval[0]) * effective_k
         )
@@ -901,6 +961,13 @@ class LocalizedRecurrence:
             "candidate_adapter_active": not self.recurrence_only_lora,
             "neutral_delta": self.neutral_delta,
         }
+        if self.paired_delta:
+            measured_compute.update({
+                "paired_delta": True,
+                "recurrence_passes_per_step": 2,
+                "recurrence_decoder_passes": (
+                    recurrence_multiplier * recurrence_passes * effective_k),
+            })
         rep = RecurrenceReport(
             k_steps=k_steps,
             interval=self.interval,
@@ -949,6 +1016,7 @@ class LocalizedRecurrence:
                 "prefill_layer_applications": prefill_apps,
                 "recurrence_interval_layer_applications": recurrence_apps,
                 "recurrence_effective_k": effective_k,
+                "recurrence_passes_per_step": recurrence_passes,
                 "candidate_readout_tail_layer_applications": readout_tail_apps,
                 "candidate_full_decoder_layer_applications": answer_decoder_apps,
                 "candidate_layer_applications": candidate_apps,
@@ -1124,7 +1192,8 @@ class LocalizedRecurrence:
         ps = lora_parameters(self.injected)
         if self.use_clock:
             ps += list(self.clock.parameters())
-        if getattr(self, "neutral_delta", False):
+        if (getattr(self, "neutral_delta", False)
+                and not getattr(self, "paired_delta", False)):
             ps.append(self.step_gates)
         return ps
 
@@ -1136,7 +1205,8 @@ class LocalizedRecurrence:
                    for i, l in enumerate(self.injected)})
         if self.use_clock:
             sd["clock.weight"] = self.clock.weight.detach().to("cpu").clone()
-        if getattr(self, "neutral_delta", False):
+        if (getattr(self, "neutral_delta", False)
+                and not getattr(self, "paired_delta", False)):
             sd["step_gates"] = self.step_gates.detach().to("cpu").clone()
         return sd
 
@@ -1147,7 +1217,8 @@ class LocalizedRecurrence:
             targets[f"lora.{i}.B"] = l.lora_B
         if self.use_clock:
             targets["clock.weight"] = self.clock.weight
-        if getattr(self, "neutral_delta", False):
+        if (getattr(self, "neutral_delta", False)
+                and not getattr(self, "paired_delta", False)):
             targets["step_gates"] = self.step_gates
         return targets
 
@@ -1229,8 +1300,9 @@ class LocalizedRecurrence:
         runtime_alpha = float(self.injected[0].scaling
                               * self.injected[0].lora_A.shape[0])
         drift = []
+        claimed_objective = None
         try:
-            training_objective_from_config(config)
+            claimed_objective = training_objective_from_config(config)
         except ValueError as e:
             drift.append(str(e))
         claimed_policy = config.get("recurrence_only_lora", False)
@@ -1252,15 +1324,29 @@ class LocalizedRecurrence:
         if not isinstance(claimed_neutral, bool):
             drift.append("neutral_delta is not a boolean")
             claimed_neutral = None
-        neutral_count = recipe["mode"].count(NEUTRAL_DELTA_MODE_SUFFIX)
-        neutral_core = recipe["mode"].removesuffix(
+        claimed_paired = config.get("paired_delta", False)
+        if not isinstance(claimed_paired, bool):
+            drift.append("paired_delta is not a boolean")
+            claimed_paired = None
+        architecture_core = recipe["mode"].removesuffix(
             RECURRENCE_ONLY_LORA_MODE_SUFFIX).removesuffix(
                 CANDIDATE_CE_MODE_SUFFIX)
-        mode_has_neutral = neutral_count == 1 and neutral_core.endswith(
+        neutral_count = architecture_core.count(NEUTRAL_DELTA_MODE_SUFFIX)
+        paired_count = architecture_core.count(PAIRED_DELTA_MODE_SUFFIX)
+        mode_has_neutral_suffix = neutral_count == 1 and architecture_core.endswith(
             NEUTRAL_DELTA_MODE_SUFFIX)
-        if neutral_count > 1 or (neutral_count == 1 and not mode_has_neutral):
+        mode_has_paired = paired_count == 1 and architecture_core.endswith(
+            PAIRED_DELTA_MODE_SUFFIX)
+        if neutral_count > 1 or (neutral_count == 1
+                                 and not mode_has_neutral_suffix):
             drift.append("mode carries a malformed neutral-delta suffix")
-        if claimed_neutral is not None and claimed_neutral != mode_has_neutral:
+        if paired_count > 1 or (paired_count == 1 and not mode_has_paired):
+            drift.append("mode carries a malformed paired-delta suffix")
+        if neutral_count and paired_count:
+            drift.append("mode cannot carry both neutral- and paired-delta")
+        mode_has_neutral_readout = mode_has_neutral_suffix or mode_has_paired
+        if claimed_neutral is not None \
+                and claimed_neutral != mode_has_neutral_readout:
             drift.append(
                 f"mode {recipe['mode']!r} does not seal "
                 f"neutral_delta={claimed_neutral}")
@@ -1269,8 +1355,21 @@ class LocalizedRecurrence:
             drift.append(
                 f"neutral_delta {claimed_neutral} != runtime "
                 f"{getattr(self, 'neutral_delta', False)}")
+        if claimed_paired is not None and claimed_paired != mode_has_paired:
+            drift.append(
+                f"mode {recipe['mode']!r} does not seal "
+                f"paired_delta={claimed_paired}")
+        if claimed_paired is not None \
+                and claimed_paired != getattr(self, "paired_delta", False):
+            drift.append(
+                f"paired_delta {claimed_paired} != runtime "
+                f"{getattr(self, 'paired_delta', False)}")
         if claimed_neutral and not claimed_policy:
             drift.append("neutral_delta requires recurrence_only_lora=true")
+        if claimed_paired and not claimed_neutral:
+            drift.append("paired_delta requires neutral_delta=true")
+        if claimed_paired and claimed_objective != "candidate_ce":
+            drift.append("paired_delta requires training_objective=candidate_ce")
         if claimed_neutral and self.interval != (
                 0, getattr(self, "n_layers", self.interval[1])):
             drift.append("neutral_delta requires the full decoder interval")

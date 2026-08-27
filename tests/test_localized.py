@@ -440,6 +440,114 @@ def test_neutral_delta_rejects_non_full_or_shared_adapter_modes():
             max_k=2, neutral_delta=True)
 
 
+def build_paired_delta(max_k=4):
+    model, tok = build_tiny_hybrid()
+    return model, LocalizedRecurrence(
+        model, tok, interval=(0, model.config.num_hidden_layers),
+        max_k=max_k, lora_r=2, recurrence_only_lora=True,
+        paired_delta=True)
+
+
+def test_paired_delta_init_is_bit_exact_k0_and_has_no_step_gates():
+    model, rec2 = build_paired_delta()
+    ids = torch.randint(0, 250, (1, 7))
+    candidates = ([10, 11, 12], [13, 14])
+    k0, report0 = rec2.score_candidates(ids, candidates, 0)
+    k4, report4 = rec2.score_candidates(ids, candidates, 4)
+
+    assert rec2.neutral_delta is True and rec2.paired_delta is True
+    assert rec2.step_gates is None
+    assert "step_gates" not in rec2.adapter_state_dict()
+    assert _token_logprobs(k4) == _token_logprobs(k0)
+    assert report4.extra["recurrence_interval_layer_applications"] == \
+        2 * 4 * model.config.num_hidden_layers
+    assert report4.extra["recurrence_passes_per_step"] == 2
+    assert report4.extra["readout_position"] == ids.shape[1]
+    assert report0.extra["readout_position"] == ids.shape[1]
+    assert rec2.runtime_contract()["recurrence_passes_per_step"] == 2
+
+
+def test_paired_delta_executes_two_full_decoder_passes_per_step():
+    model, rec2 = build_paired_delta(max_k=3)
+    ids = torch.randint(0, 250, (1, 7))
+    with torch.no_grad():
+        cache, z0 = rec2._encode(ids)
+    counts = [0] * model.config.num_hidden_layers
+    handles = []
+    for index, layer in enumerate(rec2.base.layers):
+        handles.append(layer.register_forward_hook(
+            lambda _module, _inputs, _output, i=index:
+            counts.__setitem__(i, counts[i] + 1)))
+    try:
+        with torch.no_grad():
+            rec2.latent_steps(z0, cache, ids.shape[1], 3)
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert counts == [2 * 3] * model.config.num_hidden_layers
+
+
+def test_paired_delta_first_backward_trains_b_and_clock_then_a():
+    _model, rec2 = build_paired_delta(max_k=2)
+    ids = torch.randint(0, 250, (1, 7))
+    candidates = ([10, 11], [12, 13], [14, 15])
+    optimizer = torch.optim.SGD(rec2.trainable_parameters(), lr=0.05)
+
+    loss = rec2.candidate_ce_loss_on_example(
+        ids, candidates, gold_index=1, k_steps=2)
+    loss.backward()
+    b_gradients = [adapter.lora_B.grad for adapter in rec2.injected]
+    a_gradients = [adapter.lora_A.grad for adapter in rec2.injected]
+    assert any(gradient is not None
+               and torch.count_nonzero(gradient).item() > 0
+               for gradient in b_gradients)
+    assert rec2.clock.weight.grad is not None
+    assert torch.count_nonzero(rec2.clock.weight.grad).item() > 0
+    assert all(gradient is None or torch.count_nonzero(gradient).item() == 0
+               for gradient in a_gradients)
+
+    optimizer.step()
+    optimizer.zero_grad()
+    loss2 = rec2.candidate_ce_loss_on_example(
+        ids, candidates, gold_index=1, k_steps=2)
+    loss2.backward()
+    assert any(adapter.lora_A.grad is not None
+               and torch.count_nonzero(adapter.lora_A.grad).item() > 0
+               for adapter in rec2.injected)
+    assert all(not adapter.enabled for adapter in rec2.injected)
+
+
+def test_paired_delta_full_reset_is_bit_exact_k0_after_training_signal():
+    _model, rec2 = build_paired_delta()
+    ids = torch.randint(0, 250, (1, 7))
+    candidates = ([10, 11, 12], [13, 14, 15])
+    generator = torch.Generator().manual_seed(94)
+    with torch.no_grad():
+        rec2.clock.weight.normal_(mean=0.0, std=0.1, generator=generator)
+        for adapter in rec2.injected:
+            adapter.lora_B.copy_(torch.randn(
+                adapter.lora_B.shape, generator=generator) * 0.1)
+    k0, _ = rec2.score_candidates(ids, candidates, 0)
+    reset, report = rec2.score_candidates(
+        ids, candidates, 4,
+        ablate={"reset_state": True, "reset_cache": True})
+    assert _token_logprobs(reset) == _token_logprobs(k0)
+    assert report.extra["compute"]["k_loops"] == 4
+
+
+def test_paired_delta_rejects_non_full_or_shared_adapter_modes():
+    model, tok = build_tiny_hybrid()
+    with pytest.raises(ValueError, match="full-decoder"):
+        LocalizedRecurrence(
+            model, tok, interval=INTERVAL, max_k=2,
+            recurrence_only_lora=True, paired_delta=True)
+    model, tok = build_tiny_hybrid()
+    with pytest.raises(ValueError, match="recurrence_only_lora"):
+        LocalizedRecurrence(
+            model, tok, interval=(0, model.config.num_hidden_layers),
+            max_k=2, paired_delta=True)
+
+
 def test_clock_changes_state_after_perturbation(rec):
     with torch.no_grad():
         rec.clock.weight.fill_(0.01)

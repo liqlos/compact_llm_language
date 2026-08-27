@@ -374,6 +374,63 @@ def test_neutral_delta_is_mode_bound_before_objective_and_adapter_policy():
             **cfg, "recurrence_only_lora": False})
 
 
+def test_paired_delta_mode_config_and_runtime_contract_are_sealed():
+    from latent_lab.bench import latent_run
+
+    mode = latent_run.mode_from_spec(
+        "full", 4, training_objective="candidate_ce", paired_delta=True)
+    assert mode == (
+        "D-full+paired-delta+candidate-ce+recurrence-only-lora")
+    contract = {
+        "adapter_activation_policy": "recurrence_only",
+        "prefill_adapter_active": False,
+        "recurrence_adapter_active": True,
+        "candidate_adapter_active": False,
+        "neutral_delta": True,
+        "paired_delta": True,
+        "recurrence_passes_per_step": 2,
+        "paired_base_adapter_active": False,
+        "paired_adapted_adapter_active": True,
+        "paired_clock_branch": "adapted_only",
+        "paired_cache_semantics": (
+            "restore_same_prompt_snapshot_before_base_and_adapted_"
+            "passes_and_after_update"),
+        "recurrence_update_semantics": (
+            "z_next=z+(adapted(z+clock)-base(z))"),
+    }
+    cfg = _cfg(
+        mode=mode, interval=[0, 4], training_objective="candidate_ce",
+        recurrence_only_lora=True, neutral_delta=True, paired_delta=True,
+        runtime_contract=contract)
+    assert latent_run._neutral_delta_from_config(cfg) is True
+    assert latent_run._paired_delta_from_config(cfg) is True
+    recurrence = latent_run._recurrence_config(cfg)
+    assert recurrence["paired_delta"] is True
+    assert recurrence["mode"] == mode
+
+    common = dict(
+        mode="D-full", interval=(0, 4), k=4, max_k=4,
+        lora_r=8, lora_alpha=16.0, lr=2e-4, steps=20, seed=0,
+        optimizer="adamw", weight_decay=0.01, lr_schedule="constant",
+        warmup=2, clip=0.5, detach_z0=False, suite_sha256=SUITE_SHA,
+        recurrence_only_lora=True, training_objective="candidate_ce")
+    assert latent_run.train_recipe_digest(**common) != \
+        latent_run.train_recipe_digest(**common, paired_delta=True)
+
+    with pytest.raises(ValueError, match="candidate_ce"):
+        latent_run.mode_from_spec("full", 4, paired_delta=True)
+    with pytest.raises(ValueError, match="interval='full'"):
+        latent_run.mode_from_spec(
+            "mid", 4, training_objective="candidate_ce", paired_delta=True)
+    with pytest.raises(ValueError, match="mode and paired_delta disagree"):
+        latent_run._paired_delta_from_config({
+            **cfg, "mode": "D-full+candidate-ce+recurrence-only-lora"})
+    with pytest.raises(ValueError, match="paired-delta semantics"):
+        latent_run._paired_delta_from_config({
+            **cfg, "runtime_contract": {
+                **contract, "recurrence_passes_per_step": 1}})
+
+
 def test_recurrence_only_lora_k0_training_fails_before_model_load(tmp_path):
     from latent_lab.bench import latent_run
 
