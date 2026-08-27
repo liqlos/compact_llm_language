@@ -167,6 +167,7 @@ RECURRENCE_ONLY_LORA_MODE_SUFFIX = "+recurrence-only-lora"
 CANDIDATE_CE_MODE_SUFFIX = "+candidate-ce"
 NEUTRAL_DELTA_MODE_SUFFIX = "+neutral-delta"
 PAIRED_DELTA_MODE_SUFFIX = "+paired-delta"
+TRACE_CURRICULUM_MODE_SUFFIX = "+trace-curriculum"
 TRAINING_OBJECTIVES = ("gold_nll", "candidate_ce")
 
 
@@ -620,7 +621,7 @@ class LocalizedRecurrence:
     # -- stages ----------------------------------------------------------------
 
     def latent_steps(self, z, cache, start_pos, k_steps, *,
-                     grad=False, ablate=None):
+                     grad=False, ablate=None, capture_trajectory=False):
         """Apply the interval K times; GUARDED: no vocab/tokenizer activity.
 
         ablate keys (strictly validated; unknown keys/modes are fatal):
@@ -643,6 +644,10 @@ class LocalizedRecurrence:
         if isinstance(k_steps, bool) or not isinstance(k_steps, int) \
                 or not 0 <= k_steps <= self.max_k:
             raise ValueError(f"k_steps must be an int in [0, {self.max_k}]")
+        if not isinstance(capture_trajectory, bool):
+            raise ValueError("capture_trajectory must be a boolean")
+        if capture_trajectory and not self.paired_delta:
+            raise ValueError("trajectory capture requires paired_delta mode")
         ab = validate_ablation(ablate, k_steps)
         mode = ab.get("clocks", "identity")
         eff_k = min(int(ab.get("truncate_k", k_steps)), k_steps)
@@ -651,6 +656,7 @@ class LocalizedRecurrence:
 
         lo, hi = self.interval
         z_initial = z
+        trajectory = [] if capture_trajectory else None
         prompt_cache = None
         if self.neutral_delta:
             from ..backends.hf_qwen import cache_restore, cache_snapshot
@@ -690,6 +696,8 @@ class LocalizedRecurrence:
                                     start_pos, grad=grad)
                         z = z + (adapted_proposal - base_proposal)
                         cache_restore(cache, prompt_cache)
+                        if trajectory is not None:
+                            trajectory.append(z)
                     else:
                         zz = z
                         if self.use_clock and mode != "off":
@@ -726,6 +734,8 @@ class LocalizedRecurrence:
                             dtype=torch.float32).to(z.dtype)
             n = n / (n.norm() + 1e-8) * (state.norm() + 1e-8)
             z = z_initial + n if self.neutral_delta else n
+        if trajectory is not None:
+            return z, pos, tuple(trajectory)
         return z, pos
 
     def logits_from_hidden(self, h_prenorm):
@@ -1188,6 +1198,97 @@ class LocalizedRecurrence:
             scores.append(token_logprobs.mean())
         return self.candidate_cross_entropy(scores, gold_index)
 
+    def candidate_ce_trace_loss_on_example(
+            self, input_ids, candidate_ids, gold_index, k_steps, *,
+            trace_targets, trace_lambda, detach_z0=False):
+        """Candidate CE plus fixed-schedule supervision of paired latent steps."""
+        from ..backends.hf_qwen import cache_restore, cache_snapshot
+
+        if not self.paired_delta:
+            raise ValueError("trace curriculum requires paired_delta mode")
+        if k_steps != 4:
+            raise ValueError("trace curriculum requires exactly K=4")
+        if isinstance(trace_lambda, bool) or not isinstance(
+                trace_lambda, (int, float)) or not math.isfinite(trace_lambda):
+            raise ValueError("trace_lambda must be a finite numeric weight")
+        trace_lambda = float(trace_lambda)
+        if trace_lambda not in (0.0, 0.3, 1.0):
+            raise ValueError("trace_lambda must follow the fixed {1.0, 0.3, 0.0} schedule")
+        if trace_lambda == 0.0 or not trace_targets:
+            # Deliberately delegate to the established path: at lambda=0 (or
+            # for an ineligible family) no trajectory is allocated or retained.
+            return self.candidate_ce_loss_on_example(
+                input_ids, candidate_ids, gold_index, k_steps,
+                detach_z0=detach_z0)
+        if not candidate_ids:
+            raise ValueError("candidate set must be non-empty")
+        if isinstance(gold_index, bool) or not isinstance(gold_index, int) \
+                or not 0 <= gold_index < len(candidate_ids):
+            raise ValueError("gold_index must identify one candidate")
+
+        gold_ids = torch.as_tensor(
+            candidate_ids[gold_index], device=input_ids.device,
+            dtype=torch.long).view(1, -1)
+        if gold_ids.shape[1] == 0:
+            raise ValueError("gold candidate token sequence must be non-empty")
+        gold_tokens = tuple(int(token) for token in gold_ids[0])
+        normalized_targets = []
+        previous_step = 0
+        for target in trace_targets:
+            if not isinstance(target, (tuple, list)) or len(target) != 2:
+                raise ValueError("trace targets must be (step_index, token_ids) pairs")
+            step_index, target_ids = target
+            if isinstance(step_index, bool) or not isinstance(step_index, int) \
+                    or not previous_step < step_index < k_steps:
+                raise ValueError(
+                    "trace step indices must be strictly increasing in [1, K-1]")
+            ids = torch.as_tensor(target_ids, device=input_ids.device,
+                                  dtype=torch.long).view(1, -1)
+            if ids.shape[1] == 0:
+                raise ValueError("trace target token sequences must be non-empty")
+            token_tuple = tuple(int(token) for token in ids[0])
+            if token_tuple == gold_tokens:
+                raise ValueError(
+                    "trace target tokenization equals the final/gold target")
+            normalized_targets.append((step_index, ids))
+            previous_step = step_index
+
+        cache, z0 = self._encode(input_ids, grad=True)
+        if detach_z0:
+            z0 = z0.detach()
+        prompt_cache = cache_snapshot(cache)
+        z, pos, trajectory = self.latent_steps(
+            z0, cache, input_ids.shape[1], k_steps, grad=True,
+            capture_trajectory=True)
+        if len(trajectory) != k_steps:
+            raise RuntimeError(
+                f"paired trajectory has {len(trajectory)} states for K={k_steps}")
+
+        recurrence_cache = cache_snapshot(cache)
+        latent_delta = z - z0
+        scores = []
+        for candidate in candidate_ids:
+            cache_restore(cache, recurrence_cache)
+            ids = torch.as_tensor(candidate, device=input_ids.device,
+                                  dtype=torch.long).view(1, -1)
+            if ids.shape[1] == 0:
+                raise ValueError("candidate token sequences must be non-empty")
+            token_logprobs, _counters = self._score_candidate_tokens(
+                z, cache, pos, ids, grad=True, latent_delta=latent_delta)
+            scores.append(token_logprobs.mean())
+        candidate_loss = self.candidate_cross_entropy(scores, gold_index)
+
+        trace_losses = []
+        for step_index, ids in normalized_targets:
+            cache_restore(cache, prompt_cache)
+            state = trajectory[step_index - 1]
+            token_logprobs, _counters = self._score_candidate_tokens(
+                state, cache, input_ids.shape[1], ids, grad=True,
+                latent_delta=state - z0)
+            trace_losses.append(-token_logprobs.mean())
+        trace_loss = torch.stack(trace_losses).mean()
+        return candidate_loss + trace_lambda * trace_loss
+
     def trainable_parameters(self):
         ps = lora_parameters(self.injected)
         if self.use_clock:
@@ -1328,9 +1429,20 @@ class LocalizedRecurrence:
         if not isinstance(claimed_paired, bool):
             drift.append("paired_delta is not a boolean")
             claimed_paired = None
+        claimed_trace = config.get("trace_curriculum", False)
+        if not isinstance(claimed_trace, bool):
+            drift.append("trace_curriculum is not a boolean")
+            claimed_trace = None
         architecture_core = recipe["mode"].removesuffix(
             RECURRENCE_ONLY_LORA_MODE_SUFFIX).removesuffix(
                 CANDIDATE_CE_MODE_SUFFIX)
+        trace_count = architecture_core.count(TRACE_CURRICULUM_MODE_SUFFIX)
+        mode_has_trace = trace_count == 1 and architecture_core.endswith(
+            TRACE_CURRICULUM_MODE_SUFFIX)
+        if trace_count > 1 or (trace_count == 1 and not mode_has_trace):
+            drift.append("mode carries a malformed trace-curriculum suffix")
+        architecture_core = architecture_core.removesuffix(
+            TRACE_CURRICULUM_MODE_SUFFIX if mode_has_trace else "")
         neutral_count = architecture_core.count(NEUTRAL_DELTA_MODE_SUFFIX)
         paired_count = architecture_core.count(PAIRED_DELTA_MODE_SUFFIX)
         mode_has_neutral_suffix = neutral_count == 1 and architecture_core.endswith(
@@ -1364,12 +1476,22 @@ class LocalizedRecurrence:
             drift.append(
                 f"paired_delta {claimed_paired} != runtime "
                 f"{getattr(self, 'paired_delta', False)}")
+        if claimed_trace is not None and claimed_trace != mode_has_trace:
+            drift.append(
+                f"mode {recipe['mode']!r} does not seal "
+                f"trace_curriculum={claimed_trace}")
         if claimed_neutral and not claimed_policy:
             drift.append("neutral_delta requires recurrence_only_lora=true")
         if claimed_paired and not claimed_neutral:
             drift.append("paired_delta requires neutral_delta=true")
         if claimed_paired and claimed_objective != "candidate_ce":
             drift.append("paired_delta requires training_objective=candidate_ce")
+        if claimed_trace and not claimed_paired:
+            drift.append("trace_curriculum requires paired_delta=true")
+        if claimed_trace and claimed_objective != "candidate_ce":
+            drift.append("trace_curriculum requires training_objective=candidate_ce")
+        if claimed_trace and config.get("k") != 4:
+            drift.append("trace_curriculum requires k=4")
         if claimed_neutral and self.interval != (
                 0, getattr(self, "n_layers", self.interval[1])):
             drift.append("neutral_delta requires the full decoder interval")

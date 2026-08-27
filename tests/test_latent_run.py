@@ -110,6 +110,14 @@ class _TrainingRec:
                            k_steps, detach_z0))
         return "candidate-loss"
 
+    def candidate_ce_trace_loss_on_example(
+            self, prompt_ids, candidate_ids, gold_index, k_steps, *,
+            trace_targets, trace_lambda, detach_z0):
+        self.calls.append((
+            "trace_curriculum", candidate_ids, gold_index, k_steps,
+            trace_targets, trace_lambda, detach_z0))
+        return "trace-loss"
+
     def loss_on_example(self, prompt_ids, answer_ids, k_steps, *, detach_z0):
         self.calls.append(("gold_nll", answer_ids, k_steps, detach_z0))
         return "gold-loss"
@@ -135,6 +143,74 @@ def test_training_objective_dispatch_derives_gold_and_preserves_gold_nll():
         training_objective="gold_nll", detach_z0=False)
     assert gold_loss == "gold-loss"
     assert rec.calls[-1] == ("gold_nll", data.answer_ids[0], 4, False)
+
+
+def test_training_objective_dispatches_fixed_trace_targets_and_lambda():
+    from latent_lab.bench.latent_run import _training_loss_on_example
+
+    ex = _ex(gold_pos=2)
+    trace_targets = ((1, "trace-1-ids"), (3, "trace-3-ids"))
+    data = SimpleNamespace(
+        examples=[ex], prompt_ids=[_Ids()], answer_ids=[_Ids()],
+        cand_ids=[["ids-c0", "ids-c1", "ids-c2", "ids-c3"]],
+        trace_target_ids=[trace_targets])
+    rec = _TrainingRec()
+
+    loss = _training_loss_on_example(
+        rec, data, 0, device="cpu", k_steps=4,
+        training_objective="candidate_ce", detach_z0=True,
+        trace_curriculum=True, trace_lambda=0.3)
+
+    assert loss == "trace-loss"
+    assert rec.calls == [(
+        "trace_curriculum", data.cand_ids[0], 2, 4,
+        trace_targets, 0.3, True)]
+
+
+def test_suite_tensors_cache_exact_answer_prefixed_safe_trace_targets():
+    torch = pytest.importorskip("torch")
+    from latent_lab.bench.latent_run import ANSWER_PREFIX, SuiteTensors
+    from latent_lab.bench.suite_v3 import build_suite, safe_trace_targets
+
+    suite = build_suite()
+    example = next(
+        ex for ex in suite.train
+        if len(safe_trace_targets(ex.prompt, ex.answer, 4)) >= 2)
+    expected = safe_trace_targets(example.prompt, example.answer, 4)
+
+    class RecordingTokenizer:
+        def __init__(self):
+            self.calls = []
+            self.ids = {}
+
+        def __call__(self, text, **kwargs):
+            self.calls.append((text, dict(kwargs)))
+            token_id = self.ids.setdefault(text, len(self.ids) + 1)
+            token_ids = [token_id, token_id + 1000]
+            if kwargs.get("return_tensors") == "pt":
+                token_ids = torch.tensor([token_ids], dtype=torch.long)
+            return SimpleNamespace(input_ids=token_ids)
+
+    tokenizer = RecordingTokenizer()
+    tensors = SuiteTensors(tokenizer, [example])
+
+    trace_call_offset = 2 + len(example.candidates)
+    trace_calls = tokenizer.calls[trace_call_offset:]
+    assert [text for text, _kwargs in trace_calls] == [
+        ANSWER_PREFIX + state for _step_index, state in expected]
+    assert all(kwargs == {
+        "add_special_tokens": False,
+        "return_tensors": "pt",
+        "return_dict": True,
+    } for _text, kwargs in trace_calls)
+    assert tuple(step for step, _ids in tensors.trace_target_ids[0]) == \
+        tuple(step for step, _state in expected)
+    for (_step, ids), (_expected_step, state) in zip(
+            tensors.trace_target_ids[0], expected, strict=True):
+        token_id = tokenizer.ids[ANSWER_PREFIX + state]
+        assert torch.equal(ids, torch.tensor(
+            [[token_id, token_id + 1000]], dtype=torch.long))
+    assert all(state != example.answer for _step, state in expected)
 
 
 def test_gold_at_nonzero_position_top_ranked_is_correct():

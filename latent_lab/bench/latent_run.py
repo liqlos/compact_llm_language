@@ -33,6 +33,7 @@ from latent_lab.backends.localized import (
     NEUTRAL_DELTA_MODE_SUFFIX,
     PAIRED_DELTA_MODE_SUFFIX,
     RECURRENCE_ONLY_LORA_MODE_SUFFIX,
+    TRACE_CURRICULUM_MODE_SUFFIX,
     TRAINING_OBJECTIVES,
     training_objective_from_config,
 )
@@ -44,6 +45,17 @@ EVAL_ABLATIONS = ("zero_state", "bypass_interval", "clocks_off",
                    "reverse_clocks", "truncate_half", "swap_state",
                    "noise_state", "readout_reset_to_z0",
                    "cache_reset_to_prompt", "full_state_reset_to_z0")
+
+
+def trace_curriculum_lambda(step: int) -> float:
+    """Fixed zero-based visible-trace fade schedule."""
+    if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+        raise ValueError("trace curriculum step must be a non-negative integer")
+    if step < 80:
+        return 1.0
+    if step < 140:
+        return 0.3
+    return 0.0
 
 
 def interval_from_spec(spec: str, n_layers: int) -> tuple[int, int]:
@@ -112,10 +124,13 @@ class SuiteTensors:
     """Tokenized suite with cached candidate token ids."""
 
     def __init__(self, tok, examples):
+        from latent_lab.bench.suite_v3 import safe_trace_targets
+
         self.examples = examples
         self.prompt_ids = []
         self.answer_ids = []
         self.cand_ids = []
+        self.trace_target_ids = []
         for ex in examples:
             p = tok(ex.prompt, return_tensors="pt", return_dict=True
                     ).input_ids
@@ -126,6 +141,23 @@ class SuiteTensors:
             cs = tuple(tok(ANSWER_PREFIX + c, add_special_tokens=False)
                        .input_ids for c in ex.candidates)
             self.cand_ids.append(cs)
+            trace_targets = safe_trace_targets(ex.prompt, ex.answer, 4)
+            encoded_trace = []
+            for step_index, state in trace_targets:
+                if not 1 <= step_index < 4 or state == ex.answer:
+                    raise ValueError(
+                        f"{ex.ex_id}: unsafe final/gold trace target at "
+                        f"step {step_index}")
+                target = tok(
+                    ANSWER_PREFIX + state, add_special_tokens=False,
+                    return_tensors="pt", return_dict=True).input_ids
+                if target.shape[1] == 0:
+                    raise ValueError(f"{ex.ex_id}: empty tokenized trace target")
+                if target.tolist() == a.tolist():
+                    raise ValueError(
+                        f"{ex.ex_id}: trace target tokenization equals gold")
+                encoded_trace.append((step_index, target))
+            self.trace_target_ids.append(tuple(encoded_trace))
 
     def __len__(self):
         return len(self.examples)
@@ -657,6 +689,40 @@ def _paired_delta_mode(mode: str, paired_delta: bool) -> str:
     return core + objective_suffix + recurrence_suffix
 
 
+def _trace_curriculum_mode(mode: str, trace_curriculum: bool) -> str:
+    """Seal the fixed curriculum after paired-delta, before objective/policy."""
+    if not isinstance(trace_curriculum, bool):
+        raise ValueError("trace_curriculum must be a boolean")
+    recurrence_count = mode.count(RECURRENCE_ONLY_LORA_MODE_SUFFIX)
+    if recurrence_count > 1 or (recurrence_count == 1 and not mode.endswith(
+            RECURRENCE_ONLY_LORA_MODE_SUFFIX)):
+        raise ValueError("mode carries a malformed recurrence-only suffix")
+    recurrence_suffix = (RECURRENCE_ONLY_LORA_MODE_SUFFIX
+                         if recurrence_count else "")
+    core = mode.removesuffix(recurrence_suffix)
+    objective_count = core.count(CANDIDATE_CE_MODE_SUFFIX)
+    if objective_count > 1 or (objective_count == 1 and not core.endswith(
+            CANDIDATE_CE_MODE_SUFFIX)):
+        raise ValueError("mode carries a malformed candidate-CE suffix")
+    objective_suffix = CANDIDATE_CE_MODE_SUFFIX if objective_count else ""
+    core = core.removesuffix(objective_suffix)
+    count = core.count(TRACE_CURRICULUM_MODE_SUFFIX)
+    sealed = count == 1 and core.endswith(TRACE_CURRICULUM_MODE_SUFFIX)
+    if count > 1 or (count == 1 and not sealed):
+        raise ValueError("mode carries a malformed trace-curriculum suffix")
+    if trace_curriculum:
+        base = core.removesuffix(TRACE_CURRICULUM_MODE_SUFFIX)
+        if base != "D-full+paired-delta":
+            raise ValueError("trace_curriculum requires paired_delta mode")
+        if not count:
+            core += TRACE_CURRICULUM_MODE_SUFFIX
+        return core + objective_suffix + recurrence_suffix
+    if count:
+        raise ValueError(
+            "mode claims trace_curriculum but trace_curriculum is false")
+    return core + objective_suffix + recurrence_suffix
+
+
 def _recurrence_only_lora_from_config(cfg: dict) -> bool:
     """Recover and cross-check the policy sealed into the recipe's mode."""
     value = cfg.get("recurrence_only_lora", False)
@@ -708,6 +774,13 @@ def _neutral_delta_from_config(cfg: dict) -> bool:
         raise ValueError(
             "config.mode carries malformed neutral-delta suffix ordering")
     core = core.removesuffix(CANDIDATE_CE_MODE_SUFFIX)
+    trace_count = core.count(TRACE_CURRICULUM_MODE_SUFFIX)
+    trace_sealed = trace_count == 1 and core.endswith(
+        TRACE_CURRICULUM_MODE_SUFFIX)
+    if trace_count > 1 or (trace_count == 1 and not trace_sealed):
+        raise ValueError("config.mode carries a malformed trace-curriculum suffix")
+    core = core.removesuffix(
+        TRACE_CURRICULUM_MODE_SUFFIX if trace_sealed else "")
     count = core.count(NEUTRAL_DELTA_MODE_SUFFIX)
     paired_count = core.count(PAIRED_DELTA_MODE_SUFFIX)
     gated_sealed = count == 1 and core.endswith(NEUTRAL_DELTA_MODE_SUFFIX)
@@ -756,6 +829,13 @@ def _paired_delta_from_config(cfg: dict) -> bool:
         raise ValueError(
             "config.mode carries malformed paired-delta suffix ordering")
     core = core.removesuffix(CANDIDATE_CE_MODE_SUFFIX)
+    trace_count = core.count(TRACE_CURRICULUM_MODE_SUFFIX)
+    trace_sealed = trace_count == 1 and core.endswith(
+        TRACE_CURRICULUM_MODE_SUFFIX)
+    if trace_count > 1 or (trace_count == 1 and not trace_sealed):
+        raise ValueError("config.mode carries a malformed trace-curriculum suffix")
+    core = core.removesuffix(
+        TRACE_CURRICULUM_MODE_SUFFIX if trace_sealed else "")
     count = core.count(PAIRED_DELTA_MODE_SUFFIX)
     sealed = count == 1 and core.endswith(PAIRED_DELTA_MODE_SUFFIX)
     if count > 1 or (count == 1 and not sealed):
@@ -803,6 +883,47 @@ def _paired_delta_from_config(cfg: dict) -> bool:
     return True
 
 
+def _trace_curriculum_from_config(cfg: dict) -> bool:
+    """Recover the fixed trace schedule and reject unsealed training drift."""
+    value = cfg.get("trace_curriculum", False)
+    if not isinstance(value, bool):
+        raise ValueError("config.trace_curriculum must be a boolean")
+    mode = cfg.get("mode")
+    if not isinstance(mode, str):
+        raise ValueError("config.mode must be a string")
+    core = mode.removesuffix(RECURRENCE_ONLY_LORA_MODE_SUFFIX)
+    if CANDIDATE_CE_MODE_SUFFIX in core \
+            and not core.endswith(CANDIDATE_CE_MODE_SUFFIX):
+        raise ValueError(
+            "config.mode carries malformed trace-curriculum suffix ordering")
+    core = core.removesuffix(CANDIDATE_CE_MODE_SUFFIX)
+    count = core.count(TRACE_CURRICULUM_MODE_SUFFIX)
+    sealed = count == 1 and core.endswith(TRACE_CURRICULUM_MODE_SUFFIX)
+    if count > 1 or (count == 1 and not sealed):
+        raise ValueError("config.mode carries a malformed trace-curriculum suffix")
+    if value != sealed:
+        raise ValueError(
+            "config mode and trace_curriculum disagree; refusing an unsealed "
+            "visible-to-latent curriculum")
+    if not value:
+        return False
+    if cfg.get("paired_delta") is not True:
+        raise ValueError("trace_curriculum requires paired_delta=true")
+    if cfg.get("neutral_delta") is not True \
+            or cfg.get("recurrence_only_lora") is not True:
+        raise ValueError(
+            "trace_curriculum requires neutral recurrence-only readout")
+    if training_objective_from_config(cfg) != "candidate_ce":
+        raise ValueError(
+            "trace_curriculum requires training_objective=candidate_ce")
+    if cfg.get("k") != 4:
+        raise ValueError("trace_curriculum requires k=4")
+    if core.removesuffix(TRACE_CURRICULUM_MODE_SUFFIX) != \
+            "D-full+paired-delta":
+        raise ValueError("trace_curriculum requires D-full paired_delta mode")
+    return True
+
+
 def _recurrence_config(cfg: dict) -> dict:
     """Measured recurrence settings; unsupported flags cannot enter v3."""
     if cfg.get("grad_checkpoint") not in (None, False):
@@ -811,6 +932,7 @@ def _recurrence_config(cfg: dict) -> dict:
     recurrence_only_lora = _recurrence_only_lora_from_config(cfg)
     neutral_delta = _neutral_delta_from_config(cfg)
     paired_delta = _paired_delta_from_config(cfg)
+    trace_curriculum = _trace_curriculum_from_config(cfg)
     recurrence = {
         "mode": cfg["mode"],
         "interval": list(cfg["interval"]),
@@ -826,6 +948,8 @@ def _recurrence_config(cfg: dict) -> dict:
     }
     if paired_delta:
         recurrence["paired_delta"] = True
+    if trace_curriculum:
+        recurrence["trace_curriculum"] = True
     return recurrence
 
 
@@ -925,7 +1049,8 @@ def mode_from_spec(interval_spec: str, k: int,
                    recurrence_only_lora: bool = False,
                    training_objective: str = "gold_nll",
                    neutral_delta: bool = False,
-                   paired_delta: bool = False) -> str:
+                   paired_delta: bool = False,
+                   trace_curriculum: bool = False) -> str:
     """The preregistered mode implied by the interval spec and K."""
     base = ("D-full" if interval_spec == "full"
             else "F-control" if k == 0 else "E-localized")
@@ -934,12 +1059,17 @@ def mode_from_spec(interval_spec: str, k: int,
             raise ValueError("paired_delta requires training_objective=candidate_ce")
         neutral_delta = True
         recurrence_only_lora = True
+    if trace_curriculum and (not paired_delta or k != 4
+                             or training_objective != "candidate_ce"):
+        raise ValueError(
+            "trace_curriculum requires paired_delta, K=4, and candidate_ce")
     if neutral_delta and (interval_spec != "full" or
                           not recurrence_only_lora):
         raise ValueError(
             "neutral_delta requires interval='full' and recurrence-only LoRA")
     base = (_paired_delta_mode(base, True) if paired_delta
             else _neutral_delta_mode(base, neutral_delta))
+    base = _trace_curriculum_mode(base, trace_curriculum)
     objective_mode = _training_objective_mode(base, training_objective)
     return _adapter_policy_mode(objective_mode, recurrence_only_lora)
 
@@ -951,7 +1081,8 @@ def train_recipe_digest(*, mode, interval, k, max_k, lora_r, lora_alpha,
                          recurrence_only_lora=False,
                          training_objective="gold_nll",
                          neutral_delta=False,
-                         paired_delta=False) -> str:
+                         paired_delta=False,
+                         trace_curriculum=False) -> str:
     """ONE canonical digest binding EVERY behavior-changing field.
 
     The single source of truth shared by the trainer and the paid
@@ -966,11 +1097,17 @@ def train_recipe_digest(*, mode, interval, k, max_k, lora_r, lora_alpha,
             raise ValueError("paired_delta requires training_objective=candidate_ce")
         neutral_delta = True
         recurrence_only_lora = True
+    if trace_curriculum and (not paired_delta or k != 4
+                             or training_objective != "candidate_ce"):
+        raise ValueError(
+            "trace_curriculum requires paired_delta, K=4, and candidate_ce")
     if neutral_delta and not recurrence_only_lora:
         raise ValueError("neutral_delta requires recurrence_only_lora=true")
     architecture_mode = (
         _paired_delta_mode(mode, True) if paired_delta
         else _neutral_delta_mode(mode, neutral_delta))
+    architecture_mode = _trace_curriculum_mode(
+        architecture_mode, trace_curriculum)
     cfg = {
         "mode": _adapter_policy_mode(
             _training_objective_mode(
@@ -990,19 +1127,27 @@ def train_recipe_digest(*, mode, interval, k, max_k, lora_r, lora_alpha,
 
 def _training_loss_on_example(rec, train, index: int, *, device: str,
                               k_steps: int, training_objective: str,
-                              detach_z0: bool):
+                              detach_z0: bool, trace_curriculum: bool = False,
+                              trace_lambda: float = 0.0):
     """Dispatch one example without trusting any supplied gold index."""
     prompt_ids = train.prompt_ids[index].to(device)
     if training_objective == "candidate_ce":
         ex = train.examples[index]
         gold_index = derive_gold_index(
             ex.candidates, ex.answer, ex_id=ex.ex_id)
+        if trace_curriculum:
+            return rec.candidate_ce_trace_loss_on_example(
+                prompt_ids, train.cand_ids[index], gold_index, k_steps,
+                trace_targets=train.trace_target_ids[index],
+                trace_lambda=trace_lambda, detach_z0=detach_z0)
         return rec.candidate_ce_loss_on_example(
             prompt_ids, train.cand_ids[index], gold_index, k_steps,
             detach_z0=detach_z0)
     if training_objective != "gold_nll":
         raise ValueError(
             f"training_objective must be one of {TRAINING_OBJECTIVES}")
+    if trace_curriculum:
+        raise ValueError("trace curriculum requires candidate_ce")
     return rec.loss_on_example(
         prompt_ids, train.answer_ids[index].to(device), k_steps,
         detach_z0=detach_z0)
@@ -1118,6 +1263,9 @@ def _train_inner(args, out: Path, device: str, revision: str):
     paired_delta = getattr(args, "paired_delta", False)
     if not isinstance(paired_delta, bool):
         raise ValueError("--paired-delta must be a boolean flag")
+    trace_curriculum = getattr(args, "trace_curriculum", False)
+    if not isinstance(trace_curriculum, bool):
+        raise ValueError("--trace-curriculum must be a boolean flag")
     neutral_delta = requested_neutral_delta or paired_delta
     if neutral_delta and args.interval != "full":
         raise ValueError("--neutral-delta/--paired-delta requires --interval full")
@@ -1128,6 +1276,11 @@ def _train_inner(args, out: Path, device: str, revision: str):
     _training_objective_mode("D-full", training_objective)
     if paired_delta and training_objective != "candidate_ce":
         raise ValueError("--paired-delta requires --training-objective candidate_ce")
+    if trace_curriculum and (not paired_delta or args.k != 4
+                             or training_objective != "candidate_ce"):
+        raise ValueError(
+            "--trace-curriculum requires --paired-delta, --k 4, and "
+            "--training-objective candidate_ce")
     if recurrence_only_lora and args.k == 0:
         raise ValueError(
             "--recurrence-only-lora requires --k > 0 for training; "
@@ -1155,7 +1308,7 @@ def _train_inner(args, out: Path, device: str, revision: str):
     mode = mode_from_spec(
         args.interval, args.k, recurrence_only_lora=recurrence_only_lora,
         training_objective=training_objective, neutral_delta=neutral_delta,
-        paired_delta=paired_delta)
+        paired_delta=paired_delta, trace_curriculum=trace_curriculum)
     cfg = {
         "mode": mode,
         "model": args.model, "revision": revision,
@@ -1170,6 +1323,7 @@ def _train_inner(args, out: Path, device: str, revision: str):
         "recurrence_only_lora": recurrence_only_lora,
         "neutral_delta": neutral_delta,
         "paired_delta": paired_delta,
+        "trace_curriculum": trace_curriculum,
         "runtime_contract": rec.runtime_contract(),
         "device": device,
         "label": getattr(args, "label", None),
@@ -1215,7 +1369,10 @@ def _train_inner(args, out: Path, device: str, revision: str):
         loss = _training_loss_on_example(
             rec, train, i, device=device, k_steps=args.k,
             training_objective=training_objective,
-            detach_z0=args.detach_z0)
+            detach_z0=args.detach_z0,
+            trace_curriculum=trace_curriculum,
+            trace_lambda=(trace_curriculum_lambda(step)
+                          if trace_curriculum else 0.0))
         opt.zero_grad()
         loss.backward()
         # fail-stop: any fault here raises FatalRunInvalidError and kills
@@ -1425,6 +1582,7 @@ def cmd_eval(args):
     recurrence_only_lora = _recurrence_only_lora_from_config(cfg)
     neutral_delta = _neutral_delta_from_config(cfg)
     paired_delta = _paired_delta_from_config(cfg)
+    _trace_curriculum_from_config(cfg)
     model_id = cfg.get("model")
     if not isinstance(model_id, str) or not model_id:
         raise ValueError(
@@ -1624,6 +1782,10 @@ def main():
         "--paired-delta", action="store_true",
         help="full-decoder adapted-minus-base residual recurrence; implies "
              "neutral delta readout, recurrence-only LoRA, and candidate CE")
+    tr.add_argument(
+        "--trace-curriculum", action="store_true",
+        help="fixed visible-to-latent trace fade (1.0 through step 79, 0.3 "
+             "through 139, then 0); requires paired delta at K=4")
     tr.add_argument("--label", default=None,
                     help="preregistered run label (bound into evidence; "
                     "never derived from output path)")

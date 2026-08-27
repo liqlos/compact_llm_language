@@ -548,6 +548,146 @@ def test_paired_delta_rejects_non_full_or_shared_adapter_modes():
             max_k=2, paired_delta=True)
 
 
+def test_paired_trace_lambda_zero_is_exact_ce_path_without_trajectory(
+        monkeypatch):
+    _model, rec2 = build_paired_delta()
+    ids = torch.randint(0, 250, (1, 7))
+    candidates = ([10, 11], [12, 13], [14, 15])
+    direct = rec2.candidate_ce_loss_on_example(
+        ids, candidates, gold_index=1, k_steps=4)
+
+    original = rec2.latent_steps
+    trajectory_requests = []
+
+    def capture(*args, **kwargs):
+        trajectory_requests.append(kwargs.get("capture_trajectory", False))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(rec2, "latent_steps", capture)
+    faded = rec2.candidate_ce_trace_loss_on_example(
+        ids, candidates, gold_index=1, k_steps=4,
+        trace_targets=((1, [20, 21]), (3, [22])), trace_lambda=0.0)
+
+    assert torch.equal(faded, direct)
+    assert trajectory_requests == [False]
+
+
+def test_paired_trace_alignment_cache_restore_and_loss_decomposition(
+        monkeypatch):
+    _model, rec2 = build_paired_delta()
+    ids = torch.randint(0, 250, (1, 7))
+    candidates = ([10, 11], [12, 13, 14])
+    trace_targets = ((1, [20, 21]), (3, [22]))
+    generator = torch.Generator().manual_seed(184)
+    with torch.no_grad():
+        rec2.clock.weight.normal_(mean=0.0, std=0.01, generator=generator)
+        for adapter in rec2.injected:
+            adapter.lora_B.copy_(torch.randn(
+                adapter.lora_B.shape, generator=generator) * 0.01)
+
+        expected_cache, expected_z0 = rec2._encode(ids)
+        _z, _pos, expected_trajectory = rec2.latent_steps(
+            expected_z0, expected_cache, ids.shape[1], 4,
+            capture_trajectory=True)
+        expected_states = tuple(state.detach().clone()
+                                for state in expected_trajectory)
+        expected_z0 = expected_z0.detach().clone()
+    assert any(not torch.equal(expected_states[0], state)
+               for state in expected_states[1:])
+
+    from latent_lab.backends import hf_qwen
+
+    original_restore = hf_qwen.cache_restore
+    restore_snapshots = []
+
+    def capture_restore(cache, snapshot):
+        restore_snapshots.append(id(snapshot))
+        return original_restore(cache, snapshot)
+
+    monkeypatch.setattr(hf_qwen, "cache_restore", capture_restore)
+    original_score = rec2._score_candidate_tokens
+    scored = []
+
+    def capture_score(state, cache, pos, candidate_ids, *, grad=False,
+                      latent_delta=None):
+        result = original_score(
+            state, cache, pos, candidate_ids, grad=grad,
+            latent_delta=latent_delta)
+        scored.append((
+            state.detach().clone(), pos,
+            latent_delta.detach().clone(), result[0]))
+        return result
+
+    monkeypatch.setattr(rec2, "_score_candidate_tokens", capture_score)
+    loss = rec2.candidate_ce_trace_loss_on_example(
+        ids, candidates, gold_index=1, k_steps=4,
+        trace_targets=trace_targets, trace_lambda=0.3)
+
+    candidate_count = len(candidates)
+    assert len(scored) == candidate_count + len(trace_targets)
+    for offset, (step_index, _target_ids) in enumerate(trace_targets):
+        state, pos, delta, _token_logprobs = scored[candidate_count + offset]
+        assert pos == ids.shape[1]
+        assert torch.equal(state, expected_states[step_index - 1])
+        assert torch.equal(delta, expected_states[step_index - 1] - expected_z0)
+
+    # Four logical paired steps restore the same prompt snapshot three times
+    # each plus the loop's fail-safe final restore. Candidate scoring uses its
+    # own snapshot; every trace target restores the original prompt snapshot.
+    recurrence_restores = 3 * 4 + 1
+    assert len(restore_snapshots) == \
+        recurrence_restores + candidate_count + len(trace_targets)
+    prompt_snapshot = restore_snapshots[0]
+    assert restore_snapshots[:recurrence_restores] == \
+        [prompt_snapshot] * recurrence_restores
+    candidate_snapshot = restore_snapshots[recurrence_restores]
+    assert candidate_snapshot != prompt_snapshot
+    assert restore_snapshots[
+        recurrence_restores:recurrence_restores + candidate_count] == \
+        [candidate_snapshot] * candidate_count
+    trace_prompt_snapshot = restore_snapshots[-1]
+    assert trace_prompt_snapshot != candidate_snapshot
+    assert restore_snapshots[-len(trace_targets):] == \
+        [trace_prompt_snapshot] * len(trace_targets)
+
+    candidate_loss = rec2.candidate_cross_entropy(
+        [row[3].mean() for row in scored[:candidate_count]], gold_index=1)
+    trace_loss = torch.stack(
+        [-row[3].mean() for row in scored[candidate_count:]]).mean()
+    assert torch.equal(loss, candidate_loss + 0.3 * trace_loss)
+
+
+def test_paired_trace_loss_alone_reaches_b_and_clock_gradients():
+    _model, rec2 = build_paired_delta()
+    ids = torch.randint(0, 250, (1, 7))
+    # A one-candidate CE is identically zero, so this backward signal comes
+    # only from the visible trace target.
+    loss = rec2.candidate_ce_trace_loss_on_example(
+        ids, ([10, 11],), gold_index=0, k_steps=4,
+        trace_targets=((1, [12, 13]),), trace_lambda=1.0)
+    assert loss.requires_grad and torch.isfinite(loss) and loss.item() > 0
+    loss.backward()
+
+    assert any(adapter.lora_B.grad is not None
+               and torch.count_nonzero(adapter.lora_B.grad).item() > 0
+               for adapter in rec2.injected)
+    assert rec2.clock.weight.grad is not None
+    assert torch.count_nonzero(rec2.clock.weight.grad).item() > 0
+    assert all(adapter.lora_A.grad is None
+               or torch.count_nonzero(adapter.lora_A.grad).item() == 0
+               for adapter in rec2.injected)
+
+
+def test_paired_trace_rejects_final_gold_supervision():
+    _model, rec2 = build_paired_delta()
+    ids = torch.randint(0, 250, (1, 7))
+    candidates = ([10, 11], [12, 13])
+    with pytest.raises(ValueError, match="final/gold"):
+        rec2.candidate_ce_trace_loss_on_example(
+            ids, candidates, gold_index=0, k_steps=4,
+            trace_targets=((1, [10, 11]),), trace_lambda=1.0)
+
+
 def test_clock_changes_state_after_perturbation(rec):
     with torch.no_grad():
         rec.clock.weight.fill_(0.01)

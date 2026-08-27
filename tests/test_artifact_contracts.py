@@ -455,7 +455,7 @@ def test_report_manifest_and_bundle_bind_one_canonical_recipe(tmp_path):
 
 def test_run_validator_recognizes_sealed_adapter_activation_metadata():
     assert {"training_objective", "recurrence_only_lora", "runtime_contract",
-            "neutral_delta", "paired_delta"} <= \
+            "neutral_delta", "paired_delta", "trace_curriculum"} <= \
         artifacts._TRAIN_CONFIG_KNOWN_KEYS
 
 
@@ -474,6 +474,24 @@ def test_run_validator_rejects_unsealed_paired_delta(tmp_path):
     atomic_write_json(manifest_path, manifest)
 
     with pytest.raises(ValueError, match="invalid paired-delta metadata"):
+        artifacts.validate_run(tmp_path)
+
+
+def test_run_validator_rejects_unsealed_trace_curriculum(tmp_path):
+    from latent_lab.train.checkpointing import (
+        RUN_MANIFEST_FILE, TRAIN_REPORT_FILE, atomic_write_json, sha256_file)
+
+    build_verified_run(tmp_path)
+    report_path = tmp_path / TRAIN_REPORT_FILE
+    report = json.loads(report_path.read_text())
+    report["config"]["trace_curriculum"] = True
+    atomic_write_json(report_path, report)
+    manifest_path = tmp_path / RUN_MANIFEST_FILE
+    manifest = json.loads(manifest_path.read_text())
+    manifest["report_sha256"] = sha256_file(report_path)
+    atomic_write_json(manifest_path, manifest)
+
+    with pytest.raises(ValueError, match="invalid trace-curriculum metadata"):
         artifacts.validate_run(tmp_path)
 
 
