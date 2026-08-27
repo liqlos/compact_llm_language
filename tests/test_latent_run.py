@@ -5,12 +5,61 @@ rank_of_gold read off the returned order — never assuming candidate zero is
 gold. Tests place gold at a nonzero candidate position.
 """
 
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from latent_lab.bench.latent_run import evaluate
 from latent_lab.bench.suite import Example
+
+
+def test_localized_data_contracts_import_without_torch():
+    """Core users may import evidence records without installing lab deps."""
+    script = r'''
+import builtins
+
+real_import = builtins.__import__
+
+def without_torch(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "torch" or name.startswith("torch."):
+        raise ImportError("torch intentionally unavailable")
+    return real_import(name, globals, locals, fromlist, level)
+
+builtins.__import__ = without_torch
+
+from latent_lab.backends.localized import (
+    CandidateScoreDetail,
+    LocalizedRecurrence,
+    make_step_clock,
+    parse_clock_mode,
+)
+
+detail = CandidateScoreDetail((7,), (-0.25,), -0.25, -0.25)
+assert detail.token_count == 1
+assert parse_clock_mode("reverse", 3) == [2, 1, 0]
+
+for operation, call in (
+    ("LocalizedRecurrence", lambda: LocalizedRecurrence(None, interval=(0, 1))),
+    ("make_step_clock", lambda: make_step_clock(4, 2)),
+):
+    try:
+        call()
+    except RuntimeError as exc:
+        assert f"torch required for {operation}" in str(exc)
+    else:
+        raise AssertionError(f"{operation} executed without torch")
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 class _Ids:

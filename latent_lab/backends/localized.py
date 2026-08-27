@@ -30,6 +30,22 @@ except ImportError:  # pragma: no cover - import-safety without lab group
     torch = None
 
 
+def _require_torch(operation: str):
+    """Fail clearly when a tensor runtime is used without the lab extra."""
+    if torch is None:
+        raise RuntimeError(
+            f"torch required for {operation}; install the 'lab' dependency group"
+        )
+    return torch
+
+
+def _torch_no_grad(function):
+    """Apply ``torch.no_grad`` without making torch an import dependency."""
+    if torch is None:
+        return function
+    return torch.no_grad()(function)
+
+
 class LatentLoopViolation(RuntimeError):
     """Forbidden vocabulary/tokenizer operation inside the latent loop."""
 
@@ -151,6 +167,7 @@ class LoRALinear(_Base):
     """y = W x + (alpha/r) * B A x ; W stays frozen."""
 
     def __init__(self, base, r: int, alpha: float):
+        _require_torch("LoRALinear")
         super().__init__()
         self.base = base
         for p in self.base.parameters():
@@ -175,6 +192,7 @@ class LoRALinear(_Base):
 
 def inject_lora(layers, *, r: int = 8, alpha: float = 16.0,
                 suffixes=LORA_TARGET_SUFFIXES) -> list:
+    _require_torch("inject_lora")
     targets = []
     for layer in layers:
         for name, module in layer.named_modules():
@@ -203,6 +221,7 @@ def lora_parameters(injected) -> list:
 
 def make_step_clock(hidden: int, max_k: int, device=None):
     """Zero-initialized per-step clock embeddings; always fp32."""
+    _require_torch("make_step_clock")
     clock = torch.nn.Embedding(max_k + 1, hidden, device=device,
                                dtype=torch.float32)
     torch.nn.init.zeros_(clock.weight)
@@ -316,8 +335,7 @@ class LocalizedRecurrence:
 
     def __init__(self, model, tokenizer=None, *, interval, max_k=16,
                  lora_r=8, lora_alpha=16.0, use_clock=True):
-        if torch is None:
-            raise RuntimeError("torch required for LocalizedRecurrence")
+        _require_torch("LocalizedRecurrence")
         self.model = model
         # frozen-backbone contract: nothing except LoRA/clock may train
         for p in model.parameters():
@@ -545,7 +563,7 @@ class LocalizedRecurrence:
             ),
         }
 
-    @torch.no_grad()
+    @_torch_no_grad
     def score_candidates(self, input_ids, candidate_ids, k_steps, *,
                          ablate=None, partner_input_ids=None):
         """Return raw per-token candidate evidence and measured compute."""
@@ -673,7 +691,7 @@ class LocalizedRecurrence:
         )
         return details, rep
 
-    @torch.no_grad()
+    @_torch_no_grad
     def rank_candidates(self, input_ids, candidate_ids, k_steps, *,
                         ablate=None, partner_input_ids=None):
         """Length-normalized primary ranking over raw scoring evidence.
