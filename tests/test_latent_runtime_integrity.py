@@ -994,6 +994,9 @@ def test_paired_k0_vs_kpositive_same_adapter_seed_suite():
     assert scores_k0 != scores_k1, \
         "K has no causal effect on this adapter — claim unfalsifiable"
     assert all(isinstance(s, float) for s in scores_k0 + scores_k1)
+    _order, _scores, k0_report = rec.rank_candidates(_IDS, _CANDS, 0)
+    assert k0_report.extra["recurrence_cache_at_readout"] == \
+        "target_prompt_only"
 
 
 @pytest.mark.filterwarnings("ignore")

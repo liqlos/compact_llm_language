@@ -33,7 +33,8 @@ DEFAULT_REVISION = "15852e8c16360a2fea060d615a32b45270f8a8fc"
 
 EVAL_ABLATIONS = ("zero_state", "bypass_interval", "clocks_off",
                    "reverse_clocks", "truncate_half", "swap_state",
-                   "noise_state", "readout_reset_to_z0")
+                   "noise_state", "readout_reset_to_z0",
+                   "cache_reset_to_prompt", "full_state_reset_to_z0")
 
 
 def interval_from_spec(spec: str, n_layers: int) -> tuple[int, int]:
@@ -1022,6 +1023,10 @@ def normalize_ablation(name, k_steps=None):
         return {"truncate_k": max(0, k_steps // 2)}
     if name == "readout_reset_to_z0":
         return {"reset_state": True}
+    if name == "cache_reset_to_prompt":
+        return {"reset_cache": True}
+    if name == "full_state_reset_to_z0":
+        return {"reset_state": True, "reset_cache": True}
     if name in ("zero_state", "bypass_interval", "swap_state", "noise_state"):
         return {name: True}
     raise ValueError(

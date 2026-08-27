@@ -714,6 +714,24 @@ def test_validate_eval_rejects_relabelled_v3_ablation(tmp_path):
         artifacts.validate_eval(ep)
 
 
+def test_validate_eval_binds_ablation_label_to_sealed_runtime_spec(tmp_path):
+    _, clean_record, _ = _current_v3_eval_payload()
+    noise_compute = {
+        **clean_record["compute"], "eval_ablation": {"noise_state": True},
+    }
+    payload, _, _ = _current_v3_eval_payload(compute=noise_compute)
+    result = payload["results"].pop("clean")
+    payload["identity"]["ablation"] = "zero_state"
+    result["ablate"] = {"noise_state": True}
+    result["tag"] = "E-localized|test_id|zero_state|K=4"
+    payload["results"]["zero_state"] = result
+    ep = tmp_path / "wrong-ablation-label.json"
+    ckpt.atomic_write_json(ep, payload)
+
+    with pytest.raises(ValueError, match="requires.*zero_state"):
+        artifacts.validate_eval(ep)
+
+
 def test_validate_eval_rejects_schema_valid_fabricated_current_suite_record(
         tmp_path):
     _, _, example = _current_v3_eval_payload()
@@ -1393,6 +1411,10 @@ def test_validate_eval_rejects_unknown_ablation_like_cli(tmp_path):
     ("reverse_clocks", 4, {"clocks": "reverse"}),
     ("shuffle_clocks:2,0,1", 3, {"clocks": "shuffle_perm:2,0,1"}),
     ("truncate_half", 5, {"truncate_k": 2}),
+    ("readout_reset_to_z0", 4, {"reset_state": True}),
+    ("cache_reset_to_prompt", 4, {"reset_cache": True}),
+    ("full_state_reset_to_z0", 4,
+     {"reset_state": True, "reset_cache": True}),
 ])
 def test_shared_normalizer_whitelist_used_by_cli_and_validator(name, k, spec):
     assert latent_run.normalize_ablation(name, k) == spec

@@ -781,7 +781,9 @@ class LocalizedRecurrence:
                     "post_recurrence_pre_readout"
                     if ab.get("reset_cache") else None),
                 "recurrence_cache_at_readout": (
-                    "target_prompt_only" if ab.get("reset_cache") else
+                    "target_prompt_only"
+                    if (ab.get("reset_cache") or effective_k == 0
+                        or ab.get("bypass_interval")) else
                     "prompt_plus_target_recurrence"),
                 "recurrence_start_position": loop_start,
                 "readout_position": pos,

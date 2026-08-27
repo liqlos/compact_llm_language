@@ -538,15 +538,19 @@ def _reconcile_selected_result(where: str, d: dict, ident: dict) -> None:
             f"{where}: contradictory identity — result k_steps {res_k!r} "
             f"!= canonical {k_steps!r}")
     ablate = res.get("ablate")
-    if ident["ablation"] == "clean":
-        if ablate not in (None, {}):
-            raise ValueError(
-                f"{where}: contradictory identity — clean eval carries "
-                f"ablate {ablate!r}")
-    elif not isinstance(ablate, dict) or not ablate:
+    from latent_lab.bench.latent_run import normalize_ablation
+    expected_ablate = normalize_ablation(
+        ident["ablation"], k_steps) or {}
+    if ablate is not None and not isinstance(ablate, dict):
         raise ValueError(
-            f"{where}: contradictory identity — ablation "
-            f"{ident['ablation']!r} carries no ablate spec")
+            f"{where}: contradictory identity — ablate spec is not an "
+            f"object: {ablate!r}")
+    actual_ablate = ablate or {}
+    if actual_ablate != expected_ablate:
+        raise ValueError(
+            f"{where}: contradictory identity — ablation label "
+            f"{ident['ablation']!r} requires {expected_ablate!r}, got "
+            f"{ablate!r}")
     tag = res.get("tag")
     if not isinstance(tag, str) or tag.count("|") != 3:
         raise ValueError(
