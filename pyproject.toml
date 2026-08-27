@@ -27,8 +27,16 @@ mlx = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["rcc", "latent_lab", "evals"]
+packages = ["rcc", "latent_lab", "evals", "bench"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+"core: dependency-light deterministic repository and package contract tests",
+"lab_unit: local torch-based lab tests with no model download",
+"transformer_integration: tiny/config-built transformer runtime integration tests",
+"remote_policy: offline remote/provider policy tests with no provider calls",
+"expensive_local_model: tests that may load sizeable local model assets (opt-in)",
+    "remote_paid: tests that may contact remote or paid infrastructure (double opt-in)",
+]

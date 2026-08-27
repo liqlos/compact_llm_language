@@ -1,0 +1,113 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: "0.11.28"
+
+jobs:
+  core:
+    name: core-py${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install "uv==${UV_VERSION}"
+      - run: uv sync --frozen --group dev --no-group lab --no-group mlx
+      - name: Compile every shipped package
+        run: uv run --no-sync python -m compileall -q rcc latent_lab evals bench
+      - name: Dependency-light default pytest contract
+        run: uv run --no-sync python -m pytest
+
+  lab:
+    name: pinned-lab-py3.12
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install "uv==${UV_VERSION}"
+      - run: uv sync --frozen --group dev --group lab --no-group mlx
+      - name: Lab, tiny-transformer, and offline remote-policy tiers
+        run: >-
+          uv run --no-sync python -m pytest
+          -m "lab_unit or transformer_integration or remote_policy"
+          --run-lab-unit --run-transformer-integration --run-remote-policy
+
+  evidence-contracts:
+    name: benchmark-scorer-no-spend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install "uv==${UV_VERSION}"
+      - run: uv sync --frozen --group dev --no-group lab --no-group mlx
+      - name: Canonical eval-v3 scorer
+        run: uv run --no-sync python -m pytest tests/test_eval_v3.py
+      - name: Deterministic behavioral-v3 generation and checked-in identity
+        run: |
+          uv run --no-sync python -m latent_lab.bench.suite_v3 --manifest /tmp/v3-a.json --validation /tmp/v3-a-validation.json
+          uv run --no-sync python -m latent_lab.bench.suite_v3 --manifest /tmp/v3-b.json --validation /tmp/v3-b-validation.json
+          cmp /tmp/v3-a.json /tmp/v3-b.json
+          cmp /tmp/v3-a-validation.json /tmp/v3-b-validation.json
+          cmp /tmp/v3-a.json artifacts/behavioral_v3_manifest.json
+          cmp /tmp/v3-a-validation.json artifacts/behavioral_v3_validation.json
+      - name: No-spend dry gate must fail closed on empty evidence
+        run: |
+          mkdir -p /tmp/rcc-empty-2b /tmp/rcc-empty-4b
+          set +e
+          uv run --no-sync python -m latent_lab.bench.no_spend_gate \
+            --dry-run --no-telemetry \
+            --results-2b /tmp/rcc-empty-2b \
+            --results-4b /tmp/rcc-empty-4b \
+            --out /tmp/rcc-no-spend-dry
+          status=$?
+          set -e
+          if [ "$status" -ne 1 ]; then
+            echo "expected fail-closed NOT_READY exit 1, got $status" >&2
+            exit 1
+          fi
+
+  package-export:
+    name: wheel-and-export
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install "uv==${UV_VERSION}"
+      - run: uv sync --frozen --group dev --no-group lab --no-group mlx
+      - name: Build and verify wheel contents
+        run: |
+          uv build --wheel --out-dir dist
+          wheel="$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
+          test -n "$wheel"
+          uv run --no-sync python tools/verify_wheel.py "$wheel"
+      - name: Install wheel outside source tree and import every package
+        run: |
+          python -m venv /tmp/rcc-wheel-smoke
+          /tmp/rcc-wheel-smoke/bin/python -m pip install --no-deps dist/*.whl
+          /tmp/rcc-wheel-smoke/bin/python -I tools/wheel_import_smoke.py \
+            --forbid-root "$GITHUB_WORKSPACE"
+      - name: Export manifest is deterministic and current
+        run: uv run --no-sync python tools/export_review.py --root . --check
