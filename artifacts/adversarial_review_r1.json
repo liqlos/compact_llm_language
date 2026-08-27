@@ -1,0 +1,145 @@
+{
+  "schema_version": "rcc.r1_adversarial_review.v1",
+  "review_date": "2026-08-27",
+  "reviewed_git_sha": "a9f4ca577a87fb87012b92118ec6fe2ac4242720",
+  "overall_status": "PASS",
+  "blocking_findings_remaining": [],
+  "independence": {
+    "final_review_is_clean_room": true,
+    "snapshot_root": "/private/tmp/rcc-r1-cleanroom-a9f4ca5-oTy1ku/code-only",
+    "snapshot_archive_sha256": "520d30c7ab56b75c860fe3bf244d1ecac20d99b8cc4da6014434293d742dcc81",
+    "snapshot_file_count": 106,
+    "snapshot_directory_count": 10,
+    "excluded": [
+      ".git",
+      "Markdown narrative",
+      "author audit reports",
+      "artifact classification",
+      "experiment preregistration",
+      "historical reports"
+    ],
+    "allowed_machine_inputs": [
+      "artifacts/behavioral_v3_manifest.json",
+      "artifacts/behavioral_v3_validation.json"
+    ],
+    "network_used": false,
+    "model_weights_downloaded": false,
+    "gpu_used": false,
+    "cloud_used": false,
+    "paid_operations_used": false,
+    "qualification": "The initial working-directory probe disclosed only the repository path. All substantive final evidence was produced from the allowlisted code-only snapshot."
+  },
+  "review_cycles": [
+    {
+      "cycle": 1,
+      "target_git_sha": "f16a240633c146c619060b3f21a6915b663c8b00",
+      "status": "BLOCKED",
+      "finding": "A schema-valid latent_eval.v3 record could retain a real example_id and suite hash while fabricating family, prompt hash, candidate values/order, permutation and gold, allowing false current-evidence admission.",
+      "fix_commit": "b96b59f7426d54128d12c013f837263ca581ed9c",
+      "fix": "Bind every current record to the canonical behavioral-v3 example before eval-envelope, gate, report or training-selection acceptance."
+    },
+    {
+      "cycle": 2,
+      "target_git_sha": "b96b59f7426d54128d12c013f837263ca581ed9c",
+      "status": "BLOCKED",
+      "findings": [
+        "Checkpoint selection and selected-state proof did not themselves require canonical suite binding for all seven schema-valid mutation classes.",
+        "The runtime proof parser could report PROVEN when pytest returned success with required proof cases skipped."
+      ],
+      "fix_commit": "3215c7736cfdff47113207372fd435eca236aeae",
+      "fix": "Require canonical suite joins in selection and selected-state paths, and require a complete named proof set with zero skips before runtime PROVEN.",
+      "independence_qualification": "Discovery cycle only; broad source search exposed narrative files, so this cycle is not used as final independent certification."
+    },
+    {
+      "cycle": 3,
+      "target_git_sha": "a9f4ca577a87fb87012b92118ec6fe2ac4242720",
+      "status": "PASS",
+      "blocking_findings": [],
+      "incomplete_checks": [],
+      "production_tree_digest_sha256": "c7c8af4746607028417a956b5555abcff0cbf8f5d9fef478325a4cf75ade3cea",
+      "fixture_only_integration_commit": "a9f4ca577a87fb87012b92118ec6fe2ac4242720",
+      "fixture_only_integration_changed_production_tree": false
+    }
+  ],
+  "attacks": [
+    {
+      "attack": "benchmark_direct_answer_or_initial_only_leak",
+      "status": "PASS",
+      "evidence": "Fresh deterministic regeneration and independent validation found no direct final-answer field; initial-only input was non-identifying across every family."
+    },
+    {
+      "attack": "remove_counterfactual_or_reorder_causal_events",
+      "status": "PASS",
+      "evidence": "Event removal, applicable order perturbation and counterfactual mutation each changed gold at the manifest-defined minimum rate of 1.0."
+    },
+    {
+      "attack": "candidate_position_or_permutation_false_result",
+      "status": "PASS",
+      "evidence": "Gold-position imbalance is at most one per family; all seven schema-valid canonical-suite mutations are rejected by current binding, selector and selected-state paths."
+    },
+    {
+      "attack": "online_offline_scorer_disagreement",
+      "status": "PASS",
+      "evidence": "Canonical raw-record validation and bit-exact offline rescore tests agree on scores, ranking, ties, prediction and correctness."
+    },
+    {
+      "attack": "nan_inf_exact_tie_near_tie_or_duplicate_candidate",
+      "status": "PASS",
+      "evidence": "Canonical scorer negative cases fail closed; exact top ties use the preregistered error policy and near ties retain deterministic ordering."
+    },
+    {
+      "attack": "cross_run_persisted_reference",
+      "status": "PASS",
+      "evidence": "Tampered top-level and nested run identities fail at load and again before compile/expand."
+    },
+    {
+      "attack": "no_decode_guard_bypass",
+      "status": "PASS",
+      "evidence": "Negative tests cover tokenizer call, encode, decode, batch_decode, chat template, generate and direct lm_head paths; forbidden paths raise."
+    },
+    {
+      "attack": "nonexecuting_grad_checkpoint_flag",
+      "status": "PASS",
+      "evidence": "Unsupported true values are rejected instead of persisted as an implemented mechanism; recurrence semantics explicitly name detached-cache BPTT."
+    },
+    {
+      "attack": "wrong_checkpoint_or_selected_adapter_identity",
+      "status": "PASS",
+      "evidence": "Report, manifest, raw records and actual decoded selected state must share the adapter identity and content hash."
+    },
+    {
+      "attack": "runtime_proof_with_skipped_or_missing_tests",
+      "status": "PASS",
+      "evidence": "Synthetic pytest success with 16 passed and 9 skipped produces runtime FAILED, PROOF_TESTS_FAILED and NOT_READY; the real proof has 32 passed and zero skipped."
+    },
+    {
+      "attack": "false_pass_without_raw_current_evidence",
+      "status": "PASS",
+      "evidence": "Fifty derived-only historical evals remain IRRECOVERABLE_LEGACY_SCORER and cannot enter current metrics or authorize spend."
+    },
+    {
+      "attack": "historical_invalid_result_in_headline_metrics",
+      "status": "PASS",
+      "evidence": "Current-evidence eligibility requires behavioral-v3 canonical binding and latent_eval.v3 raw records; legacy salvage is explicitly non-current."
+    }
+  ],
+  "execution_receipts": [
+    {
+      "scope": "clean_room_artifact_contracts_and_cli",
+      "result": "120 passed in 3.08s"
+    },
+    {
+      "scope": "clean_room_guard_full_decoder_gradient_and_mock_runtime",
+      "result": "13 passed in 13.96s"
+    },
+    {
+      "scope": "integrated_selector_gate_and_state_binding",
+      "result": "146 passed in 4.36s"
+    },
+    {
+      "scope": "integrated_runtime_proof",
+      "result": "32 passed in 7.73s; 0 skipped; all_passed=true"
+    }
+  ],
+  "reviewer_verdict": "The reviewed code-only snapshot exposes no demonstrated route to a false R1 infrastructure PASS. This verdict does not claim that latent recurrence works; no valid model experiment has been executed."
+}

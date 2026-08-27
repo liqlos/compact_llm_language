@@ -1,0 +1,159 @@
+{
+  "schema_version": "rcc.milestone_r1_verdict.v1",
+  "milestone": "R1_VALID_EVIDENCE",
+  "git_sha": "a9f4ca577a87fb87012b92118ec6fe2ac4242720",
+  "status": "R1_INFRASTRUCTURE_PASS",
+  "scientific_status": "VALID_EXPERIMENT_PENDING",
+  "paid_spend_authorized": false,
+  "authorization_status": "PAID_SPEND_NOT_AUTHORIZED",
+  "scaling_authorized": false,
+  "code_test_status": {
+    "status": "PASS_LOCAL",
+    "python_3_11_compileall": "PASS",
+    "python_3_14_compileall": "PASS",
+    "rcc_core_python_3_11": "83 passed",
+    "rcc_core_python_3_14": "83 passed",
+    "local_lab_and_transformer_tiers": "270 passed, 1 skipped, 473 deselected",
+    "package_build_verify_clean_install_import": "PASS",
+    "remote_ci": "CONFIGURED_NOT_EXECUTED"
+  },
+  "benchmark_status": {
+    "status": "PASS",
+    "suite_identity": "behavioral-v3",
+    "suite_version": 3,
+    "suite_sha256": "5cf5cbf397510ba597b59f7ccf0839cf344e6fb795a5cb29d031f39dac218254",
+    "deterministic_regeneration": "PASS",
+    "independent_solver": "PASS",
+    "anti_shortcut_contracts": "PASS",
+    "semantic_ood": "PRESENT",
+    "untouched_final_test": true,
+    "checkpoint_selection_uses_final_test": false
+  },
+  "scorer_status": {
+    "status": "PASS",
+    "schema": "latent_eval.v3",
+    "primary_candidate_score": "mean_candidate_token_logprob_v1",
+    "raw_per_token_evidence_required": true,
+    "canonical_suite_join_required": true,
+    "online_offline_exact_agreement": "PASS",
+    "selection_final_report_gate_share_canonical_scorer": true,
+    "historical_derived_metrics_counted_as_accuracy": false
+  },
+  "runtime_status": {
+    "status": "PASS_LOCAL",
+    "gradient_semantics": "hidden_state_chain_bptt_with_detached_cache_recurrence",
+    "fake_grad_checkpoint_flag_allowed": false,
+    "full_decoder_autoregressive_reference": "PASS",
+    "same_adapter_k_values_supported": [
+      0,
+      1,
+      2,
+      4,
+      8
+    ],
+    "no_decode_negative_contract": "PASS",
+    "required_proof": "32 passed, 0 skipped",
+    "large_or_paid_runtime_used": false
+  },
+  "artifact_status": {
+    "status": "PASS_TRUTHFUL_NOT_READY",
+    "inventory_count": 120,
+    "valid_current_model_results": 0,
+    "independently_rescorable_historical_model_results": 0,
+    "irrecoverable_legacy_scorer_records": 50,
+    "selection_provenance_invalid_checkpoints": 13,
+    "live_invalid_4b_candidate_runs": 0,
+    "quarantined_4b_directories": 8,
+    "no_spend_gate": "NOT_READY with 9 blockers",
+    "no_spend_false_pass_found": false
+  },
+  "documentation_status": {
+    "status": "PASS",
+    "machine_verdict_is_source_of_truth": true,
+    "historical_reports_preserved": true,
+    "historical_accuracy_claims_invalidated": true,
+    "direct_no_thinking_preview_caveat_present": true,
+    "scientifically_proven_claim_present": false
+  },
+  "independent_adversarial_review": {
+    "status": "PASS",
+    "reviewed_git_sha": "a9f4ca577a87fb87012b92118ec6fe2ac4242720",
+    "clean_room": true,
+    "blocking_findings_remaining": 0,
+    "pre_pass_blockers_found_and_fixed": 2,
+    "report": "artifacts/adversarial_review_r1.json"
+  },
+  "remaining_blockers": [
+    "No valid behavioral-v3 model experiment has been executed; latent recurrence remains unmeasured under the corrected contract.",
+    "No VALID_CURRENT model result exists, so scientific or scaling claims are forbidden.",
+    "The retained historical artifact corpus correctly keeps the full no-spend gate NOT_READY with nine blocker classes.",
+    "Linux CI jobs are configured but have not been executed in this local session.",
+    "Any future remote run requires separate explicit paid-spend authorization, live provider-price verification, bounded provisioning watchdogs and independent post-run raw-evidence review."
+  ],
+  "exact_next_experiment": {
+    "status": "NOT_EXECUTED",
+    "preregistration": "artifacts/r1_experiment_preregistration.json",
+    "local_smoke_command": "uv run --frozen --group dev --group lab --no-group mlx python -m pytest -q --run-lab-unit --run-transformer-integration tests/test_benchmark_v3.py tests/test_eval_v3.py tests/test_latent_runtime_integrity.py tests/test_latent_run.py tests/test_no_spend_gate.py tests/test_dictenc.py tests/test_provenance_links.py tests/test_scratch.py tests/test_session.py tests/test_store.py tests/test_tokens.py",
+    "potential_remote_command": "RCC_PAID_SPEND_AUTHORIZED=1 RCC_R1_PREREG_ACK=5cf5cbf397510ba597b59f7ccf0839cf344e6fb795a5cb29d031f39dac218254 bash latent_lab/bench/r1_experiment_driver.sh --seeds 0,1,2 --device cuda --out .rcc_work/r1_experiment",
+    "potential_remote_command_executed": false,
+    "paid_spend_authorized": false,
+    "estimated_gpu_hours": 18,
+    "max_compute_cost_usd": 10.8,
+    "hard_total_cost_cap_usd": 12.0,
+    "budget_source": "preregistered policy cap, not a live market-price quote"
+  },
+  "evidence_files_and_hashes": [
+    {
+      "path": "artifacts/audit_before.json",
+      "sha256": "87529ac09ee55ad7576e3ad46efdcd43040199960af38c0546a43c63f75be312"
+    },
+    {
+      "path": "artifacts/audit_after.json",
+      "sha256": "0b480ac99116cd98236bef586a744ba70c642de7481185499f6a209349449497"
+    },
+    {
+      "path": "artifacts/adversarial_review_r1.json",
+      "sha256": "7b2ba213fa33ba23b4cd0b9e3ac177effb029aafe0e16cde2682fd1aaa66cd44"
+    },
+    {
+      "path": "artifacts/ARTIFACT_CLASSIFICATION.json",
+      "sha256": "7fe3044a95012407751aaf0dd7b2127a81d8c7ca31d7cd3a62f9b8b09097faa0"
+    },
+    {
+      "path": "artifacts/HISTORICAL_EVAL_INVALIDATION.json",
+      "sha256": "27d5ff0c0ae782e6ac8f51b551f7867f464ae3136ddcc7715d6d9fd4318d133e"
+    },
+    {
+      "path": "artifacts/markdown_claim_audit.json",
+      "sha256": "1197b0cec116c2410b8f9c829e89df282f8ceb78ba796c451ef9ec6c3701e5d7"
+    },
+    {
+      "path": "artifacts/behavioral_v3_manifest.json",
+      "sha256": "34e71a31499bdcf6370446b70ab20b23263d70b46000ab73ac1917292f17f77a"
+    },
+    {
+      "path": "artifacts/behavioral_v3_validation.json",
+      "sha256": "8cc1a18024bc746415a33eb2450de1010a9284aa355096443cbd856013be919a"
+    },
+    {
+      "path": "artifacts/r1_experiment_preregistration.json",
+      "sha256": "10e5d1c95a330ed67b332f1f973e6231957a1ad8ef83221fc4e28922949aca26"
+    },
+    {
+      "path": "latent_lab/bench/suite_v3.py",
+      "sha256": "13170b3010062fd372d1e677822b52f5b7bd3cded9a817cf91e54f78de163252"
+    },
+    {
+      "path": "latent_lab/bench/eval_v3.py",
+      "sha256": "375ef7e97f10566dc4a9d2a95a09630d0a0ffeb8e3a05365a235aaa501ba422f"
+    },
+    {
+      "path": "latent_lab/bench/r1_experiment_driver.sh",
+      "sha256": "1afff626b6ffc357a2d22a2e4a0cdc264d6a950dc75eb833b6ec11034ebffe0a"
+    },
+    {
+      "path": ".github/workflows/ci.yml",
+      "sha256": "11325a2df04f32ac985c14afefd2af3c519cb04f8de2ad673964cba57dd8eb52"
+    }
+  ]
+}

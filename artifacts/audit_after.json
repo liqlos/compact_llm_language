@@ -1,0 +1,268 @@
+{
+  "schema_version": "rcc.r1_audit_after.v1",
+  "audit_date": "2026-08-27",
+  "repository": {
+    "branch": "codex/r1-valid-evidence",
+    "baseline_git_sha": "aec85a9c8e60a9297b295ceba94cef8e6fb93ef3",
+    "reviewed_implementation_git_sha": "a9f4ca577a87fb87012b92118ec6fe2ac4242720",
+    "baseline_dirty": false,
+    "reviewed_implementation_dirty": false
+  },
+  "constraints_observed": {
+    "paid_spend_authorized": false,
+    "paid_gpu_operations": 0,
+    "remote_instances_created": 0,
+    "cloud_training_runs": 0,
+    "large_model_downloads": 0,
+    "4b_or_27b_training_runs": 0,
+    "history_rewritten": false,
+    "negative_results_deleted": false
+  },
+  "audit_method": {
+    "code_first_before_markdown": true,
+    "pre_audit_file": "artifacts/audit_before.json",
+    "markdown_comparison_file": "artifacts/markdown_claim_audit.json",
+    "negative_cases_required": true,
+    "final_clean_room_review": "PASS"
+  },
+  "baseline_facts": {
+    "system_python": "3.14.6",
+    "project_venv_python": "3.14.0",
+    "clean_contract_python": "3.11.15",
+    "os": "Darwin 25.4.0 arm64",
+    "uv": "0.11.28",
+    "baseline_compileall": "PASS",
+    "baseline_default_pytest": "529 passed, 1 skipped in 30.04s",
+    "baseline_core_pytest": "98 passed",
+    "baseline_no_spend_dry": "NOT_READY with 6 blockers",
+    "baseline_no_spend_full": "NOT_READY with 12 blockers",
+    "baseline_artifact_files": 120,
+    "baseline_artifact_bytes": 38842166,
+    "baseline_latent_eval_files": 50,
+    "baseline_independently_rescorable_eval_files": 0
+  },
+  "lead_reverification": [
+    {
+      "id": 1,
+      "baseline_verdict": "CONFIRMED",
+      "r1_resolution": "FIXED",
+      "evidence": "Canonical ranking derives gold_index from the actual gold answer; tests place gold at every candidate position."
+    },
+    {
+      "id": 2,
+      "baseline_verdict": "CONFIRMED",
+      "r1_resolution": "CLASSIFIED_NOT_RECONSTRUCTED",
+      "evidence": "All 50 historical latent evals lack raw candidate evidence and are IRRECOVERABLE_LEGACY_SCORER."
+    },
+    {
+      "id": 3,
+      "baseline_verdict": "CONFIRMED",
+      "r1_resolution": "INVALIDATED",
+      "evidence": "Thirteen historical selected checkpoints have selection_provenance_invalid; current selection uses the canonical v3 scorer and canonical suite join."
+    },
+    {
+      "id": 4,
+      "baseline_verdict": "CONFIRMED",
+      "r1_resolution": "FIXED_IN_NEW_IMMUTABLE_SUITE",
+      "evidence": "behavioral-v2 is preserved; behavioral-v3 snapshots the real obj_track initial state and independent replay reproduces gold."
+    },
+    {
+      "id": 5,
+      "baseline_verdict": "PARTIALLY_CONFIRMED",
+      "r1_resolution": "FIXED",
+      "evidence": "Per-example candidate counts and token lengths are retained; mean per-token log probability is preregistered primary while raw sums remain evidence."
+    },
+    {
+      "id": 6,
+      "baseline_verdict": "CONFIRMED",
+      "r1_resolution": "FIXED",
+      "evidence": "latent_eval.v3 is the sole current schema and exact-top-tie policy is shared by online, offline, selection, report and gate paths."
+    },
+    {
+      "id": 7,
+      "baseline_verdict": "CONFIRMED_WITH_NONRESCORABLE_CAVEAT",
+      "r1_resolution": "TRUTHFULLY_RELABELED",
+      "evidence": "The stored direct/no-thinking preview is much stronger than native-thinking preview, but neither is independently rescorable or a current accuracy result."
+    },
+    {
+      "id": 8,
+      "baseline_verdict": "CONFIRMED",
+      "r1_resolution": "EXPERIMENT_CONTRACT_FIXED",
+      "evidence": "The preregistration evaluates one recurrence-trained adapter at K=0,1,2,4,8 and labels separately trained K0 as secondary; prefill LoRA compute is counted."
+    },
+    {
+      "id": 9,
+      "baseline_verdict": "CONFIRMED",
+      "r1_resolution": "FIXED",
+      "evidence": "Every answer token traverses the intended full decoder stack autoregressively; a tiny deterministic reference test covers multi-token candidates."
+    },
+    {
+      "id": 10,
+      "baseline_verdict": "CONFIRMED",
+      "r1_resolution": "MADE_EXPLICIT_AND_TESTED",
+      "evidence": "The runtime names hidden_state_chain_bptt_with_detached_cache_recurrence, tests gradient presence/absence and finiteness, and rejects unsupported grad_checkpoint=true."
+    },
+    {
+      "id": 11,
+      "baseline_verdict": "CONFIRMED",
+      "r1_resolution": "FIXED",
+      "evidence": "The scoped VocabGuard covers tokenizer call/encode/decode/batch_decode/chat-template/generate and direct lm_head paths with negative failure tests."
+    },
+    {
+      "id": 12,
+      "baseline_verdict": "CONFIRMED",
+      "r1_resolution": "FIXED",
+      "evidence": "Canonical structural JSON encoding roundtrips arbitrary JSON keys, nested values, Unicode, separators, control characters and literal escapes."
+    },
+    {
+      "id": 13,
+      "baseline_verdict": "CONFIRMED",
+      "r1_resolution": "FIXED",
+      "evidence": "Boundary-aware normalized numeric tokens cover signs, decimal separators and exponents; 142/1420 and 2/20.1 negative cases fail."
+    },
+    {
+      "id": 14,
+      "baseline_verdict": "CONFIRMED",
+      "r1_resolution": "FIXED",
+      "evidence": "Run identity is checked at load and repeated before compile/expand; corrupted persisted state fails closed."
+    },
+    {
+      "id": 15,
+      "baseline_verdict": "CONFIRMED",
+      "r1_resolution": "FIXED",
+      "evidence": "Python 3.11 syntax is valid, documented default dependencies install cleanly, and test tiers make optional/paid coverage explicit."
+    },
+    {
+      "id": 16,
+      "baseline_verdict": "REFUTED_AS_STATED",
+      "r1_resolution": "PUBLIC_SURFACE_GAP_FIXED",
+      "evidence": "latent_lab.bench was already packaged, but public repository-root bench was not; the wheel now contains both the declared bench surface and all required packages."
+    },
+    {
+      "id": 17,
+      "baseline_verdict": "CONFIRMED",
+      "r1_resolution": "QUARANTINED_RECOVERABLY",
+      "evidence": "Eight byte-identical invalid 4B live directories were moved to quarantine with hashes and reasons; live 4B candidate roots now contain zero runs."
+    },
+    {
+      "id": 18,
+      "baseline_verdict": "CONFIRMED_AFTER_PHASE_B",
+      "r1_resolution": "INVALIDATED_OR_CORRECTED",
+      "evidence": "MODEL_MEASURED, above-chance, K-dose and text-baseline-dead narratives now carry invalidation/caveat labels and defer to machine verdicts."
+    }
+  ],
+  "benchmark_v3": {
+    "suite_identity": "behavioral-v3",
+    "suite_version": 3,
+    "suite_sha256": "5cf5cbf397510ba597b59f7ccf0839cf344e6fb795a5cb29d031f39dac218254",
+    "families": 7,
+    "splits": {
+      "train": 280,
+      "validation": 224,
+      "test_id": 168,
+      "test_ood_length": 168,
+      "test_ood_semantic": 168,
+      "final_test": 224
+    },
+    "checkpoint_selection_split": "validation",
+    "final_test_untouched": true,
+    "gold_position_max_imbalance_per_family": 1,
+    "independent_validation": "PASS"
+  },
+  "canonical_scoring": {
+    "schema_version": "latent_eval.v3",
+    "primary_score": "mean_candidate_token_logprob_v1",
+    "secondary_score": "raw_summed_logprob",
+    "tie_policy": "exact_top_tie_is_error",
+    "raw_per_token_logprob_required": true,
+    "canonical_suite_join_required": true,
+    "online_offline_bit_exact_agreement": true,
+    "current_rescorable_model_results": 0
+  },
+  "artifact_classification": {
+    "total_artifacts": 120,
+    "valid_current_model_results": 0,
+    "independently_rescorable_model_evals": 0,
+    "irrecoverable_legacy_scorer": 50,
+    "legacy_selection_checkpoints": 13,
+    "live_4b_target_runs_remaining": 0,
+    "quarantine_moves": 8
+  },
+  "execution_receipts": [
+    {
+      "command_scope": "benchmark_v3_regression_and_integrity",
+      "result": "64 passed in 0.81s"
+    },
+    {
+      "command_scope": "canonical_selector_gate_and_selected_state",
+      "result": "146 passed in 4.36s"
+    },
+    {
+      "command_scope": "runtime_scientific_integrity",
+      "result": "63 passed, 1 skipped in 44.19s"
+    },
+    {
+      "command_scope": "required_no_spend_runtime_proof",
+      "result": "32 passed in 7.73s; 0 skipped"
+    },
+    {
+      "command_scope": "rcc_core_contracts_python_3_11",
+      "result": "83 passed in 0.25s"
+    },
+    {
+      "command_scope": "rcc_core_contracts_python_3_14",
+      "result": "83 passed in 0.33s"
+    },
+    {
+      "command_scope": "all_local_lab_and_transformer_markers_on_reviewed_head",
+      "result": "270 passed, 1 skipped, 473 deselected in 48.69s"
+    },
+    {
+      "command_scope": "python_3_11_and_python_3_14_compileall_on_reviewed_head",
+      "result": "PASS"
+    },
+    {
+      "command_scope": "wheel_build_verify_clean_python_3_11_install_and_import",
+      "result": "PASS; rcc-0.1.0-py3-none-any.whl contains bench, evals, latent_lab and rcc"
+    },
+    {
+      "command_scope": "independent_clean_room_review",
+      "result": "PASS; 120 artifact/CLI tests and 13 runtime attack tests; no blockers"
+    }
+  ],
+  "no_spend_gate": {
+    "command_status": "NOT_READY",
+    "exit_code": 1,
+    "blocker_count": 9,
+    "blocker_codes": [
+      "CKPT_LEGACY_UNBOUND_IDENTITY",
+      "EVAL_FILE_INVALID",
+      "IRRECOVERABLE_LEGACY_SCORER",
+      "REPORT_RECIPE_NOT_CANONICAL",
+      "REPORT_SCHEMA_MISSING_FIELDS",
+      "REPORT_SUITE_HASH_MISMATCH",
+      "REPORT_TRAINABLE_PRECISION_MISSING",
+      "SELECTION_PROVENANCE_NOT_CORRECTED",
+      "TRAINABLES_NOT_FP32_IN_RETAINED_CHECKPOINTS"
+    ],
+    "runtime_prerequisite": "PROVEN",
+    "interpretation": "Expected fail-closed verdict over retained historical evidence; it does not contradict R1 infrastructure validity and cannot authorize spend."
+  },
+  "integration_gates": {
+    "gate_1_repository_correctness": "PASS_LOCAL",
+    "gate_2_benchmark_and_scorer_validity": "PASS",
+    "gate_3_runtime_local_smoke": "PASS_LOCAL",
+    "gate_4_artifact_truth": "PASS_TRUTHFUL_NOT_READY",
+    "remote_ci_execution": "NOT_EXECUTED",
+    "scientific_model_claim": "VALID_EXPERIMENT_PENDING"
+  },
+  "remaining_limits": [
+    "No behavioral-v3 model experiment has been executed.",
+    "There are zero VALID_CURRENT model results.",
+    "Linux CI is configured but was not executed by this local session.",
+    "Any future paid execution still requires separate explicit authorization, live provider-price verification, provisioning watchdogs and post-run independent evidence join."
+  ],
+  "strategic_verdict": "R1_INFRASTRUCTURE_PASS",
+  "scientific_status": "VALID_EXPERIMENT_PENDING",
+  "scaling_authorized": false
+}
