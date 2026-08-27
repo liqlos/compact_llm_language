@@ -28,6 +28,8 @@ import sys
 import time
 from pathlib import Path
 
+from latent_lab.backends.localized import RECURRENCE_ONLY_LORA_MODE_SUFFIX
+
 DEFAULT_MODEL_ID = "Qwen/Qwen3.5-2B"
 DEFAULT_REVISION = "15852e8c16360a2fea060d615a32b45270f8a8fc"
 
@@ -542,9 +544,6 @@ def _suite_v3_contract(suite) -> dict:
 def _recipe_hash(recipe) -> str:
     from latent_lab.bench.eval_v3 import canonical_sha256
     return canonical_sha256(recipe)
-
-
-RECURRENCE_ONLY_LORA_MODE_SUFFIX = "+recurrence-only-lora"
 
 
 def _adapter_policy_mode(mode: str, recurrence_only_lora: bool) -> str:

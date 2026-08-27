@@ -249,6 +249,22 @@ def test_recurrence_only_lora_policy_is_recipe_and_runtime_bound():
     assert recurrence_config["recurrence_only_lora"] is True
     assert recurrence_config["adapter_activation_policy"] == "recurrence_only"
 
+    fake_runtime = SimpleNamespace(
+        interval=(0, 4), max_k=4, recurrence_only_lora=True,
+        injected=[SimpleNamespace(
+            scaling=2.0,
+            lora_A=torch.zeros(8, 1))],
+        runtime_contract=lambda: contract,
+    )
+    LocalizedRecurrence.adapter_recipe(fake_runtime, config=cfg)
+    with pytest.raises(AdapterBundleIdentityError,
+                       match="recurrence_only_lora False != runtime True"):
+        LocalizedRecurrence.adapter_recipe(
+            fake_runtime,
+            config={**cfg, "mode": "D-full",
+                    "recurrence_only_lora": False,
+                    "runtime_contract": None})
+
     common = dict(
         mode="D-full", interval=(0, 4), k=4, max_k=4,
         lora_r=8, lora_alpha=16.0, lr=2e-4, steps=20, seed=0,

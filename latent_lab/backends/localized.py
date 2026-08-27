@@ -163,6 +163,7 @@ LORA_TARGET_SUFFIXES = (
     # Retain the earlier fused spellings for compatible Qwen revisions.
     "in_proj", "in_proj_qkvz", "in_proj_ba",
 )
+RECURRENCE_ONLY_LORA_MODE_SUFFIX = "+recurrence-only-lora"
 
 _Base = torch.nn.Module if torch is not None else object
 
@@ -1052,6 +1053,27 @@ class LocalizedRecurrence:
         runtime_alpha = float(self.injected[0].scaling
                               * self.injected[0].lora_A.shape[0])
         drift = []
+        claimed_policy = config.get("recurrence_only_lora", False)
+        if not isinstance(claimed_policy, bool):
+            drift.append("recurrence_only_lora is not a boolean")
+            claimed_policy = None
+        mode_has_policy = recipe["mode"].endswith(
+            RECURRENCE_ONLY_LORA_MODE_SUFFIX)
+        if claimed_policy is not None and claimed_policy != mode_has_policy:
+            drift.append(
+                f"mode {recipe['mode']!r} does not seal "
+                f"recurrence_only_lora={claimed_policy}")
+        if claimed_policy is not None \
+                and claimed_policy != self.recurrence_only_lora:
+            drift.append(
+                f"recurrence_only_lora {claimed_policy} != runtime "
+                f"{self.recurrence_only_lora}")
+        stored_contract = config.get("runtime_contract")
+        if claimed_policy and stored_contract is None:
+            drift.append("recurrence-only LoRA lacks runtime_contract metadata")
+        elif stored_contract is not None \
+                and stored_contract != self.runtime_contract():
+            drift.append("runtime_contract != live runtime contract")
         if list(recipe["interval"]) != [lo, hi]:
             drift.append(f"interval {recipe['interval']} != runtime "
                          f"{[lo, hi]}")
