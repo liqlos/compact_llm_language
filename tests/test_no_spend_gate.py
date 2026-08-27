@@ -334,6 +334,7 @@ def _gate_v3_record(ex, *, split="test_id", hit=True,
             "wall_seconds": 0.1,
             "peak_memory_bytes": None,
             "successful_task": True,
+            "eval_ablation": {},
         },
     }
     metadata.update(record_overrides or {})

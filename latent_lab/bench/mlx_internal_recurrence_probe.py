@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import os
 import time
 
 
@@ -34,9 +35,18 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    snap = args.model_snapshot or sorted(glob.glob(
-        "/Users/aleksei/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/"
-        "snapshots/*"))[0]
+    hf_home = os.environ.get(
+        "HF_HOME", os.path.join(os.path.expanduser("~"), ".cache", "huggingface"))
+    hub_cache = os.environ.get("HF_HUB_CACHE", os.path.join(hf_home, "hub"))
+    snapshots = sorted(glob.glob(os.path.join(
+        hub_cache, "models--Qwen--Qwen3.5-0.8B", "snapshots", "*")))
+    if args.model_snapshot:
+        snap = args.model_snapshot
+    elif snapshots:
+        snap = snapshots[-1]
+    else:
+        ap.error(
+            "no cached Qwen3.5-0.8B snapshot found; pass --model-snapshot")
     report = {"probe": "mlx_internal_recurrence", "model": snap,
               "status": "running"}
     try:
@@ -85,7 +95,6 @@ def _run(snap, args, report):
             "cedar, cedar --x--> amber.\nIt reads x y x. In which state "
             "does it end?\nAnswer:")
     ids = mx.array(tok.encode(text))[None]
-    n_prompt = ids.shape[1]
 
     # ---- reference: public forward ------------------------------------
     def make_cache():
@@ -103,7 +112,7 @@ def _run(snap, args, report):
     from mlx_lm.models.base import create_attention_mask, create_ssm_mask
     c_man = make_cache()
     h = inner.embed_tokens(ids)
-    fa_idx = next(i for i, l in enumerate(layers) if not l.is_linear)
+    fa_idx = next(i for i, layer in enumerate(layers) if not layer.is_linear)
     fa_mask = create_attention_mask(h, c_man[fa_idx])
     ssm_mask = create_ssm_mask(h, c_man)
     for i, layer in enumerate(layers):

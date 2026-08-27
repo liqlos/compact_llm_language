@@ -1,9 +1,10 @@
 # RCC Vision — Latent Cognition on Open-Weight Qwen
 
-> **R1 status (2026-08-27): `VALID_EXPERIMENT_PENDING` and
-> `PAID_SPEND_NOT_AUTHORIZED`.** This document describes direction, not
-> evidence or spend authority. Current authority is
-> `artifacts/milestone_r1_verdict.json` plus the fresh no-spend verdict.
+> **Archived 2026-08-27.** This was the architectural hypothesis, not a shipped
+> capability. The bounded Qwen3.5-2B investigation ended with
+> `NO_PROVEN_LATENT_REASONING_GAIN`; see
+> [`LATENT_EXPERIMENT_STATUS.md`](LATENT_EXPERIMENT_STATUS.md). The 27B target
+> was never attempted.
 
 Date: 2026-08-22. Supersedes the "textual RCC as end-state" reading of earlier
 plan documents.

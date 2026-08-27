@@ -1,8 +1,12 @@
 # R1 next experiment preregistration
 
-Status: `NOT EXECUTED`  
-Scientific status: `VALID_EXPERIMENT_PENDING`  
-Paid spend: `NOT AUTHORIZED`
+Status: `HISTORICAL_NOT_EXECUTED`
+
+This exact R1 plan was never authorized or executed. It is retained to show
+the frozen gate that preceded the later, separately authorized bounded 2B
+experiments. The project is now archived with
+`NO_PROVEN_LATENT_REASONING_GAIN`; see
+[`LATENT_EXPERIMENT_STATUS.md`](LATENT_EXPERIMENT_STATUS.md).
 
 The machine-readable source of this preregistration is
 `artifacts/r1_experiment_preregistration.json`. Behavioral-v3, its candidate

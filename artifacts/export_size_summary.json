@@ -1,14 +1,15 @@
 {
   "excluded_tracked_file_count": 2,
-  "file_count": 139,
+  "file_count": 141,
   "files_by_top_level": {
     ".github": 1,
     ".gitignore": 1,
     "CONTRIBUTING.md": 1,
+    "LICENSE": 1,
     "README.md": 1,
     "artifacts": 11,
     "bench": 5,
-    "docs": 11,
+    "docs": 12,
     "evals": 6,
     "latent_lab": 46,
     "pyproject.toml": 1,
@@ -18,5 +19,5 @@
     "uv.lock": 1
   },
   "schema_version": "rcc.review_export.v1",
-  "total_bytes": 2087207
+  "total_bytes": 2281694
 }

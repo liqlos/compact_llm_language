@@ -1,18 +1,18 @@
-# Latent Roadmap — maturity-tracked
+# Latent Roadmap — archived research plan
 
-> **Current real-model status:** see
-> [`LATENT_EXPERIMENT_STATUS.md`](LATENT_EXPERIMENT_STATUS.md). The direct owner
-> authorization on 2026-08-27 permits up to approximately USD 20 of paid
-> compute for the current 2B investigation. Historical R1 artifacts remain
-> invalidated; that authorization does not rehabilitate their scorer or
-> checkpoint provenance.
+> **Archived 2026-08-27.** The proxy gate failed and this roadmap is no longer
+> an active task list. See
+> [`LATENT_EXPERIMENT_STATUS.md`](LATENT_EXPERIMENT_STATUS.md) for the final
+> `NO_PROVEN_LATENT_REASONING_GAIN` verdict. Historical R1 artifacts remain
+> invalidated; the later bounded 2B authorization did not rehabilitate their
+> scorer or checkpoint provenance.
 
 Status vocabulary: `HYPOTHESIS` `SCAFFOLDED` `UNIT_VERIFIED` `MODEL_VERIFIED`
 `REPLICATED` `REJECTED_BY_EVIDENCE` `BLOCKED` (plus NOT_STARTED / NOT MEASURED).
 A file or class existing is never evidence of maturity by itself.
 
-Updated: 2026-08-27 (R1 evidence invalidation and local runtime contracts).
-Measurements remain historical snapshots unless a row names a current receipt.
+Updated: 2026-08-27 (project closure). All proposed later stages below are
+historical design options, not planned work.
 
 ## Current status table
 
@@ -29,7 +29,7 @@ Measurements remain historical snapshots unless a row names a current receipt.
 | Toy recurrence trainer (T1 analog) | UNIT_VERIFIED | loss 7.58→0.016, acc 100% vs 6.25% under loop ablation ⇒ latent path causally used at toy scale |
 | Historical Qwen hybrid runtime probe | HISTORICAL_UNBOUND | retained 0.8B state-probe JSON is runtime-only evidence, not reasoning quality or current scorer evidence |
 | MLX soft-embedding path | MEASURED / PARTIALLY BLOCKED | exact-vocab embeds bit-exact & fast; off-manifold inputs slow ~3.5–5×; hybrid prefix-cache trim unsupported |
-| Localized recurrence quality/speedup | INVALIDATED / VALID_EXPERIMENT_PENDING | behavioral-v2 derived-only outputs cannot be rescored; no current model result exists |
+| Localized/full recurrence quality | REJECTED_BY_EVIDENCE (tested 2B recipes) | no replicated gain under K/reset/intervention/seed controls; see final experiment status |
 | Qwen3.8-27B speedup ≥2× | NOT MEASURED | no current scaling permission; valid small behavioral-v3 experiment pending |
 
 ## Stages

@@ -25,14 +25,20 @@
     {
       "mode": "100644",
       "path": "CONTRIBUTING.md",
-      "sha256": "13cd076b18f49ebd3ed23db0815122fd1ce9f6bfa7d5ee125237d8b7628aa681",
-      "size_bytes": 1563
+      "sha256": "6d9f01db27dea83e841f9e151f8b19cfdb2e98bc5272bf9b4d5ff1d5f1172a01",
+      "size_bytes": 1699
+    },
+    {
+      "mode": "100644",
+      "path": "LICENSE",
+      "sha256": "0a3102812d13dbdb3c4f7a5af9a8a3c7d9ac957b7d30ba084088b8b3d391944d",
+      "size_bytes": 1073
     },
     {
       "mode": "100644",
       "path": "README.md",
-      "sha256": "700a600f4de73fe8016f1efac937fe213980b700c739abbd3bca40a2649b6ce6",
-      "size_bytes": 12762
+      "sha256": "6e3a8bf4ba45456924e1a7e313f5aa3854786d96414b3feca4e3be93333cbea6",
+      "size_bytes": 6233
     },
     {
       "mode": "100644",
@@ -145,20 +151,20 @@
     {
       "mode": "100644",
       "path": "docs/research-context-compiler/ADR-001-OPEN-WEIGHT-LATENT-RCC.md",
-      "sha256": "c82fecd701c784d38fc96e7b62a6fec767f42b886f81a65434952ee3d7bcb5e8",
-      "size_bytes": 3384
+      "sha256": "06918e00f5fcc079b22b4970c211fb11177a22bdfa2155c92e1c19fdb457c90e",
+      "size_bytes": 3410
     },
     {
       "mode": "100644",
       "path": "docs/research-context-compiler/BLOCKERS.md",
-      "sha256": "200230b670339513805b210a3a9d711a35b028f509ace6f0df8baa74a1d6aa0e",
-      "size_bytes": 5418
+      "sha256": "f9c63deee0934b57ce536678579c0a0b5ae3fe7b345e52a7ddf8ce8e0facf51c",
+      "size_bytes": 5618
     },
     {
       "mode": "100644",
       "path": "docs/research-context-compiler/EVALUATION_PROTOCOL.md",
-      "sha256": "63b63080b8fb82a7e25ba6169984d714deef3909e6a878244f884f8e523b572a",
-      "size_bytes": 3784
+      "sha256": "35aa456aee2eb4ebe03f3c988ce2cdec3b9b37a2dc46962d7880d309fd2cd3d3",
+      "size_bytes": 4003
     },
     {
       "mode": "100644",
@@ -174,9 +180,15 @@
     },
     {
       "mode": "100644",
+      "path": "docs/research-context-compiler/LATENT_EXPERIMENT_STATUS.md",
+      "sha256": "53ef246c5289963d24030ec74c64cb72411a59602d6d322be78f8bb6ef8489b4",
+      "size_bytes": 6025
+    },
+    {
+      "mode": "100644",
       "path": "docs/research-context-compiler/LATENT_ROADMAP.md",
-      "sha256": "e8809ea39ce426a0e5421f77a521f406fd0340044dd7d28f308a7ffec03e20b2",
-      "size_bytes": 6919
+      "sha256": "c86e23fa7f61cf058d2bf759b7828f346037d6e0fc0693fa9e49616dceaa4de2",
+      "size_bytes": 6865
     },
     {
       "mode": "100644",
@@ -187,14 +199,14 @@
     {
       "mode": "100644",
       "path": "docs/research-context-compiler/R1_EXPERIMENT_PREREGISTRATION.md",
-      "sha256": "ec886622a52a2a8f457fc6bc37724217ece966ee0ed58c3bcd3a665178daf562",
-      "size_bytes": 2780
+      "sha256": "720b40f0f358e8734a7c84969b57d5ca0f2955efbb95e4457434fe1712ed0777",
+      "size_bytes": 3010
     },
     {
       "mode": "100644",
       "path": "docs/research-context-compiler/VISION.md",
-      "sha256": "e7044e48c946e5af307914a31d8d5a7930b8180190fdf6b5b615847b3616aac9",
-      "size_bytes": 4518
+      "sha256": "e3d73893a91428d7226bf294eee3455a5474df4193afe58a64d084e01b518c37",
+      "size_bytes": 4547
     },
     {
       "mode": "100644",
@@ -259,8 +271,8 @@
     {
       "mode": "100644",
       "path": "latent_lab/backends/localized.py",
-      "sha256": "85e0520a6fd76eea41b5415445ba4c03917af858989937dc7340fab52f931d0b",
-      "size_bytes": 38584
+      "sha256": "723e24c693028d5f00e57b92c5323537e61852188d6a1d8746eef7cbccbc2278",
+      "size_bytes": 89528
     },
     {
       "mode": "100644",
@@ -283,8 +295,8 @@
     {
       "mode": "100644",
       "path": "latent_lab/bench/artifacts.py",
-      "sha256": "ec090890b9dc8ecebe06567ce8bd0dca2358c0eebc1bdec6158f09d05d5947fe",
-      "size_bytes": 31834
+      "sha256": "2826b16a2b139e83fa616fb5feed1450d246212619c87369794a4cc7941c28e1",
+      "size_bytes": 39241
     },
     {
       "mode": "100644",
@@ -295,14 +307,14 @@
     {
       "mode": "100644",
       "path": "latent_lab/bench/eval_v3.py",
-      "sha256": "375ef7e97f10566dc4a9d2a95a09630d0a0ffeb8e3a05365a235aaa501ba422f",
-      "size_bytes": 33891
+      "sha256": "53ab21035bef3d573aee94febbfa5f736c5c2e6b59df912cb621849d04065958",
+      "size_bytes": 34119
     },
     {
       "mode": "100644",
       "path": "latent_lab/bench/latent_run.py",
-      "sha256": "dfe426c10f39626d02e0203b8dad275bb29e3fa89ec9b9a259b445183c6930d7",
-      "size_bytes": 54517
+      "sha256": "6ab98c35b7a1760ccf9ed8e975708d9d2612f9a57ac4f5bc7c31fc26b563b902",
+      "size_bytes": 91179
     },
     {
       "mode": "100644",
@@ -313,8 +325,8 @@
     {
       "mode": "100644",
       "path": "latent_lab/bench/mlx_internal_recurrence_probe.py",
-      "sha256": "2b585c6c61bc3bd07a7d1dd1659fe0ded5da421523940faf7d0c77856098d000",
-      "size_bytes": 7477
+      "sha256": "bcbb09774c1a830c40314ab0353376bf9f1e4facb0170681b7865cf10d5e2f8c",
+      "size_bytes": 7834
     },
     {
       "mode": "100644",
@@ -403,8 +415,8 @@
     {
       "mode": "100644",
       "path": "latent_lab/bench/suite_v3.py",
-      "sha256": "13170b3010062fd372d1e677822b52f5b7bd3cded9a817cf91e54f78de163252",
-      "size_bytes": 56601
+      "sha256": "2c30521e6296824f754e91b52a1b8ffdffca257c9dfffe4a68b55bd71e2c0834",
+      "size_bytes": 61306
     },
     {
       "mode": "100644",
@@ -481,8 +493,8 @@
     {
       "mode": "100644",
       "path": "latent_lab/train/checkpointing.py",
-      "sha256": "2dd244adcfaa5fa569bd8b11dcb9685928494efbdd171f3be01649a66ef5c4a8",
-      "size_bytes": 58614
+      "sha256": "d8af344c067e401d998bc872daa2873181dc2574dbe07a56e0bfe6ac95ddb8bb",
+      "size_bytes": 60126
     },
     {
       "mode": "100644",
@@ -511,8 +523,8 @@
     {
       "mode": "100644",
       "path": "pyproject.toml",
-      "sha256": "18e5c01ae6acd72a0a20c77e505ba1e5f73a6d3d1d479315baa3c83cf64836be",
-      "size_bytes": 1214
+      "sha256": "8c3cdd2e2e0465461a7a4616fbb1c635121c6fa772a974a0ebcae794c419f9c1",
+      "size_bytes": 1235
     },
     {
       "mode": "100644",
@@ -589,14 +601,14 @@
     {
       "mode": "100644",
       "path": "tests/test_artifact_classification.py",
-      "sha256": "e7c4f20a5314f97f1ad4cb04b8261d0c39f2f3caf991d35bf7363ac8f8d8b5d3",
-      "size_bytes": 7378
+      "sha256": "17161d47b96870894850296bc151c60567007e72662180db0b611828ec3bb8bb",
+      "size_bytes": 7572
     },
     {
       "mode": "100644",
       "path": "tests/test_artifact_contracts.py",
-      "sha256": "d7f580eb6e0ba4f010aaf46a6acc59d13fef8a056b5e71274f2df97a6f4fc387",
-      "size_bytes": 58187
+      "sha256": "2dc600ddc6f8ff9d89c15c6911f290307afb0846ff721e36082fc56df217c8e9",
+      "size_bytes": 66941
     },
     {
       "mode": "100644",
@@ -607,8 +619,8 @@
     {
       "mode": "100644",
       "path": "tests/test_benchmark_v3.py",
-      "sha256": "4170bb6fea3b1d05cc0e35e54db2a48ec3ffd91e33dd94301b4293619d6c82b3",
-      "size_bytes": 12058
+      "sha256": "02b2d6894e97c165b572b8e0f43902e2650d2c475f8bd098270d2e4cf1a27d36",
+      "size_bytes": 16015
     },
     {
       "mode": "100644",
@@ -619,8 +631,8 @@
     {
       "mode": "100644",
       "path": "tests/test_eval_v3.py",
-      "sha256": "170ea0a45c40a921e2cbcd2a9a777573391bc07d4d0eb68c2a5a7ee3dc46e8f4",
-      "size_bytes": 14463
+      "sha256": "d4da4449365a772377e603bffc1ffc4cee7994bb285b2d15696656dd51812497",
+      "size_bytes": 15647
     },
     {
       "mode": "100644",
@@ -661,14 +673,14 @@
     {
       "mode": "100644",
       "path": "tests/test_latent_run.py",
-      "sha256": "876bed95105b75e6e19dfe272237da7e2c3ea33466973636114c59ccc9f69394",
-      "size_bytes": 23275
+      "sha256": "cbf2c38feddadfde34b11e66f735e695d989c2b459ca7e15e7c93f35435047a9",
+      "size_bytes": 30938
     },
     {
       "mode": "100644",
       "path": "tests/test_latent_runtime_integrity.py",
-      "sha256": "e9aa345db925b9dcff0756c26ca881047066fbf7f6f1b9debcf152f0bb4ef50d",
-      "size_bytes": 51820
+      "sha256": "6aedb94da7260d0f6efc31963678af66743e0cdfb5edfefd3bdf3b9587797417",
+      "size_bytes": 85650
     },
     {
       "mode": "100644",
@@ -685,14 +697,14 @@
     {
       "mode": "100644",
       "path": "tests/test_localized.py",
-      "sha256": "055fc6272208060821e4acd540d57e04992f72650f9781fe87d59f7987dc38fb",
-      "size_bytes": 7341
+      "sha256": "96130e7ee2ca36ea274014be7ee7570eb15f0ad5e7d7ec358baef65431fa9b8b",
+      "size_bytes": 41313
     },
     {
       "mode": "100644",
       "path": "tests/test_no_spend_gate.py",
-      "sha256": "5f93597446e3f4a46bc19e3d304c1bbd07feb2a270586f9c0bca58cc458b6f44",
-      "size_bytes": 85176
+      "sha256": "0986748c367c7d14fb7274c0f27728dc81c6b048de2ecacd676d3e0b5ee4c85c",
+      "size_bytes": 85209
     },
     {
       "mode": "100644",
@@ -733,8 +745,8 @@
     {
       "mode": "100644",
       "path": "tests/test_runtime_scientific.py",
-      "sha256": "a91bf38208159b182508a8705a52152cce7f536a1d0f7f1a939f198aea6577d6",
-      "size_bytes": 10332
+      "sha256": "debeea78b577a9ac1a8197d090ce39df4e7e3a1736b39d3b6aed9f84d8267585",
+      "size_bytes": 12041
     },
     {
       "mode": "100644",

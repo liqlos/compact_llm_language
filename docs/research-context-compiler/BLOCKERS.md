@@ -1,5 +1,9 @@
 # Historical blockers and measured runtime facts
 
+> **Project archived 2026-08-27.** This ledger is retained for provenance, not
+> as future work. The final experimental verdict is
+> [`NO_PROVEN_LATENT_REASONING_GAIN`](LATENT_EXPERIMENT_STATUS.md).
+
 Snapshot date: 2026-08-24. This is an evidence ledger, not the current task
 queue. Recheck environment-dependent claims before acting; current maturity and
 spend authority live in `artifacts/milestone_r1_verdict.json`. At R1 the status

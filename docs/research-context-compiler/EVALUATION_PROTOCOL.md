@@ -1,7 +1,10 @@
 # Evaluation Protocol — RCC latent experiments
 
-Version: 2026-08-27. Status: `VALID_EXPERIMENT_PENDING`;
-`PAID_SPEND_NOT_AUTHORIZED` per `artifacts/milestone_r1_verdict.json`.
+Version: 2026-08-27. Status: `ARCHIVED_PROTOCOL`. The original R1 gate was
+`VALID_EXPERIMENT_PENDING` / `PAID_SPEND_NOT_AUTHORIZED` per
+`artifacts/milestone_r1_verdict.json`; later bounded 2B experiments were
+separately authorized and ended with `NO_PROVEN_LATENT_REASONING_GAIN`.
+See [`LATENT_EXPERIMENT_STATUS.md`](LATENT_EXPERIMENT_STATUS.md).
 All benchmark results must embed a config manifest
 (model repo+revision, runtime versions, dtype, hardware, seeds, exact command)
 and be committed as machine-readable JSON under `latent_lab/bench/results/`

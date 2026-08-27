@@ -1,5 +1,8 @@
 # Development workflow
 
+> This repository is archived as a research record. The workflow below is kept
+> for reproducibility; no active roadmap is maintained.
+
 The repository stores product state and evidence; an external tool may schedule
 work, but the repository does not run its own agent queue or session loop.
 

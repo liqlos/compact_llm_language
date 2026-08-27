@@ -175,22 +175,26 @@ def test_checked_classification_is_exhaustive_and_matches_baseline_hashes():
     assert current == baseline
 
 
-def test_docs_make_invalidation_and_no_spend_status_explicit():
+def test_docs_make_final_negative_status_and_historical_invalidation_explicit():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     roadmap = (
         ROOT / "docs/research-context-compiler/LATENT_ROADMAP.md"
     ).read_text(encoding="utf-8")
+    status = (
+        ROOT / "docs/research-context-compiler/LATENT_EXPERIMENT_STATUS.md"
+    ).read_text(encoding="utf-8")
     no_spend = (ROOT / "docs/NO_SPEND_GATE.md").read_text(encoding="utf-8")
 
-    for text in (readme, roadmap, no_spend):
-        assert "PAID_SPEND_NOT_AUTHORIZED" in text
-        assert "artifacts/milestone_r1_verdict.json" in text
-    assert "VALID_EXPERIMENT_PENDING" in readme
+    assert "NO_PROVEN_LATENT_REASONING_GAIN" in readme
+    assert "IMPLEMENTED_AND_CONTROLLED" in readme
+    assert "NO_PROVEN_LATENT_REASONING_GAIN" in status
+    assert "53/224" in readme and "53/224" in status
+    assert "Archived 2026-08-27" in roadmap
     assert "IRRECOVERABLE_LEGACY_SCORER" in readme
-    assert "97/112" in readme and "84/112" in readme
-    assert "preview-only" in readme
+    assert "PAID_SPEND_NOT_AUTHORIZED" in readme
+    assert "artifacts/milestone_r1_verdict.json" in readme
+    assert "PAID_SPEND_NOT_AUTHORIZED" in no_spend
     assert "MODEL_MEASURED @ Qwen3.5-2B" not in readme
     assert "REJECTED_BY_EVIDENCE (capability limit)" not in readme
     assert "INVALIDATED HISTORICAL TEXT" in roadmap
-    assert "above-chance learning replicates across seeds" in roadmap
     assert "The historical paragraph below is preserved" in roadmap

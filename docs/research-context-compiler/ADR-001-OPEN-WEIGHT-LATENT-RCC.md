@@ -1,15 +1,15 @@
 # ADR-001: Open-Weight Latent RCC on Qwen3.8
 
-Status: ACCEPTED
+Status: SUPERSEDED_BY_NEGATIVE_PROXY_RESULT
 Date: 2026-08-22
 Supersedes: implicit direction of IMPLEMENTATION_PLAN.md phases 5–7 (textual
 machine dialects as end state).
 
-> **R1 evidence addendum (2026-08-27):** the architectural target remains a
-> hypothesis. Historical behavioral-v2 latent metrics and checkpoint selection
-> are invalidated; no proxy result currently permits scaling. The machine
-> verdict in `artifacts/milestone_r1_verdict.json` is
-> `PAID_SPEND_NOT_AUTHORIZED`.
+> **Final addendum (2026-08-27):** the later bounded Qwen3.5-2B experiments
+> produced no replicated latent-reasoning gain, so proxy failure stopped
+> scaling and superseded this direction. See
+> [`LATENT_EXPERIMENT_STATUS.md`](LATENT_EXPERIMENT_STATUS.md). Historical
+> behavioral-v2 metrics remain invalidated.
 
 ## Context
 
