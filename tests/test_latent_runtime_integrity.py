@@ -568,6 +568,7 @@ def test_counterfactual_margin_mode_config_and_recipe_are_sealed():
 def test_causal_workspace_config_recipe_and_legacy_m1_are_sealed():
     from latent_lab.backends.localized import WORKSPACE_LAYOUT
     from latent_lab.bench import latent_run
+    from latent_lab.bench.eval_v3 import canonical_sha256
     from latent_lab.train.checkpointing import (
         recipe_from_config, validate_recipe)
 
@@ -601,6 +602,22 @@ def test_causal_workspace_config_recipe_and_legacy_m1_are_sealed():
     legacy_recipe = recipe_from_config(legacy_cfg, SUITE_SHA)
     assert "workspace_slots" not in legacy_recipe
     assert validate_recipe(legacy_recipe) == legacy_recipe
+
+    # Frozen production ccbed14 identity: adding explicit workspace support
+    # must not silently rewrite the historical implicit-M=1 recipe.
+    ccbed14_suite = (
+        "5cf5cbf397510ba597b59f7ccf0839cf344e6fb795a5cb29d031f39dac218254")
+    ccbed14_recipe = recipe_from_config({
+        "mode": mode, "interval": [0, 24], "k": 4, "max_k": 16,
+        "lora_r": 8, "lora_alpha": 16.0, "lr": 5e-5, "steps": 280,
+        "seed": 0, "optimizer": "adamw", "weight_decay": 0.01,
+        "lr_schedule": "cosine", "warmup": 28, "clip": 0.5,
+        "detach_z0": False,
+    }, ccbed14_suite)
+    assert ccbed14_recipe["config_sha256"] == (
+        "c4af610962e5713cc2c3f9e35d6a3ad5096438c3ad0e23c5ab6a2f881ff9e903")
+    assert canonical_sha256(ccbed14_recipe) == (
+        "52d92357257393ccb0b0c6d878ce71490082ab9c622d860fba0a539a222fa448")
 
     workspace_contract = {
         **legacy_contract,

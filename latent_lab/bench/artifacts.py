@@ -159,13 +159,15 @@ def _check_revision(value, where: str) -> None:
     _check_sha(value, "identity.revision", where, length=_REV_HEX_LEN)
 
 
-def _validate_workspace_record_identity(cfg: dict, records, where: str) -> None:
+def _validate_workspace_record_identity(
+        cfg: dict, records, where: str, *, canonical_recipe=None) -> None:
     """Bind the persisted workspace layout to each raw v3 execution record.
 
     Old artifacts predate workspace metadata and remain implicit M=1.  New
     explicit configs must carry the same slots/layout in both recurrence and
-    measured-compute metadata; this closes config/record relabelling without
-    widening the historical v3 schema.
+    measured-compute metadata.  Whenever a complete canonical recipe is
+    available, every raw record must also carry its exact recipe hash; otherwise
+    config + recurrence + compute could be relabelled together.
     """
     from latent_lab.bench.latent_run import _workspace_slots_from_config
     from latent_lab.backends.localized import WORKSPACE_LAYOUT
@@ -176,6 +178,10 @@ def _validate_workspace_record_identity(cfg: dict, records, where: str) -> None:
         "workspace_slots": slots,
         "workspace_layout": WORKSPACE_LAYOUT,
     }
+    expected_recipe_hash = None
+    if canonical_recipe is not None:
+        from latent_lab.bench.eval_v3 import canonical_sha256
+        expected_recipe_hash = canonical_sha256(canonical_recipe)
     for index, record in enumerate(records or ()):
         if not isinstance(record, dict) or "recurrence_config" not in record:
             continue  # historical non-v3 eval evidence has no runtime record
@@ -184,6 +190,12 @@ def _validate_workspace_record_identity(cfg: dict, records, where: str) -> None:
         if not isinstance(recurrence, dict) or not isinstance(compute, dict):
             raise ValueError(
                 f"{where}: record[{index}] has invalid workspace evidence")
+        if expected_recipe_hash is not None \
+                and record.get("recipe_hash") != expected_recipe_hash:
+            raise ValueError(
+                f"{where}: record[{index}].recipe_hash "
+                f"{record.get('recipe_hash')!r} does not bind the canonical "
+                f"training recipe {expected_recipe_hash!r}")
         rec_projection = {
             key: recurrence.get(key)
             for key in expected if key in recurrence
@@ -359,7 +371,8 @@ def validate_run(run_dir, *, expected: dict | None = None) -> dict:
             if isinstance(entry, dict):
                 _validate_workspace_record_identity(
                     cfg, entry.get("records"),
-                    f"{where}: validation history[{history_index}]")
+                    f"{where}: validation history[{history_index}]",
+                    canonical_recipe=recipe)
         raw_selected_state_sha256 = selected_v3_adapter_state_sha256(
             report.get("val_history"), expected_step=report.get("best_step"),
             expected_metric=report.get("best_val_acc"))
@@ -746,6 +759,34 @@ def validate_eval(eval_path, *, expected: dict | None = None) -> dict:
     # EVERY duplicated semantic field must agree with this identity
     _reconcile_eval_identity(where, d, ident)
 
+    # Current eval payloads carry the complete training config.  Rebuild its
+    # canonical recipe so raw record.recipe_hash is anchored to config + suite.
+    # Historical partial/empty configs remain readable as implicit M=1, but an
+    # explicit workspace declaration is never allowed without a complete
+    # recipe identity.
+    eval_recipe = None
+    cfgp = d.get("config")
+    if isinstance(cfgp, dict):
+        from latent_lab.train.checkpointing import (
+            LEGACY_RECIPE_KEYS, recipe_from_config)
+        required = set(LEGACY_RECIPE_KEYS) - {
+            "suite_sha256", "config_sha256"}
+        complete = required <= set(cfgp)
+        explicit_workspace = bool(
+            {"workspace_slots", "workspace_layout"} & set(cfgp))
+        if explicit_workspace and not complete:
+            raise ValueError(
+                f"{where}: explicit workspace config has no complete "
+                "canonical training recipe")
+        if complete:
+            try:
+                eval_recipe = recipe_from_config(
+                    cfgp, ident["suite_sha256"])
+            except Exception as exc:
+                raise ValueError(
+                    f"{where}: config cannot bind a canonical training "
+                    f"recipe: {exc}") from exc
+
     results = d.get("results")
     if not isinstance(results, dict) or not results:
         raise ValueError(f"{where}: no results block")
@@ -754,7 +795,8 @@ def validate_eval(eval_path, *, expected: dict | None = None) -> dict:
         if isinstance(d.get("config"), dict):
             _validate_workspace_record_identity(
                 d["config"], res.get("records"),
-                f"{where}: results[{name!r}]")
+                f"{where}: results[{name!r}]",
+                canonical_recipe=eval_recipe)
     if ablation not in results:
         raise ValueError(
             f"{where}: identity.ablation {ablation!r} has no matching "

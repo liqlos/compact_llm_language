@@ -766,8 +766,28 @@ def _current_v3_eval_payload(**record_overrides):
     return payload, record, example
 
 
-def _explicit_workspace_v3_payload(*, record_slots=4, compute_slots=4):
+def _explicit_workspace_v3_payload(*, record_slots=4, compute_slots=4,
+                                   config_slots=4, recipe_slots=None):
+    from latent_lab.bench.eval_v3 import canonical_sha256
+
     _, base_record, _ = _current_v3_eval_payload()
+    config = fake_cfg(
+        mode="D-full+paired-delta+counterfactual-margin+recurrence-only-lora",
+        training_objective="counterfactual_margin",
+        paired_delta=True,
+        neutral_delta=True,
+        recurrence_only_lora=True,
+        trace_curriculum=False,
+        workspace_slots=config_slots,
+        workspace_layout="causal_last_slot_readout",
+    )
+    recipe_config = {
+        **config,
+        "workspace_slots": (config_slots if recipe_slots is None
+                            else recipe_slots),
+    }
+    recipe_hash = canonical_sha256(ckpt.recipe_from_config(
+        recipe_config, base_record["suite_identity"]["sha256"]))
     recurrence = {
         **base_record["recurrence_config"],
         "workspace_slots": record_slots,
@@ -779,18 +799,9 @@ def _explicit_workspace_v3_payload(*, record_slots=4, compute_slots=4):
         "workspace_layout": "causal_last_slot_readout",
     }
     payload, record, example = _current_v3_eval_payload(
-        recurrence_config=recurrence, compute=compute)
-    payload["config"] = {
-        "mode": "D-full+paired-delta+counterfactual-margin+recurrence-only-lora",
-        "training_objective": "counterfactual_margin",
-        "paired_delta": True,
-        "neutral_delta": True,
-        "recurrence_only_lora": True,
-        "trace_curriculum": False,
-        "k": 4,
-        "workspace_slots": 4,
-        "workspace_layout": "causal_last_slot_readout",
-    }
+        recurrence_config=recurrence, compute=compute,
+        recipe_hash=recipe_hash)
+    payload["config"] = config
     return payload, record, example
 
 
@@ -818,6 +829,42 @@ def test_validate_eval_binds_workspace_config_to_raw_execution(tmp_path):
         ckpt.atomic_write_json(ep, payload)
         with pytest.raises(ValueError, match="workspace identity mismatch"):
             artifacts.validate_eval(ep)
+
+    # A coordinated relabel of config + recurrence + compute is still false
+    # evidence when the raw record remains bound to the original M=4 recipe.
+    payload, _, _ = _explicit_workspace_v3_payload(
+        record_slots=1, compute_slots=1, config_slots=1, recipe_slots=4)
+    ckpt.atomic_write_json(ep, payload)
+    with pytest.raises(ValueError, match="recipe_hash.*canonical training recipe"):
+        artifacts.validate_eval(ep)
+
+
+def test_run_validator_binds_raw_history_to_canonical_recipe(tmp_path):
+    from latent_lab.bench.eval_v3 import aggregate_records, canonical_sha256
+    from latent_lab.train.checkpointing import (
+        RUN_MANIFEST_FILE, TRAIN_REPORT_FILE, atomic_write_json, sha256_file)
+
+    build_verified_run(tmp_path)
+    assert artifacts.validate_run(tmp_path)["status"] == "complete"
+
+    report_path = tmp_path / TRAIN_REPORT_FILE
+    report = json.loads(report_path.read_text())
+    records = report["val_history"][0]["records"]
+    for record in records:
+        record["recipe_hash"] = "ff" * 32
+        core = dict(record)
+        core.pop("record_sha256")
+        record["record_sha256"] = canonical_sha256(core)
+    report["val_history"][0]["metrics"] = aggregate_records(records)
+    atomic_write_json(report_path, report)
+
+    manifest_path = tmp_path / RUN_MANIFEST_FILE
+    manifest = json.loads(manifest_path.read_text())
+    manifest["report_sha256"] = sha256_file(report_path)
+    atomic_write_json(manifest_path, manifest)
+
+    with pytest.raises(ValueError, match="recipe_hash.*canonical training recipe"):
+        artifacts.validate_run(tmp_path)
 
 
 def test_validate_eval_rejects_relabelled_v3_ablation(tmp_path):
