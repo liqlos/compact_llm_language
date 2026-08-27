@@ -132,6 +132,7 @@ _TRAIN_CONFIG_KNOWN_KEYS = frozenset((
     "steps", "seed", "optimizer", "weight_decay", "lr_schedule",
     "warmup", "clip", "detach_z0", "grad_checkpoint", "model",
     "revision", "label", "device", "train_examples", "suite_sha256",
+    "recurrence_only_lora", "runtime_contract",
 ))
 
 
@@ -171,7 +172,8 @@ def validate_run(run_dir, *, expected: dict | None = None) -> dict:
     are rejected; nothing is silently ignored.
     """
     from latent_lab.bench.latent_run import (
-        recipe_from_config, selected_v3_adapter_state_sha256)
+        _recurrence_only_lora_from_config, recipe_from_config,
+        selected_v3_adapter_state_sha256)
     from latent_lab.train.checkpointing import (
         CHECKPOINT_FILE, TRAIN_REPORT_FILE, inspect_adapter_bundle,
         validate_selected_adapter_state_binding,
@@ -202,6 +204,11 @@ def validate_run(run_dir, *, expected: dict | None = None) -> dict:
         raise ValueError(
             f"{where}: unexpected config metadata {unknown_cfg}; "
             "identity/config fields are never ignored")
+    try:
+        _recurrence_only_lora_from_config(cfg)
+    except ValueError as e:
+        raise ValueError(
+            f"{where}: invalid adapter activation policy metadata: {e}") from e
 
     # canonical recipe rebuilt from the report's own config must equal
     # BOTH the report's bound recipe AND the manifest's bound recipe

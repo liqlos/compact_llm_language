@@ -423,7 +423,6 @@ def test_report_manifest_and_bundle_bind_one_canonical_recipe(tmp_path):
             == report["checkpoint_content_digest"])
     assert (manifest["selected_adapter_state_sha256"]
             == report["selected_adapter_state_sha256"])
-
     # tampering with the REPORT config breaks recipe binding everywhere
     from latent_lab.train.checkpointing import (
         RUN_MANIFEST_FILE,
@@ -452,6 +451,11 @@ def test_report_manifest_and_bundle_bind_one_canonical_recipe(tmp_path):
     atomic_write_json(manifest_path, d)
     with pytest.raises(Exception):
         artifacts.validate_run(tmp_path)
+
+
+def test_run_validator_recognizes_sealed_adapter_activation_metadata():
+    assert {"recurrence_only_lora", "runtime_contract"} <= \
+        artifacts._TRAIN_CONFIG_KNOWN_KEYS
 
 
 def test_valid_but_different_bundle_cannot_claim_selected_raw_history(
