@@ -64,9 +64,10 @@ def test_full_decoder_candidate_matches_independent_incremental_oracle():
 
     details, report = runtime.score_candidates(prompt, [candidate], k_steps=2)
 
-    # Independent answer scorer: recurrence establishes the state/cache, then
-    # the public decoder's incremental API consumes every preceding answer
-    # token.  It deliberately does not call the runtime scoring helper.
+    # Independent answer scorer: recurrence establishes the state/cache and a
+    # fixed carrier.  Each preceding answer token traverses the full decoder,
+    # with the carrier added at the interval output-boundary.  It deliberately
+    # does not call the runtime scoring helper.
     with torch.no_grad():
         cache, state = runtime._encode(prompt)
         state, position = runtime.latent_steps(
@@ -76,14 +77,22 @@ def test_full_decoder_candidate_matches_independent_incremental_oracle():
         expected.append(float(torch.log_softmax(logits.float(), -1)[0, 0, candidate[0]]))
         for previous, target in zip(candidate, candidate[1:]):
             embedded = model.model.embed_tokens(torch.tensor([[previous]]))
-            output = model.model(
-                inputs_embeds=embedded,
-                past_key_values=cache,
-                use_cache=True,
-                position_ids=torch.tensor([[position]]),
-            )
+            position_rows = torch.full(
+                (4, 1, 1), position, device=embedded.device, dtype=torch.long)
+            rotary = model.model.rotary_emb(embedded, position_rows[1:])
+            hidden = embedded
+            for layer in model.model.layers:
+                hidden = layer(
+                    hidden,
+                    position_embeddings=rotary,
+                    attention_mask=None,
+                    position_ids=position_rows[0],
+                    past_key_values=cache,
+                    use_cache=True,
+                )
+            hidden = hidden + state
             position += 1
-            logits = model.lm_head(output.last_hidden_state[:, -1:, :])
+            logits = model.lm_head(model.model.norm(hidden[:, -1:, :]))
             expected.append(float(torch.log_softmax(logits.float(), -1)[0, 0, target]))
 
     assert details[0].token_logprobs == pytest.approx(expected, abs=0.0, rel=0.0)
@@ -118,6 +127,38 @@ def test_hidden_chain_bptt_is_live_while_cache_recurrence_is_detached():
     assert all(torch.isfinite(gradient).all() for gradient in trainable_grads)
     assert any(torch.count_nonzero(gradient).item() > 0
                for gradient in trainable_grads)
+
+
+def test_later_token_only_loss_has_live_carrier_and_recurrence_lora_gradient():
+    runtime = LocalizedRecurrence(
+        _tiny_model(seed=39), interval=(1, 3), max_k=2, lora_r=2,
+        use_clock=False, recurrence_only_lora=True)
+    prompt = torch.tensor([[2, 3, 5, 7]])
+    answer = torch.tensor([[11, 13, 17]])
+
+    cache, state = runtime._encode(prompt, grad=True)
+    carrier, position = runtime.latent_steps(
+        state, cache, prompt.shape[1], 1, grad=True)
+    carrier.retain_grad()
+    token_logprobs, _ = runtime._score_candidate_tokens(
+        carrier, cache, position, answer, grad=True)
+    later_token_loss = -token_logprobs[1:].mean()
+
+    assert later_token_loss.requires_grad
+    later_token_loss.backward()
+    assert carrier.grad is not None
+    assert torch.isfinite(carrier.grad).all()
+    assert torch.count_nonzero(carrier.grad).item() > 0
+    lora_gradients = [
+        parameter.grad
+        for adapter in runtime.injected
+        for parameter in (adapter.lora_A, adapter.lora_B)
+        if parameter.grad is not None
+    ]
+    assert lora_gradients
+    assert all(torch.isfinite(gradient).all() for gradient in lora_gradients)
+    assert any(torch.count_nonzero(gradient).item() > 0
+               for gradient in lora_gradients)
 
 
 def test_gold_loss_has_finite_gradients_for_multitoken_answer():

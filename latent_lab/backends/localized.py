@@ -632,6 +632,11 @@ class LocalizedRecurrence:
             next_pos = pos
             readout_tail_layers = 0
 
+        # Keep a live, fixed readout carrier from the completed recurrence.  The
+        # first answer token keeps the established direct readout above; every
+        # later token re-enters the decoder from embeddings and receives this
+        # carrier at the same output-boundary where recurrence produced it.
+        carrier = z
         token_logprobs = []
         for token_index in range(candidate_ids.shape[1]):
             logits = self.logits_from_hidden(current[:, -1:, :])
@@ -644,7 +649,11 @@ class LocalizedRecurrence:
             hidden = self.base.embed_tokens(previous)
             with self._lora_scope(False):
                 current = self._run_layers(
-                    range(self.n_layers), hidden, cache, next_pos, grad=grad)
+                    range(hi), hidden, cache, next_pos, grad=grad)
+                current = current + carrier
+                current = self._run_layers(
+                    range(hi, self.n_layers), current, cache, next_pos,
+                    grad=grad)
             next_pos += 1
 
         return torch.stack(token_logprobs), {
