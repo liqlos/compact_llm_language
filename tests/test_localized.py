@@ -49,8 +49,7 @@ INTERVAL = (1, 3)
 @pytest.fixture(scope="module")
 def rec(tiny):
     model, tok = tiny
-    return LocalizedRecurrence(model, tok, interval=INTERVAL, max_k=4,
-                               grad_checkpoint=False)
+    return LocalizedRecurrence(model, tok, interval=INTERVAL, max_k=4)
 
 
 def test_manual_composition_bit_exact(rec):
@@ -96,7 +95,7 @@ def test_full_interval_matches_public_incremental_path(tiny):
     model, tok = build_tiny_hybrid()  # fresh: binding is exclusive
     L = model.config.num_hidden_layers
     lr = LocalizedRecurrence(model, tok, interval=(0, L), max_k=4,
-                             use_clock=False, grad_checkpoint=False, lora_r=2)
+                             use_clock=False, lora_r=2)
     ids = torch.randint(0, 250, (1, 6))
     t = ids.shape[1]
     with torch.no_grad():
@@ -150,8 +149,7 @@ def test_guard_catches_lm_head_inside_loop(tiny, rec, monkeypatch):
 def test_lora_freeze_and_zero_init_identity():
     # fresh model: a LocalizedRecurrence binds its host exclusively
     model, tok = build_tiny_hybrid()
-    rec2 = LocalizedRecurrence(model, tok, interval=INTERVAL, max_k=4,
-                               grad_checkpoint=False)
+    rec2 = LocalizedRecurrence(model, tok, interval=INTERVAL, max_k=4)
     trainable = {id(p) for p in rec2.trainable_parameters()}
     n_lora = 0
     for n, p in rec2.model.named_parameters():
@@ -193,5 +191,7 @@ def test_rank_candidates_mechanics(rec):
     expected = sorted(range(3), key=lambda i: -scores[i])
     assert order == expected
     assert rep.k_steps == 1
-    # one lm_head CALL per candidate (both token positions scored in it)
-    assert rec.guard.lm_head_calls - lm_before == len(cands)
+    # Autoregressive evidence records one output-head call per scored token.
+    assert rec.guard.lm_head_calls - lm_before == sum(map(len, cands))
+    assert rep.extra["candidate_token_counts"] == [2, 2, 2]
+    assert rep.extra["candidate_raw_sum_logprobs"] == scores

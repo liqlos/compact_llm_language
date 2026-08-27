@@ -163,7 +163,7 @@ def _nonzero_adapted_rec(model, seed: int = 5, interval=None):
     interval = interval or (0, model.config.num_hidden_layers)
     rec = LocalizedRecurrence(
         model, None, interval=interval,
-        max_k=4, lora_r=4, lora_alpha=8, grad_checkpoint=False)
+        max_k=4, lora_r=4, lora_alpha=8)
     g = torch.Generator().manual_seed(seed)
     with torch.no_grad():
         for l in rec.injected:
@@ -907,7 +907,7 @@ def test_cached_localized_full_equivalence_across_fp32_roundtrip(
 
     rec2 = LocalizedRecurrence(_tiny_qwen35(11, layers), None,
                                interval=interval, max_k=4, lora_r=4,
-                               lora_alpha=8, grad_checkpoint=False)
+                               lora_alpha=8)
     wrong_rev_kwargs = dict(model_id="tiny-qwen35", revision=REV_B,
                             config=cfg)
     with pytest.raises(AdapterBundleIdentityError):
