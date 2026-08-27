@@ -157,7 +157,10 @@ class VocabGuard:
 
 LORA_TARGET_SUFFIXES = (
     "q_proj", "k_proj", "v_proj", "o_proj",
-    "in_proj", "out_proj", "in_proj_qkvz", "in_proj_ba",
+    # Qwen3.5 GatedDeltaNet projections in transformers>=5.3.
+    "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj",
+    # Retain the earlier fused spellings for compatible Qwen revisions.
+    "in_proj", "in_proj_qkvz", "in_proj_ba",
 )
 
 _Base = torch.nn.Module if torch is not None else object
@@ -234,7 +237,8 @@ def make_step_clock(hidden: int, max_k: int, device=None):
 
 CLOCK_MODES = ("identity", "off", "reverse")
 KNOWN_ABLATION_KEYS = ("zero_state", "noise_state", "noise_seed", "clocks",
-                       "bypass_interval", "truncate_k", "swap_state")
+                       "bypass_interval", "truncate_k", "swap_state",
+                       "reset_state")
 
 
 def parse_clock_mode(mode, k_steps: int):
@@ -289,6 +293,18 @@ def validate_ablation(ablate, k_steps: int) -> dict:
         raise ValueError(f"truncate_k must be an int in [0, {k_steps}]")
     if "zero_state" in ab and not isinstance(ab["zero_state"], bool):
         raise ValueError("zero_state must be a boolean")
+    if "reset_state" in ab and not isinstance(ab["reset_state"], bool):
+        raise ValueError("reset_state must be a boolean")
+    for key in ("noise_state", "swap_state"):
+        if key in ab and not isinstance(ab[key], bool):
+            raise ValueError(f"{key} must be a boolean")
+    active_state_controls = [
+        key for key in ("zero_state", "noise_state", "swap_state",
+                        "reset_state") if ab.get(key)]
+    if len(active_state_controls) > 1:
+        raise ValueError(
+            f"state interventions are mutually exclusive: "
+            f"{active_state_controls}")
     if "bypass_interval" in ab \
             and not isinstance(ab["bypass_interval"], bool):
         raise ValueError("bypass_interval must be a boolean")
@@ -328,7 +344,7 @@ class CandidateScoreDetail:
 class LocalizedRecurrence:
     """Frozen-backbone localized recurrence with guarded latent loop."""
 
-    RUNTIME_CONTRACT_VERSION = "localized_recurrence.runtime.v1"
+    RUNTIME_CONTRACT_VERSION = "localized_recurrence.runtime.v2"
     TRAINING_GRADIENT_SEMANTICS = (
         "hidden_state_chain_bptt_with_detached_cache_recurrence"
     )
@@ -446,7 +462,13 @@ class LocalizedRecurrence:
         return h
 
     def _encode(self, input_ids_or_emb, *, grad=False):
-        """Full decoder pass; returns (cache, pre-norm last-position hidden)."""
+        """Prefill the full cache and return the interval-boundary state.
+
+        Localized recurrence must start/read out at the interval's output
+        boundary.  Returning the final decoder state here would feed a
+        final-layer representation back into middle layers and would also
+        make K=0 re-apply the tail to an already-final state.
+        """
         from transformers import DynamicCache
         cache = DynamicCache(config=self.config)
         emb = (input_ids_or_emb if not torch.is_tensor(input_ids_or_emb)
@@ -454,9 +476,13 @@ class LocalizedRecurrence:
                else self.base.embed_tokens(input_ids_or_emb))
         ctx = contextlib.nullcontext() if grad else torch.no_grad()
         with ctx:
-            h = self._run_layers(range(self.n_layers), emb, cache, 0,
+            hi = self.interval[1]
+            h = self._run_layers(range(hi), emb, cache, 0, grad=grad)
+            boundary = h[:, -1:, :]
+            if hi < self.n_layers:
+                self._run_layers(range(hi, self.n_layers), h, cache, 0,
                                  grad=grad)
-        return cache, h[:, -1:, :]
+        return cache, boundary
 
     # -- stages ----------------------------------------------------------------
 
@@ -465,31 +491,22 @@ class LocalizedRecurrence:
         """Apply the interval K times; GUARDED: no vocab/tokenizer activity.
 
         ablate keys (strictly validated; unknown keys/modes are fatal):
-          zero_state         -> incoming z zeroed AND all prompt-derived
-                                cache state (conv/recurrent/KV) zeroed,
-                                so no prompt latent survives the reset
+          zero_state         -> post-recurrence readout carrier z zeroed
+          noise_state        -> post-recurrence readout carrier replaced by
+                                deterministic norm-matched noise
           clocks             -> "identity"|"off"|"reverse"|
                                 "shuffle_perm:i,j,.." (full unique perm of
                                 range(k_steps); compute-matched)
           bypass_interval    -> interval layers replaced by identity
           truncate_k         -> effective step count reduced
-          swap/noise         -> performed by caller replacing z beforehand
+          swap_state         -> caller replaces post-recurrence z with the
+                                partner's post-recurrence carrier
+          reset_state        -> caller restores z0 after compute-matched loop
         """
         if isinstance(k_steps, bool) or not isinstance(k_steps, int) \
                 or not 0 <= k_steps <= self.max_k:
             raise ValueError(f"k_steps must be an int in [0, {self.max_k}]")
         ab = validate_ablation(ablate, k_steps)
-        if ab.get("zero_state"):
-            from ..backends.hf_qwen import cache_zero_prompt_state
-            z = torch.zeros_like(z)
-            cache_zero_prompt_state(cache)  # erase ALL prompt-derived state
-        if ab.get("noise_state"):
-            g = torch.Generator(device=z.device.type)
-            g.manual_seed(int(ab.get("noise_seed", 1234)))
-            n = torch.randn(z.shape, generator=g, device=z.device,
-                            dtype=torch.float32).to(z.dtype)
-            n = n / (n.norm() + 1e-8) * (z.norm() + 1e-8)
-            z = n
         mode = ab.get("clocks", "identity")
         eff_k = min(int(ab.get("truncate_k", k_steps)), k_steps)
         # validated against the FULL requested loop; truncation is explicit
@@ -509,6 +526,18 @@ class LocalizedRecurrence:
                     z = self._run_layers(range(lo, hi), zz, cache, pos,
                                          grad=grad)
                 pos += 1
+        # Causal state interventions happen after the requested recurrence,
+        # immediately before readout.  Ablating z0 would let the loop rebuild
+        # information from the prompt cache and could falsely look state-free.
+        if ab.get("zero_state"):
+            z = torch.zeros_like(z)
+        if ab.get("noise_state"):
+            g = torch.Generator(device=z.device.type)
+            g.manual_seed(int(ab.get("noise_seed", 1234)))
+            n = torch.randn(z.shape, generator=g, device=z.device,
+                            dtype=torch.float32).to(z.dtype)
+            n = n / (n.norm() + 1e-8) * (z.norm() + 1e-8)
+            z = n
         return z, pos
 
     def logits_from_hidden(self, h_prenorm):
@@ -579,17 +608,55 @@ class LocalizedRecurrence:
         gen0 = self.guard.generate_calls
         decode0 = (self.guard.tokenizer_operations["decode"]
                    + self.guard.tokenizer_operations["batch_decode"])
+        cuda_device = (input_ids.device
+                       if input_ids.device.type == "cuda" else None)
+        if cuda_device is not None:
+            torch.cuda.synchronize(cuda_device)
+            torch.cuda.reset_peak_memory_stats(cuda_device)
         t0 = time.perf_counter()
-        source_ids = (partner_input_ids
-                      if partner_input_ids is not None else input_ids)
-        cache, z0 = self._encode(source_ids)
-        loop_start = source_ids.shape[1]
-        t1 = time.perf_counter()
         ab = validate_ablation(ablate or {}, k_steps)
+        if ab.get("swap_state") and partner_input_ids is None:
+            raise ValueError(
+                "swap_state requires partner_input_ids; refusing a mislabeled "
+                "clean run")
+        if partner_input_ids is not None and not ab.get("swap_state"):
+            raise ValueError(
+                "partner_input_ids requires swap_state; refusing an unlabeled "
+                "state intervention")
+
+        # Cache/prompt context always belongs to the evaluated example.
+        # State interventions replace only the post-recurrence readout carrier;
+        # target recurrence cache remains fixed across clean/zero/noise/swap.
+        cache, z0 = self._encode(input_ids)
+        partner_prefill_tokens = 0
+        state_intervention = bool(
+            ab.get("zero_state") or ab.get("noise_state")
+            or ab.get("swap_state") or ab.get("reset_state"))
+        loop_start = input_ids.shape[1]
+        partner_cache = None
+        partner_z0 = None
         if partner_input_ids is not None:
-            ab["swap_state"] = True
-        z, pos = self.latent_steps(z0, cache, loop_start, k_steps,
-                                   ablate=ab)
+            partner_cache, partner_z0 = self._encode(partner_input_ids)
+            partner_prefill_tokens = int(partner_input_ids.shape[1])
+        if cuda_device is not None:
+            torch.cuda.synchronize(cuda_device)
+        t1 = time.perf_counter()
+
+        z, pos = self.latent_steps(
+            z0, cache, loop_start, k_steps, ablate=ab)
+        if partner_input_ids is not None:
+            partner_ab = dict(ab)
+            partner_ab.pop("swap_state", None)
+            partner_z, _partner_pos = self.latent_steps(
+                partner_z0, partner_cache, partner_input_ids.shape[1],
+                k_steps, ablate=partner_ab)
+            z = partner_z
+        if ab.get("reset_state"):
+            # Position/compute-matched no-recurrence carrier control: execute
+            # the full loop, then discard zK and read out the original z0.
+            z = z0
+        if cuda_device is not None:
+            torch.cuda.synchronize(cuda_device)
         t2 = time.perf_counter()
         snap = cache_snapshot(cache)
         details = []
@@ -617,14 +684,19 @@ class LocalizedRecurrence:
                 length_normalized_logprob=raw_sum / len(token_logprobs),
             ))
             candidate_compute.append(counters)
+        if cuda_device is not None:
+            torch.cuda.synchronize(cuda_device)
         t3 = time.perf_counter()
 
         effective_k = min(int(ab.get("truncate_k", k_steps)), k_steps)
-        recurrence_apps = (
+        recurrence_multiplier = 2 if partner_input_ids is not None else 1
+        recurrence_apps = recurrence_multiplier * (
             0 if ab.get("bypass_interval") else
             (self.interval[1] - self.interval[0]) * effective_k
         )
-        prefill_apps = self.n_layers * int(source_ids.shape[1])
+        target_prefill_tokens = int(input_ids.shape[1])
+        prefill_apps = self.n_layers * (
+            target_prefill_tokens + partner_prefill_tokens)
         readout_tail_apps = sum(
             item["readout_tail_layer_applications"]
             for item in candidate_compute)
@@ -635,11 +707,18 @@ class LocalizedRecurrence:
         total_apps = prefill_apps + recurrence_apps + candidate_apps
 
         raw_sums = [detail.raw_sum_logprob for detail in details]
+        if cuda_device is not None:
+            peak_memory_bytes = int(
+                torch.cuda.max_memory_allocated(cuda_device))
+        else:
+            # Torch exposes no resettable MPS peak allocator counter.  Do not
+            # mislabel a current-allocation/RSS sample as peak VRAM.
+            peak_memory_bytes = None
         wall_seconds = t3 - t0
         measured_compute = {
             "prefill_layers": prefill_apps,
             "recurrence_interval_applications": recurrence_apps,
-            "k_loops": effective_k,
+            "k_loops": recurrence_multiplier * effective_k,
             "candidate_tail_layers": candidate_apps,
             "lm_head_calls": self.guard.lm_head_calls - lm0,
             "tokenizer_calls": self.guard.tokenizer_calls - tk0,
@@ -647,7 +726,7 @@ class LocalizedRecurrence:
                 self.guard.tokenizer_operations["decode"]
                 + self.guard.tokenizer_operations["batch_decode"] - decode0),
             "wall_seconds": wall_seconds,
-            "peak_memory_bytes": None,
+            "peak_memory_bytes": peak_memory_bytes,
             "successful_task": True,
         }
         rep = RecurrenceReport(
@@ -669,7 +748,15 @@ class LocalizedRecurrence:
                 "candidate_raw_sum_logprobs": raw_sums,
                 "candidate_length_normalized_logprobs": [
                     detail.length_normalized_logprob for detail in details],
-                "prefill_tokens": int(source_ids.shape[1]),
+                "prefill_tokens": target_prefill_tokens,
+                "partner_state_prefill_tokens": partner_prefill_tokens,
+                "latent_state_source": (
+                    "partner" if partner_input_ids is not None else "target"),
+                "prompt_cache_source": "target",
+                "latent_state_ablation_stage": (
+                    "post_recurrence_readout" if state_intervention else None),
+                "recurrence_cache_at_readout": (
+                    "prompt_plus_target_recurrence"),
                 "prefill_layer_applications": prefill_apps,
                 "recurrence_interval_layer_applications": recurrence_apps,
                 "recurrence_effective_k": effective_k,
@@ -740,11 +827,20 @@ class LocalizedRecurrence:
     def loss_on_example(self, input_ids, answer_ids, k_steps, *,
                         ablate=None, detach_z0=False):
         """Teacher-forced CE on gold answer tokens appended after the loop."""
+        from ..backends.hf_qwen import cache_restore, cache_snapshot
+
+        ab = validate_ablation(ablate or {}, k_steps)
+        if ab.get("swap_state"):
+            raise ValueError("swap_state training requires an explicit partner")
         cache, z0 = self._encode(input_ids, grad=True)
         if detach_z0:
             z0 = z0.detach()
+        state_intervention = bool(ab.get("zero_state") or ab.get("noise_state"))
+        prompt_cache = cache_snapshot(cache) if state_intervention else None
         z, pos = self.latent_steps(z0, cache, input_ids.shape[1], k_steps,
-                                   grad=True, ablate=ablate)
+                                   grad=True, ablate=ab)
+        if prompt_cache is not None:
+            cache_restore(cache, prompt_cache)
         token_logprobs, _counters = self._score_candidate_tokens(
             z, cache, pos, answer_ids, grad=True)
         return -token_logprobs.mean()

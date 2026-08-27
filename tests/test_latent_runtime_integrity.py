@@ -189,6 +189,64 @@ def _cached_matches_full(rec, k=2) -> tuple:
     return order, scores
 
 
+def test_training_seed_is_set_before_model_and_lora_construction(
+        monkeypatch, tmp_path):
+    import random
+
+    from latent_lab.bench import latent_run
+
+    seed = 731
+    expected_python = random.Random(seed).random()
+    observed = {}
+
+    def stop_at_model_load(device, model_id, revision):
+        observed["torch_seed"] = torch.initial_seed()
+        observed["python_draw"] = random.random()
+        raise RuntimeError("seed-observed")
+
+    monkeypatch.setattr(latent_run, "load_model", stop_at_model_load)
+    args = SimpleNamespace(seed=seed, model="tiny-qwen35")
+    with pytest.raises(RuntimeError, match="seed-observed"):
+        latent_run._train_inner(args, tmp_path, "cpu", REV_A)
+
+    assert observed["torch_seed"] == seed
+    assert observed["python_draw"] == expected_python
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_qwen35_lora_targets_cover_real_attention_and_gdn_projections():
+    model = _tiny_qwen35(11, 4)
+    rec = LocalizedRecurrence(
+        model, None, interval=(0, 4), max_k=1, lora_r=2, lora_alpha=4)
+    for layer_type, layer in zip(rec.layer_types, rec.base.layers):
+        names = {
+            name.rsplit(".", 1)[-1]
+            for name, module in layer.named_modules()
+            if isinstance(module, LoRALinear)
+        }
+        if layer_type == "linear_attention":
+            assert {"in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b",
+                    "out_proj"} <= names
+        else:
+            assert {"q_proj", "k_proj", "v_proj", "o_proj"} <= names
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_encode_returns_interval_boundary_not_final_decoder_state():
+    from transformers import DynamicCache
+
+    rec = _nonzero_adapted_rec(_tiny_qwen35(11, 6), interval=(2, 4))
+    with torch.no_grad():
+        _cache, actual = rec._encode(_IDS)
+        cache = DynamicCache(config=rec.config)
+        h = rec.base.embed_tokens(_IDS)
+        h = rec._run_layers(range(4), h, cache, 0)
+        expected = h[:, -1:, :]
+        final = rec._run_layers(range(4, 6), h, cache, 0)[:, -1:, :]
+    assert torch.equal(actual, expected)
+    assert not torch.equal(actual, final)
+
+
 # ---------------------------------------------------------------------------
 # best-checkpoint tracking (finite metric only; strict step schema)
 # ---------------------------------------------------------------------------
@@ -959,6 +1017,8 @@ def test_ablation_parsers_reject_unknown_modes():
         validate_ablation({"truncate_k": 99}, 4)
     with pytest.raises(ValueError):
         validate_ablation({"clocks": "sideways"}, 4)
+    assert validate_ablation({"reset_state": True}, 4) == {
+        "reset_state": True}
 
 
 def test_shuffle_requires_full_unique_compute_matched_permutation():
@@ -978,10 +1038,9 @@ def test_shuffle_requires_full_unique_compute_matched_permutation():
 
 
 @pytest.mark.filterwarnings("ignore")
-def test_zero_state_resets_all_prompt_derived_cache_state():
-    """The zero_state claim is exact: prompt z AND every conv/recurrent/KV
-    storage entry derived from the prompt are zeroed before the loop."""
-    from latent_lab.backends.hf_qwen import cache_snapshot
+def test_zero_state_zeros_only_latent_carrier_and_preserves_prompt_cache():
+    """zero_state isolates z; prompt/cache context must remain unchanged."""
+    from latent_lab.backends.hf_qwen import cache_snapshot, trees_equal
 
     pytest.importorskip("transformers")
     rec = _nonzero_adapted_rec(_tiny_qwen35(11, 6))
@@ -1002,25 +1061,75 @@ def test_zero_state_resets_all_prompt_derived_cache_state():
 
     with torch.no_grad():
         cache, z0 = rec._encode(_IDS)
-        assert any(float(t.abs().sum()) > 0 for t in _all_storage_tensors(
-            cache_snapshot(cache))), "test needs populated prompt cache"
+        before = cache_snapshot(cache)
+        assert any(float(t.abs().sum()) > 0
+                   for t in _all_storage_tensors(before)), \
+            "test needs populated prompt cache"
         assert float(z0.abs().sum()) > 0
-        rec.latent_steps(z0, cache, _IDS.shape[1], 0,
-                         ablate={"zero_state": True})
-        # K=0: nothing rewrote the cache after the reset -> all-zero proof
-        for t in _all_storage_tensors(cache_snapshot(cache)):
-            assert float(t.abs().sum()) == 0.0, \
-                "prompt-derived state survived the zero_state reset"
+        z, _ = rec.latent_steps(z0, cache, _IDS.shape[1], 0,
+                                ablate={"zero_state": True})
+        after = cache_snapshot(cache)
+    assert torch.count_nonzero(z) == 0
+    assert trees_equal(before, after), "zero_state mutated target prompt cache"
 
-    # behavioral: with prompt-derived state erased, two DIFFERENT prompts of
-    # equal length produce IDENTICAL candidate scores
-    ids_a = torch.tensor([[7, 11, 13, 5, 200, 3]])
-    ids_b = torch.tensor([[42, 2, 99, 8, 201, 4]])
-    _, sa, _ = rec.rank_candidates(ids_a, _CANDS, 2,
-                                   ablate={"zero_state": True})
-    _, sb, _ = rec.rank_candidates(ids_b, _CANDS, 2,
-                                   ablate={"zero_state": True})
-    assert sa == sb, "zero_state left prompt-identifying information"
+
+@pytest.mark.filterwarnings("ignore")
+def test_swap_state_uses_partner_carrier_with_target_prompt_cache():
+    from latent_lab.backends.hf_qwen import cache_restore, cache_snapshot
+
+    rec = _nonzero_adapted_rec(_tiny_qwen35(11, 6), interval=(2, 4))
+    target = torch.tensor([[7, 11, 13, 5, 200, 3]])
+    partner = torch.tensor([[42, 2, 99, 8, 201, 4, 17]])
+    with torch.no_grad():
+        target_cache, target_z = rec._encode(target)
+        partner_cache, partner_z = rec._encode(partner)
+        _target_final, pos = rec.latent_steps(
+            target_z, target_cache, target.shape[1], 2)
+        z, _partner_pos = rec.latent_steps(
+            partner_z, partner_cache, partner.shape[1], 2)
+        snap = cache_snapshot(target_cache)
+        manual = []
+        for candidate in _CANDS:
+            cache_restore(target_cache, snap)
+            ids = torch.tensor([candidate])
+            token_logprobs, _ = rec._score_candidate_tokens(
+                z, target_cache, pos, ids)
+            manual.append(float(token_logprobs.sum()))
+
+    _order, actual, report = rec.rank_candidates(
+        target, _CANDS, 2, ablate={"swap_state": True},
+        partner_input_ids=partner)
+    assert torch.allclose(torch.tensor(actual), torch.tensor(manual), atol=1e-6)
+    assert report.extra["latent_state_source"] == "partner"
+    assert report.extra["prompt_cache_source"] == "target"
+    assert report.extra["partner_state_prefill_tokens"] == partner.shape[1]
+    assert report.extra["latent_state_ablation_stage"] == \
+        "post_recurrence_readout"
+    assert report.extra["recurrence_cache_at_readout"] == \
+        "prompt_plus_target_recurrence"
+
+    with pytest.raises(ValueError, match="requires partner_input_ids"):
+        rec.rank_candidates(target, _CANDS, 2, ablate={"swap_state": True})
+    with pytest.raises(ValueError, match="requires swap_state"):
+        rec.rank_candidates(target, _CANDS, 2, partner_input_ids=partner)
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_readout_reset_is_compute_and_position_matched_but_restores_z0():
+    rec = _nonzero_adapted_rec(_tiny_qwen35(11, 6), interval=(2, 4))
+    _clean_order, clean_scores, clean_report = rec.rank_candidates(
+        _IDS, _CANDS, 2)
+    _reset_order, reset_scores, reset_report = rec.rank_candidates(
+        _IDS, _CANDS, 2, ablate={"reset_state": True})
+
+    assert reset_report.extra["recurrence_effective_k"] == 2
+    assert (reset_report.extra["recurrence_interval_layer_applications"]
+            == clean_report.extra["recurrence_interval_layer_applications"])
+    assert reset_report.extra["latent_state_ablation_stage"] == \
+        "post_recurrence_readout"
+    assert reset_report.extra["recurrence_cache_at_readout"] == \
+        "prompt_plus_target_recurrence"
+    assert reset_scores != clean_scores
 
 
 # ---------------------------------------------------------------------------

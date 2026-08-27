@@ -32,8 +32,8 @@ DEFAULT_MODEL_ID = "Qwen/Qwen3.5-2B"
 DEFAULT_REVISION = "15852e8c16360a2fea060d615a32b45270f8a8fc"
 
 EVAL_ABLATIONS = ("zero_state", "bypass_interval", "clocks_off",
-                  "reverse_clocks", "truncate_half", "swap_state",
-                  "noise_state")
+                   "reverse_clocks", "truncate_half", "swap_state",
+                   "noise_state", "readout_reset_to_z0")
 
 
 def interval_from_spec(spec: str, n_layers: int) -> tuple[int, int]:
@@ -53,7 +53,10 @@ ANSWER_PREFIX = " "  # prompt ends with "Answer:" -> continuation " <ans>"
 
 
 def peak_rss_mib() -> float:
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2 ** 20
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # macOS reports bytes; Linux reports KiB.
+    peak_bytes = peak if sys.platform == "darwin" else peak * 1024
+    return peak_bytes / 2 ** 20
 
 
 def _gpu_mem_report(device: str) -> dict:
@@ -764,6 +767,8 @@ def cmd_train(args):
 
 
 def _train_inner(args, out: Path, device: str, revision: str):
+    import random
+
     import torch
 
     from latent_lab.backends.localized import LocalizedRecurrence
@@ -771,6 +776,13 @@ def _train_inner(args, out: Path, device: str, revision: str):
     from latent_lab.train.checkpointing import (
         BestCheckpointTracker, adapter_state_sha256,
         guarded_optimizer_step, sha256_file, write_train_generation)
+
+    # Seed before every stochastic construction: model load, LoRA init,
+    # optimizer creation, and the torch.randperm training shuffle.
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     model, tok = load_model(device, args.model, revision)
     interval = interval_from_spec(
@@ -1006,6 +1018,8 @@ def normalize_ablation(name, k_steps=None):
         return {"clocks": f"shuffle_perm:{perm}"}  # validated downstream
     if name == "truncate_half":
         return {"truncate_k": max(0, k_steps // 2)}
+    if name == "readout_reset_to_z0":
+        return {"reset_state": True}
     if name in ("zero_state", "bypass_interval", "swap_state", "noise_state"):
         return {name: True}
     raise ValueError(

@@ -53,6 +53,7 @@ def _compute(**over):
 def _metadata(
     *,
     example_id="e0",
+    prompt=None,
     family="fsm",
     candidates=("A", "B", "C"),
     gold_answer="B",
@@ -79,7 +80,7 @@ def _metadata(
         "example_id": example_id,
         "split": split,
         "family": family,
-        "prompt": f"prompt:{example_id}",
+        "prompt": prompt or f"prompt:{example_id}",
         "candidates": candidates,
         "candidate_permutation_seed": candidate_permutation_seed,
         "candidate_permutation": candidate_permutation,
@@ -364,6 +365,22 @@ def test_paired_bootstrap_is_deterministic_and_requires_identical_examples():
         paired_comparison(treatment, control[:1])
     with pytest.raises(EvalV3Error, match="duplicate example_id"):
         paired_comparison(treatment + treatment[:1], control)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "field"),
+    [
+        ({"prompt": "different prompt"}, "prompt_hash"),
+        ({"candidate_permutation_seed": 99}, "candidate_permutation_seed"),
+        ({"candidate_permutation": (2, 1, 0)}, "candidate_permutation"),
+    ],
+)
+def test_paired_bootstrap_rejects_mismatched_prompt_or_permutation(
+        overrides, field):
+    treatment = [_record(example_id="a")]
+    control = [_record(example_id="a", **overrides)]
+    with pytest.raises(EvalV3Error, match=field):
+        paired_comparison(treatment, control, bootstrap_samples=10)
 
 
 def test_selector_accepts_only_canonical_summaries_and_earliest_tie():

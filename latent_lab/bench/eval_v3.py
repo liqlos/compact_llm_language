@@ -831,7 +831,11 @@ def paired_comparison(
     ids = sorted(treatment)
     for example_id in ids:
         left, right = treatment[example_id], control[example_id]
-        for field in ("suite_identity", "split", "family", "candidates", "gold_answer"):
+        for field in (
+            "suite_identity", "split", "family", "prompt_hash", "candidates",
+            "candidate_permutation_seed", "candidate_permutation",
+            "gold_answer",
+        ):
             if left[field] != right[field]:
                 raise EvalV3Error(f"paired example {example_id} disagrees on {field}")
     deltas = [
