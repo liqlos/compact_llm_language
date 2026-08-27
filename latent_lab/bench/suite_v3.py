@@ -24,6 +24,10 @@ SUITE_SCHEMA_VERSION = "behavioral_suite.v3"
 MASTER_SEED = 20260827
 TOKENIZER_IDENTITY = "utf8-bytes.v1"
 
+TRACE_SUPERVISION_FAMILIES = frozenset({
+    "fsm", "graph_walk", "chain_arith", "tiny_prog",
+})
+
 FAMILIES: tuple[str, ...] = (
     "fsm",
     "stack_queue",
@@ -557,6 +561,49 @@ def parse_prompt(prompt: str) -> dict[str, Any]:
 def reference_solve_prompt(prompt: str) -> str:
     """Independently parse prompt text and replay from its serialized initial state."""
     return _reference_replay(parse_prompt(prompt))
+
+
+def reference_trace_prompt(prompt: str) -> tuple[str, ...]:
+    """Return prompt-derived scalar state after each event prefix.
+
+    This is intentionally narrower than the benchmark solver: only families
+    whose complete intermediate state is a single answer-shaped scalar are
+    eligible for latent trace supervision.
+    """
+    scenario = parse_prompt(prompt)
+    family = scenario.get("family")
+    if family not in TRACE_SUPERVISION_FAMILIES:
+        raise ValueError(
+            f"family {family!r} has no scalar trace-supervision contract")
+    events = scenario.get("events")
+    if not isinstance(events, list) or not events:
+        raise ValueError("trace-supervised prompt must contain events")
+    trace = tuple(
+        _reference_replay({**scenario, "events": events[:prefix_length]})
+        for prefix_length in range(1, len(events) + 1)
+    )
+    if trace[-1] != _reference_replay(scenario):
+        raise AssertionError("prefix replay disagrees with full prompt replay")
+    return trace
+
+
+def safe_trace_targets(prompt: str, answer: str, k_steps: int
+                       ) -> tuple[tuple[int, str], ...]:
+    """Select non-final, non-gold trace targets without shifting step indices."""
+    if isinstance(k_steps, bool) or not isinstance(k_steps, int) or k_steps < 0:
+        raise ValueError("k_steps must be a non-negative integer")
+    scenario = parse_prompt(prompt)
+    if scenario.get("family") not in TRACE_SUPERVISION_FAMILIES:
+        return ()
+    trace = reference_trace_prompt(prompt)
+    if trace[-1] != answer:
+        raise ValueError("prompt-derived terminal state disagrees with gold answer")
+    target_count = min(max(0, k_steps - 1), max(0, len(trace) - 1))
+    return tuple(
+        (step_index, trace[step_index - 1])
+        for step_index in range(1, target_count + 1)
+        if trace[step_index - 1] != answer
+    )
 
 
 def _candidate_order(

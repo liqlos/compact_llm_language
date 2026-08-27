@@ -21,6 +21,7 @@ from latent_lab.bench.suite_v3 import (
     SUITE_IDENTITY,
     SUITE_VERSION,
     TOKENIZER_IDENTITY,
+    TRACE_SUPERVISION_FAMILIES,
     TRAINING_SPLIT,
     UNTOUCHED_FINAL_SPLIT,
     _candidate_order,
@@ -31,6 +32,8 @@ from latent_lab.bench.suite_v3 import (
     counterfactual_prompt,
     parse_prompt,
     reference_solve_prompt,
+    reference_trace_prompt,
+    safe_trace_targets,
     validation_report,
     with_reversed_events,
     without_last_causal_event,
@@ -88,6 +91,55 @@ def test_reference_solver_survives_mutated_generation_oracle(monkeypatch):
     example = next(example for example in SUITE.validation if example.family == "obj_track")
     monkeypatch.setattr(suite_v3, "_replay", lambda _scenario: "MUTATED_GENERATION_ORACLE")
     assert reference_solve_prompt(example.prompt) == example.answer
+
+
+@pytest.mark.parametrize("family", sorted(TRACE_SUPERVISION_FAMILIES))
+def test_prompt_derived_scalar_traces_reach_the_gold_terminal_state(family):
+    examples = [example for example in SUITE.train if example.family == family]
+    assert examples
+    for example in examples:
+        trace = reference_trace_prompt(example.prompt)
+        assert len(trace) == example.depth
+        assert trace[-1] == example.answer
+
+
+def test_safe_trace_targets_mask_gold_without_compressing_latent_steps():
+    eligible_examples = 0
+    safe_targets = 0
+    raw_targets = 0
+    masked_targets = 0
+    for example in SUITE.train:
+        if example.family not in TRACE_SUPERVISION_FAMILIES:
+            assert safe_trace_targets(example.prompt, example.answer, 4) == ()
+            continue
+        targets = safe_trace_targets(example.prompt, example.answer, 4)
+        trace = reference_trace_prompt(example.prompt)
+        raw = tuple(
+            (step_index, trace[step_index - 1])
+            for step_index in range(1, min(3, len(trace) - 1) + 1)
+        )
+        assert all(step_index in {index for index, _ in raw}
+                   for step_index, _ in targets)
+        assert all(value != example.answer for _, value in targets)
+        assert targets == tuple(item for item in raw
+                                if item[1] != example.answer)
+        eligible_examples += bool(targets)
+        safe_targets += len(targets)
+        raw_targets += len(raw)
+        masked_targets += len(raw) - len(targets)
+
+    assert eligible_examples == 160
+    assert raw_targets == 425
+    assert masked_targets == 29
+    assert safe_targets == 396
+
+
+def test_trace_target_selection_fails_closed_on_wrong_gold_and_bad_k():
+    example = next(ex for ex in SUITE.train if ex.family == "fsm")
+    with pytest.raises(ValueError, match="terminal state disagrees"):
+        safe_trace_targets(example.prompt, "not-the-answer", 4)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        safe_trace_targets(example.prompt, example.answer, True)
 
 
 def test_audit_detects_stored_gold_disagreement_with_reference_solver():
