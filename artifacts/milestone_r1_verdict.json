@@ -16,6 +16,7 @@
     "documented_default_clean_python_3_11": "399 passed, 166 skipped",
     "project_venv_default": "399 passed, 345 skipped",
     "local_lab_and_transformer_tiers": "270 passed, 1 skipped, 473 deselected",
+    "exact_preregistered_local_smoke": "306 passed, 1 skipped, 0 failures, 0 errors",
     "package_build_verify_clean_install_import": "PASS",
     "remote_ci": "CONFIGURED_NOT_EXECUTED"
   },
@@ -111,7 +112,7 @@
     },
     {
       "path": "artifacts/audit_after.json",
-      "sha256": "193c5398aa092f1a8e97c6a986f1c4fc6e3df5679c2dc22123a41c7d548d8670"
+      "sha256": "842102b726cdb7cab7846c788e1006c981efb4826e4c7ad29bf6406895a0211d"
     },
     {
       "path": "artifacts/adversarial_review_r1.json",

@@ -218,6 +218,10 @@
       "result": "270 passed, 1 skipped, 473 deselected in 48.69s"
     },
     {
+      "command_scope": "exact_preregistered_local_smoke_command",
+      "result": "306 passed, 1 skipped, 0 failures, 0 errors; 307 tests in 12.179s"
+    },
+    {
       "command_scope": "python_3_11_and_python_3_14_compileall_on_reviewed_head",
       "result": "PASS"
     },
