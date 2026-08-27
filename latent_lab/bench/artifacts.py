@@ -134,6 +134,7 @@ _TRAIN_CONFIG_KNOWN_KEYS = frozenset((
     "revision", "label", "device", "train_examples", "suite_sha256",
     "training_objective", "recurrence_only_lora", "runtime_contract",
     "neutral_delta", "paired_delta", "trace_curriculum",
+    "workspace_slots", "workspace_layout",
 ))
 
 
@@ -158,6 +159,62 @@ def _check_revision(value, where: str) -> None:
     _check_sha(value, "identity.revision", where, length=_REV_HEX_LEN)
 
 
+def _validate_workspace_record_identity(cfg: dict, records, where: str) -> None:
+    """Bind the persisted workspace layout to each raw v3 execution record.
+
+    Old artifacts predate workspace metadata and remain implicit M=1.  New
+    explicit configs must carry the same slots/layout in both recurrence and
+    measured-compute metadata; this closes config/record relabelling without
+    widening the historical v3 schema.
+    """
+    from latent_lab.bench.latent_run import _workspace_slots_from_config
+    from latent_lab.backends.localized import WORKSPACE_LAYOUT
+
+    slots = _workspace_slots_from_config(cfg)
+    explicit = "workspace_slots" in cfg
+    expected = {
+        "workspace_slots": slots,
+        "workspace_layout": WORKSPACE_LAYOUT,
+    }
+    for index, record in enumerate(records or ()):
+        if not isinstance(record, dict) or "recurrence_config" not in record:
+            continue  # historical non-v3 eval evidence has no runtime record
+        recurrence = record.get("recurrence_config")
+        compute = record.get("compute")
+        if not isinstance(recurrence, dict) or not isinstance(compute, dict):
+            raise ValueError(
+                f"{where}: record[{index}] has invalid workspace evidence")
+        rec_projection = {
+            key: recurrence.get(key)
+            for key in expected if key in recurrence
+        }
+        compute_projection = {
+            key: compute.get(key)
+            for key in expected if key in compute
+        }
+        if explicit:
+            if rec_projection != expected or compute_projection != expected:
+                raise ValueError(
+                    f"{where}: record[{index}] workspace identity mismatch; "
+                    f"expected {expected}, recurrence={rec_projection}, "
+                    f"compute={compute_projection}")
+            continue
+        if rec_projection:
+            raise ValueError(
+                f"{where}: legacy M=1 record[{index}] carries unbound "
+                f"recurrence workspace metadata {rec_projection}")
+        # A newly evaluated legacy checkpoint may honestly report the now-
+        # measured M=1 compute projection.  Old records omit it entirely.
+        legacy_measured = {
+            "workspace_slots": 1,
+            "workspace_layout": WORKSPACE_LAYOUT,
+        }
+        if compute_projection not in ({}, legacy_measured):
+            raise ValueError(
+                f"{where}: legacy M=1 record[{index}] has contradictory "
+                f"compute workspace metadata {compute_projection}")
+
+
 # ---------------------------------------------------------------------------
 # run validation
 # ---------------------------------------------------------------------------
@@ -177,6 +234,7 @@ def validate_run(run_dir, *, expected: dict | None = None) -> dict:
         _counterfactual_margin_from_config, _neutral_delta_from_config,
         _paired_delta_from_config,
         _recurrence_only_lora_from_config, _trace_curriculum_from_config,
+        _workspace_slots_from_config,
         recipe_from_config,
         selected_v3_adapter_state_sha256)
     from latent_lab.train.checkpointing import (
@@ -239,6 +297,11 @@ def validate_run(run_dir, *, expected: dict | None = None) -> dict:
     except ValueError as e:
         raise ValueError(
             f"{where}: invalid counterfactual-margin metadata: {e}") from e
+    try:
+        _workspace_slots_from_config(cfg)
+    except ValueError as e:
+        raise ValueError(
+            f"{where}: invalid workspace metadata: {e}") from e
 
     # canonical recipe rebuilt from the report's own config must equal
     # BOTH the report's bound recipe AND the manifest's bound recipe
@@ -292,6 +355,11 @@ def validate_run(run_dir, *, expected: dict | None = None) -> dict:
             f"{where}: checkpoint content digest {content_digest} != "
             "report checkpoint_content_digest")
     try:
+        for history_index, entry in enumerate(report.get("val_history") or ()):
+            if isinstance(entry, dict):
+                _validate_workspace_record_identity(
+                    cfg, entry.get("records"),
+                    f"{where}: validation history[{history_index}]")
         raw_selected_state_sha256 = selected_v3_adapter_state_sha256(
             report.get("val_history"), expected_step=report.get("best_step"),
             expected_metric=report.get("best_val_acc"))
@@ -683,6 +751,10 @@ def validate_eval(eval_path, *, expected: dict | None = None) -> dict:
         raise ValueError(f"{where}: no results block")
     for name, res in results.items():
         _validate_eval_result(where, name, res, ident)
+        if isinstance(d.get("config"), dict):
+            _validate_workspace_record_identity(
+                d["config"], res.get("records"),
+                f"{where}: results[{name!r}]")
     if ablation not in results:
         raise ValueError(
             f"{where}: identity.ablation {ablation!r} has no matching "

@@ -170,6 +170,7 @@ NEUTRAL_DELTA_MODE_SUFFIX = "+neutral-delta"
 PAIRED_DELTA_MODE_SUFFIX = "+paired-delta"
 TRACE_CURRICULUM_MODE_SUFFIX = "+trace-curriculum"
 TRAINING_OBJECTIVES = ("gold_nll", "candidate_ce", "counterfactual_margin")
+WORKSPACE_LAYOUT = "causal_last_slot_readout"
 
 
 def training_objective_from_config(config: dict) -> str:
@@ -393,7 +394,7 @@ class CandidateScoreDetail:
 class LocalizedRecurrence:
     """Frozen-backbone localized recurrence with guarded latent loop."""
 
-    RUNTIME_CONTRACT_VERSION = "localized_recurrence.runtime.v5"
+    RUNTIME_CONTRACT_VERSION = "localized_recurrence.runtime.v6"
     TRAINING_GRADIENT_SEMANTICS = (
         "hidden_state_chain_bptt_with_detached_cache_recurrence"
     )
@@ -401,7 +402,7 @@ class LocalizedRecurrence:
     def __init__(self, model, tokenizer=None, *, interval, max_k=16,
                  lora_r=8, lora_alpha=16.0, use_clock=True,
                  recurrence_only_lora=False, neutral_delta=False,
-                 paired_delta=False):
+                 paired_delta=False, workspace_slots=1):
         _require_torch("LocalizedRecurrence")
         if not isinstance(recurrence_only_lora, bool):
             raise ValueError("recurrence_only_lora must be a boolean")
@@ -409,6 +410,9 @@ class LocalizedRecurrence:
             raise ValueError("neutral_delta must be a boolean")
         if not isinstance(paired_delta, bool):
             raise ValueError("paired_delta must be a boolean")
+        if isinstance(workspace_slots, bool) or not isinstance(
+                workspace_slots, int) or workspace_slots < 1:
+            raise ValueError("workspace_slots must be a positive integer")
         self.model = model
         # frozen-backbone contract: nothing except LoRA/clock may train
         for p in model.parameters():
@@ -441,9 +445,13 @@ class LocalizedRecurrence:
         if (neutral_delta or paired_delta) and not recurrence_only_lora:
             raise ValueError(
                 "neutral/paired delta requires recurrence_only_lora=True")
+        if workspace_slots > 1 and not paired_delta:
+            raise ValueError(
+                "workspace_slots > 1 requires full paired_delta recurrence")
         if isinstance(max_k, bool) or not isinstance(max_k, int) or max_k < 0:
             raise ValueError("max_k must be a non-negative integer")
         self.max_k = max_k
+        self.workspace_slots = workspace_slots
         hidden = self.base.embed_tokens.embedding_dim
 
         self.guard = VocabGuard(model, tokenizer)
@@ -500,9 +508,15 @@ class LocalizedRecurrence:
             "gradient_checkpointing": "UNSUPPORTED_ABSENT",
             "candidate_scoring": "autoregressive_raw_per_token_logprobs",
             "same_adapter_supported_k": list(range(self.max_k + 1)),
+            "workspace_slots": self.workspace_slots,
+            "workspace_layout": WORKSPACE_LAYOUT,
+            "workspace_position_policy": (
+                "fixed_prompt_end_contiguous_positions"),
         }
         if self.paired_delta:
             contract.update({
+                "contract_version": (
+                    "localized_recurrence.runtime.paired_delta.workspace.v1"),
                 "paired_delta": True,
                 "recurrence_passes_per_step": 2,
                 "paired_base_adapter_active": False,
@@ -514,6 +528,21 @@ class LocalizedRecurrence:
                 "recurrence_update_semantics": (
                     "z_next=z+(adapted(z+clock)-base(z))"),
             })
+        return contract
+
+    def runtime_contract_for_config(self, config: dict) -> dict:
+        """Return the live contract in new or legacy-M1 serialized form."""
+        contract = self.runtime_contract()
+        if "workspace_slots" not in config \
+                and "workspace_layout" not in config:
+            # Bundles produced before multi-slot support are exactly M=1.  Keep
+            # their already-bound contract valid without weakening new bundles.
+            contract["contract_version"] = (
+                "localized_recurrence.runtime.paired_delta.v1"
+                if self.paired_delta else "localized_recurrence.runtime.v5")
+            for key in ("workspace_slots", "workspace_layout",
+                        "workspace_position_policy"):
+                contract.pop(key, None)
         return contract
 
     def _set_lora_enabled(self, enabled: bool) -> None:
@@ -603,6 +632,42 @@ class LocalizedRecurrence:
                 self._sever_cache_grads(cache)
         return h
 
+    def _run_workspace_layers(self, indices, h, cache, pos, *, grad=False):
+        """Run a workspace causally, preserving the exact M=1 code path."""
+        if h.shape[1] == 1:
+            return self._run_layers(indices, h, cache, pos, grad=grad)
+        # Reproduce the model-level mask construction omitted by direct layer
+        # calls.  Chunked execution keeps full gradient flow among workspace
+        # slots; sequential cache calls would numerically be causal but detach
+        # the only early-slot credit-assignment path.
+        from transformers.masking_utils import (
+            create_causal_mask, create_recurrent_attention_mask)
+
+        pos4 = self._pos4(h.shape[1], pos)
+        text_positions = pos4[0]
+        mask_kwargs = {
+            "config": self.config,
+            "inputs_embeds": h,
+            "attention_mask": None,
+            "past_key_values": cache,
+            "position_ids": text_positions,
+        }
+        masks = {
+            "full_attention": create_causal_mask(**mask_kwargs),
+            "linear_attention": create_recurrent_attention_mask(**mask_kwargs),
+        }
+        pe = self.base.rotary_emb(h, pos4[1:])
+        for i in indices:
+            layer = self.base.layers[i]
+            h = layer(
+                h, position_embeddings=pe,
+                attention_mask=masks[self.layer_types[i]],
+                position_ids=text_positions, past_key_values=cache,
+                use_cache=True)
+            if grad:
+                self._sever_cache_grads(cache)
+        return h
+
     def _encode(self, input_ids_or_emb, *, grad=False):
         """Prefill the full cache and return the interval-boundary state.
 
@@ -616,15 +681,33 @@ class LocalizedRecurrence:
         emb = (input_ids_or_emb if not torch.is_tensor(input_ids_or_emb)
                or input_ids_or_emb.dtype.is_floating_point
                else self.base.embed_tokens(input_ids_or_emb))
+        if emb.shape[1] < self.workspace_slots:
+            raise ValueError(
+                f"prompt length {emb.shape[1]} is smaller than "
+                f"workspace_slots={self.workspace_slots}")
         ctx = contextlib.nullcontext() if grad else torch.no_grad()
         with ctx, self._lora_scope(False):
             hi = self.interval[1]
             h = self._run_layers(range(hi), emb, cache, 0, grad=grad)
-            boundary = h[:, -1:, :]
+            boundary = h[:, -self.workspace_slots:, :]
             if hi < self.n_layers:
                 self._run_layers(range(hi, self.n_layers), h, cache, 0,
                                  grad=grad)
         return cache, boundary
+
+    def _readout_state_and_delta(self, z0, z):
+        """Select the causal summary slot used by every answer readout."""
+        if not torch.is_tensor(z0) or not torch.is_tensor(z) \
+                or z0.shape != z.shape or z0.ndim != 3 \
+                or z0.shape[1] != self.workspace_slots:
+            raise ValueError(
+                "workspace states must be equal-shaped [batch, slots, hidden] "
+                f"tensors with slots={self.workspace_slots}")
+        z0_read = z0[:, -1:, :]
+        if self.neutral_delta:
+            delta = (z - z0)[:, -1:, :]
+            return z0_read + delta, delta
+        return z[:, -1:, :], None
 
     # -- stages ----------------------------------------------------------------
 
@@ -686,7 +769,7 @@ class LocalizedRecurrence:
                             base_proposal = z
                         else:
                             with self._lora_scope(False):
-                                base_proposal = self._run_layers(
+                                base_proposal = self._run_workspace_layers(
                                     range(lo, hi), z, cache, start_pos,
                                     grad=grad)
                         cache_restore(cache, prompt_cache)
@@ -699,7 +782,7 @@ class LocalizedRecurrence:
                             adapted_proposal = adapted_input
                         else:
                             with self._lora_scope(True):
-                                adapted_proposal = self._run_layers(
+                                adapted_proposal = self._run_workspace_layers(
                                     range(lo, hi), adapted_input, cache,
                                     start_pos, grad=grad)
                         z = z + (adapted_proposal - base_proposal)
@@ -735,13 +818,19 @@ class LocalizedRecurrence:
         if ab.get("zero_state"):
             z = z_initial if self.neutral_delta else torch.zeros_like(z)
         if ab.get("noise_state"):
-            state = z - z_initial if self.neutral_delta else z
+            state = ((z - z_initial)[:, -1:, :]
+                     if self.neutral_delta else z)
             g = torch.Generator(device=z.device.type)
             g.manual_seed(int(ab.get("noise_seed", 1234)))
-            n = torch.randn(z.shape, generator=g, device=z.device,
+            n = torch.randn(state.shape, generator=g, device=z.device,
                             dtype=torch.float32).to(z.dtype)
             n = n / (n.norm() + 1e-8) * (state.norm() + 1e-8)
-            z = z_initial + n if self.neutral_delta else n
+            if self.neutral_delta:
+                last = z_initial[:, -1:, :] + n
+                z = (last if self.workspace_slots == 1 else
+                     torch.cat((z[:, :-1, :], last), dim=1))
+            else:
+                z = n
         if trajectory is not None:
             return z, pos, tuple(trajectory)
         return z, pos
@@ -867,7 +956,8 @@ class LocalizedRecurrence:
 
         z, pos = self.latent_steps(
             z0, cache, loop_start, k_steps, ablate=ab)
-        neutral_readout_delta = (z - z0) if self.neutral_delta else None
+        readout_state, neutral_readout_delta = \
+            self._readout_state_and_delta(z0, z)
         if partner_input_ids is not None:
             partner_ab = dict(ab)
             partner_ab.pop("swap_state", None)
@@ -875,22 +965,25 @@ class LocalizedRecurrence:
                 partner_z0, partner_cache, partner_input_ids.shape[1],
                 k_steps, ablate=partner_ab)
             if self.neutral_delta:
-                neutral_readout_delta = partner_z - partner_z0
-                z = z0 + neutral_readout_delta
+                _partner_readout, neutral_readout_delta = \
+                    self._readout_state_and_delta(partner_z0, partner_z)
+                readout_state = z0[:, -1:, :] + neutral_readout_delta
             else:
-                z = partner_z
+                readout_state, _unused = self._readout_state_and_delta(
+                    partner_z0, partner_z)
         if ab.get("reset_state"):
             # Position/compute-matched no-recurrence carrier control: execute
             # the full loop, then discard zK and read out the original z0.
-            z = z0
             if self.neutral_delta:
-                neutral_readout_delta = torch.zeros_like(z0)
+                neutral_readout_delta = torch.zeros_like(z0[:, -1:, :])
+                readout_state = z0[:, -1:, :]
+            else:
+                readout_state = z0[:, -1:, :]
         if prompt_cache is not None:
             # Orthogonal cache control: recurrence really executed and pos
             # remains prompt_len + effective_k, but readout sees prompt cache.
             cache_restore(cache, prompt_cache)
         latent_delta = neutral_readout_delta
-        readout_state = z0 + latent_delta if self.neutral_delta else z
         if cuda_device is not None:
             torch.cuda.synchronize(cuda_device)
         t2 = time.perf_counter()
@@ -934,6 +1027,7 @@ class LocalizedRecurrence:
             0 if ab.get("bypass_interval") else
             (self.interval[1] - self.interval[0]) * effective_k
         )
+        recurrence_token_apps = recurrence_apps * self.workspace_slots
         target_prefill_tokens = int(input_ids.shape[1])
         prefill_apps = self.n_layers * (
             target_prefill_tokens + partner_prefill_tokens)
@@ -944,7 +1038,7 @@ class LocalizedRecurrence:
             item["answer_context_full_decoder_layer_applications"]
             for item in candidate_compute)
         candidate_apps = readout_tail_apps + answer_decoder_apps
-        total_apps = prefill_apps + recurrence_apps + candidate_apps
+        total_apps = prefill_apps + recurrence_token_apps + candidate_apps
 
         raw_sums = [detail.raw_sum_logprob for detail in details]
         if cuda_device is not None:
@@ -958,6 +1052,8 @@ class LocalizedRecurrence:
         measured_compute = {
             "prefill_layers": prefill_apps,
             "recurrence_interval_applications": recurrence_apps,
+            "recurrence_interval_token_layer_applications": (
+                recurrence_token_apps),
             "k_loops": recurrence_multiplier * effective_k,
             "candidate_tail_layers": candidate_apps,
             "lm_head_calls": self.guard.lm_head_calls - lm0,
@@ -978,6 +1074,8 @@ class LocalizedRecurrence:
             "recurrence_adapter_active": True,
             "candidate_adapter_active": not self.recurrence_only_lora,
             "neutral_delta": self.neutral_delta,
+            "workspace_slots": self.workspace_slots,
+            "workspace_layout": WORKSPACE_LAYOUT,
         }
         if self.paired_delta:
             measured_compute.update({
@@ -1033,12 +1131,16 @@ class LocalizedRecurrence:
                     else "prompt_end_plus_effective_k"),
                 "prefill_layer_applications": prefill_apps,
                 "recurrence_interval_layer_applications": recurrence_apps,
+                "recurrence_interval_token_layer_applications": (
+                    recurrence_token_apps),
                 "recurrence_effective_k": effective_k,
                 "recurrence_passes_per_step": recurrence_passes,
                 "candidate_readout_tail_layer_applications": readout_tail_apps,
                 "candidate_full_decoder_layer_applications": answer_decoder_apps,
                 "candidate_layer_applications": candidate_apps,
                 "total_layer_token_applications": total_apps,
+                "workspace_slots": self.workspace_slots,
+                "workspace_layout": WORKSPACE_LAYOUT,
                 "lm_head_calls": measured_compute["lm_head_calls"],
                 "tokenizer_calls": measured_compute["tokenizer_calls"],
                 "generate_calls": self.guard.generate_calls - gen0,
@@ -1133,8 +1235,7 @@ class LocalizedRecurrence:
                                    grad=True, ablate=ab)
         if prompt_cache is not None:
             cache_restore(cache, prompt_cache)
-        latent_delta = (z - z0) if self.neutral_delta else None
-        readout_state = z0 + latent_delta if self.neutral_delta else z
+        readout_state, latent_delta = self._readout_state_and_delta(z0, z)
         token_logprobs, _counters = self._score_candidate_tokens(
             readout_state, cache, pos, answer_ids, grad=True,
             latent_delta=latent_delta)
@@ -1271,7 +1372,8 @@ class LocalizedRecurrence:
             cache_restore(cache, prompt_cache)
             if pos != prompt_ids.shape[1]:
                 raise RuntimeError("paired recurrence changed the readout position")
-            return cache, prompt_cache, z0, z - z0, pos
+            readout_state, delta = self._readout_state_and_delta(z0, z)
+            return cache, prompt_cache, z0[:, -1:, :], delta, pos
 
         p_cache, p_snapshot, p_z0, p_delta, p_pos = recurrent_context(input_ids)
         q_cache, q_snapshot, q_z0, q_delta, q_pos = recurrent_context(
@@ -1345,8 +1447,7 @@ class LocalizedRecurrence:
             cache_restore(cache, prompt_cache)
 
         recurrence_cache = cache_snapshot(cache)
-        latent_delta = (z - z0) if self.neutral_delta else None
-        readout_state = z0 + latent_delta if self.neutral_delta else z
+        readout_state, latent_delta = self._readout_state_and_delta(z0, z)
         scores = []
         for candidate in candidate_ids:
             cache_restore(cache, recurrence_cache)
@@ -1368,6 +1469,8 @@ class LocalizedRecurrence:
 
         if not self.paired_delta:
             raise ValueError("trace curriculum requires paired_delta mode")
+        if self.workspace_slots != 1:
+            raise ValueError("trace curriculum requires workspace_slots=1")
         if k_steps != 4:
             raise ValueError("trace curriculum requires exactly K=4")
         if isinstance(trace_lambda, bool) or not isinstance(
@@ -1427,7 +1530,7 @@ class LocalizedRecurrence:
                 f"paired trajectory has {len(trajectory)} states for K={k_steps}")
 
         recurrence_cache = cache_snapshot(cache)
-        latent_delta = z - z0
+        readout_state, latent_delta = self._readout_state_and_delta(z0, z)
         scores = []
         for candidate in candidate_ids:
             cache_restore(cache, recurrence_cache)
@@ -1436,7 +1539,8 @@ class LocalizedRecurrence:
             if ids.shape[1] == 0:
                 raise ValueError("candidate token sequences must be non-empty")
             token_logprobs, _counters = self._score_candidate_tokens(
-                z, cache, pos, ids, grad=True, latent_delta=latent_delta)
+                readout_state, cache, pos, ids, grad=True,
+                latent_delta=latent_delta)
             scores.append(token_logprobs.mean())
         candidate_loss = self.candidate_cross_entropy(scores, gold_index)
 
@@ -1444,9 +1548,10 @@ class LocalizedRecurrence:
         for step_index, ids in normalized_targets:
             cache_restore(cache, prompt_cache)
             state = trajectory[step_index - 1]
+            trace_state, trace_delta = self._readout_state_and_delta(z0, state)
             token_logprobs, _counters = self._score_candidate_tokens(
-                state, cache, input_ids.shape[1], ids, grad=True,
-                latent_delta=state - z0)
+                trace_state, cache, input_ids.shape[1], ids, grad=True,
+                latent_delta=trace_delta)
             trace_losses.append(-token_logprobs.mean())
         trace_loss = torch.stack(trace_losses).mean()
         return candidate_loss + trace_lambda * trace_loss
@@ -1595,6 +1700,17 @@ class LocalizedRecurrence:
         if not isinstance(claimed_trace, bool):
             drift.append("trace_curriculum is not a boolean")
             claimed_trace = None
+        claimed_workspace_slots = config.get("workspace_slots", 1)
+        claimed_workspace_layout = config.get(
+            "workspace_layout", WORKSPACE_LAYOUT)
+        if isinstance(claimed_workspace_slots, bool) or not isinstance(
+                claimed_workspace_slots, int) or claimed_workspace_slots < 1:
+            drift.append("workspace_slots is not a positive integer")
+            claimed_workspace_slots = None
+        if claimed_workspace_layout != WORKSPACE_LAYOUT:
+            drift.append(
+                f"workspace_layout {claimed_workspace_layout!r} != "
+                f"{WORKSPACE_LAYOUT!r}")
         architecture_core = recipe["mode"].removesuffix(
             RECURRENCE_ONLY_LORA_MODE_SUFFIX)
         objective_suffixes = (
@@ -1676,15 +1792,34 @@ class LocalizedRecurrence:
                 drift.append("counterfactual_margin requires k=4")
             if claimed_trace:
                 drift.append("counterfactual_margin forbids trace_curriculum")
+        if claimed_workspace_slots is not None:
+            runtime_workspace_slots = getattr(self, "workspace_slots", 1)
+            if claimed_workspace_slots != runtime_workspace_slots:
+                drift.append(
+                    f"workspace_slots {claimed_workspace_slots} != runtime "
+                    f"{runtime_workspace_slots}")
+            if claimed_workspace_slots > 1 and (
+                    not claimed_paired
+                    or claimed_objective != "counterfactual_margin"
+                    or claimed_trace):
+                drift.append(
+                    "workspace_slots > 1 requires paired_delta "
+                    "counterfactual_margin without trace curriculum")
         if claimed_neutral and self.interval != (
                 0, getattr(self, "n_layers", self.interval[1])):
             drift.append("neutral_delta requires the full decoder interval")
         stored_contract = config.get("runtime_contract")
         if claimed_policy and stored_contract is None:
             drift.append("recurrence-only LoRA lacks runtime_contract metadata")
-        elif stored_contract is not None \
-                and stored_contract != self.runtime_contract():
-            drift.append("runtime_contract != live runtime contract")
+        elif stored_contract is not None:
+            contract_for_config = getattr(
+                self, "runtime_contract_for_config", None)
+            live_contract = (
+                contract_for_config(config)
+                if contract_for_config is not None
+                else self.runtime_contract())
+            if stored_contract != live_contract:
+                drift.append("runtime_contract != live runtime contract")
         if list(recipe["interval"]) != [lo, hi]:
             drift.append(f"interval {recipe['interval']} != runtime "
                          f"{[lo, hi]}")

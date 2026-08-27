@@ -533,6 +533,8 @@ def test_counterfactual_margin_mode_config_and_recipe_are_sealed():
     assert latent_run._paired_delta_from_config(cfg) is True
     assert latent_run._counterfactual_margin_from_config(cfg) is True
     assert latent_run._recurrence_config(cfg)["mode"] == mode
+    assert latent_run._workspace_slots_from_config(cfg) == 1
+    assert "workspace_slots" not in latent_run._recurrence_config(cfg)
 
     common = dict(
         mode="D-full", interval=(0, 4), k=4, max_k=4,
@@ -563,11 +565,197 @@ def test_counterfactual_margin_mode_config_and_recipe_are_sealed():
             **cfg, "trace_curriculum": True})
 
 
+def test_causal_workspace_config_recipe_and_legacy_m1_are_sealed():
+    from latent_lab.backends.localized import WORKSPACE_LAYOUT
+    from latent_lab.bench import latent_run
+    from latent_lab.train.checkpointing import (
+        recipe_from_config, validate_recipe)
+
+    mode = latent_run.mode_from_spec(
+        "full", 4, training_objective="counterfactual_margin",
+        paired_delta=True, workspace_slots=4)
+    assert mode == (
+        "D-full+paired-delta+counterfactual-margin+recurrence-only-lora")
+    legacy_contract = {
+        "adapter_activation_policy": "recurrence_only",
+        "prefill_adapter_active": False,
+        "recurrence_adapter_active": True,
+        "candidate_adapter_active": False,
+        "neutral_delta": True,
+        "paired_delta": True,
+        "recurrence_passes_per_step": 2,
+        "paired_base_adapter_active": False,
+        "paired_adapted_adapter_active": True,
+        "paired_clock_branch": "adapted_only",
+        "paired_cache_semantics": (
+            "restore_same_prompt_snapshot_before_base_and_adapted_"
+            "passes_and_after_update"),
+        "recurrence_update_semantics": (
+            "z_next=z+(adapted(z+clock)-base(z))"),
+    }
+    legacy_cfg = _cfg(
+        mode=mode, interval=[0, 4], training_objective="counterfactual_margin",
+        recurrence_only_lora=True, neutral_delta=True, paired_delta=True,
+        trace_curriculum=False, runtime_contract=legacy_contract)
+    assert latent_run._workspace_slots_from_config(legacy_cfg) == 1
+    legacy_recipe = recipe_from_config(legacy_cfg, SUITE_SHA)
+    assert "workspace_slots" not in legacy_recipe
+    assert validate_recipe(legacy_recipe) == legacy_recipe
+
+    workspace_contract = {
+        **legacy_contract,
+        "workspace_slots": 4,
+        "workspace_layout": WORKSPACE_LAYOUT,
+        "workspace_position_policy": "fixed_prompt_end_contiguous_positions",
+    }
+    cfg = {
+        **legacy_cfg,
+        "workspace_slots": 4,
+        "workspace_layout": WORKSPACE_LAYOUT,
+        "runtime_contract": workspace_contract,
+    }
+    assert latent_run._workspace_slots_from_config(cfg) == 4
+    recurrence = latent_run._recurrence_config(cfg)
+    assert recurrence["workspace_slots"] == 4
+    assert recurrence["workspace_layout"] == WORKSPACE_LAYOUT
+    recipe = recipe_from_config(cfg, SUITE_SHA)
+    assert recipe["workspace_slots"] == 4
+    assert recipe["workspace_layout"] == WORKSPACE_LAYOUT
+    assert recipe["config_sha256"] != legacy_recipe["config_sha256"]
+
+    common = dict(
+        mode="D-full", interval=(0, 4), k=4, max_k=4,
+        lora_r=8, lora_alpha=16.0, lr=2e-4, steps=20, seed=0,
+        optimizer="adamw", weight_decay=0.01, lr_schedule="constant",
+        warmup=2, clip=0.5, detach_z0=False, suite_sha256=SUITE_SHA,
+        recurrence_only_lora=True, paired_delta=True,
+        training_objective="counterfactual_margin")
+    assert latent_run.train_recipe_digest(**common, workspace_slots=1) != \
+        latent_run.train_recipe_digest(**common, workspace_slots=4)
+
+    for invalid in (True, 0, -1, 1.5):
+        with pytest.raises(ValueError, match="positive integer"):
+            latent_run._workspace_slots_from_config({
+                **cfg, "workspace_slots": invalid})
+    with pytest.raises(ValueError, match="persisted together"):
+        latent_run._workspace_slots_from_config({
+            key: value for key, value in cfg.items()
+            if key != "workspace_layout"})
+    with pytest.raises(ValueError, match="counterfactual_margin"):
+        latent_run._workspace_slots_from_config({
+            **cfg, "mode": (
+                "D-full+paired-delta+candidate-ce+recurrence-only-lora"),
+            "training_objective": "candidate_ce"})
+    with pytest.raises(ValueError, match="workspace semantics"):
+        latent_run._workspace_slots_from_config({
+            **cfg, "runtime_contract": {
+                **workspace_contract, "workspace_slots": 1}})
+    with pytest.raises(ValueError, match="legacy M=1"):
+        latent_run._workspace_slots_from_config({
+            **legacy_cfg, "runtime_contract": workspace_contract})
+    with pytest.raises(ValueError, match="workspace_slots > 1"):
+        latent_run.mode_from_spec(
+            "full", 4, training_objective="counterfactual_margin",
+            workspace_slots=4)
+
+
+def test_ccbed14_active_artifact_remains_exact_legacy_m1():
+    """Frozen oracle copied from the active step-280 ccbed14 train report."""
+    from latent_lab.bench import latent_run
+    from latent_lab.train.checkpointing import (
+        recipe_from_config, validate_recipe)
+
+    suite_sha = "5cf5cbf397510ba597b59f7ccf0839cf344e6fb795a5cb29d031f39dac218254"
+    runtime_contract = {
+        "adapter_activation_policy": "recurrence_only",
+        "cache_gradient_semantics": "detached_after_each_layer_application",
+        "candidate_adapter_active": False,
+        "candidate_scoring": "autoregressive_raw_per_token_logprobs",
+        "contract_version": "localized_recurrence.runtime.paired_delta.v1",
+        "evidence_runtime": "LocalizedRecurrence",
+        "generic_state_controller_abi": "SCAFFOLD_NOT_EVIDENCE_PATH",
+        "gradient_checkpointing": "UNSUPPORTED_ABSENT",
+        "neutral_delta": True,
+        "paired_adapted_adapter_active": True,
+        "paired_base_adapter_active": False,
+        "paired_cache_semantics": (
+            "restore_same_prompt_snapshot_before_base_and_adapted_"
+            "passes_and_after_update"),
+        "paired_clock_branch": "adapted_only",
+        "paired_delta": True,
+        "prefill_adapter_active": False,
+        "readout_state_policy": "canonical_decoder_boundary_plus_latent_delta",
+        "recurrence_adapter_active": True,
+        "recurrence_cache_policy": "restore_prompt_cache_each_step_fixed_position",
+        "recurrence_passes_per_step": 2,
+        "recurrence_update_semantics": (
+            "z_next=z+(adapted(z+clock)-base(z))"),
+        "same_adapter_supported_k": list(range(17)),
+        "state_ablation_target": "latent_delta",
+        "training_gradient_semantics": (
+            "hidden_state_chain_bptt_with_detached_cache_recurrence"),
+    }
+    cfg = {
+        "clip": 0.5, "detach_z0": False, "device": "cuda",
+        "interval": [0, 24], "k": 4,
+        "label": "pilot-2b-full-k4-paired-cfmargin-s0-280-v1",
+        "lora_alpha": 16.0, "lora_r": 8, "lr": 0.00005,
+        "lr_schedule": "cosine", "max_k": 16,
+        "mode": (
+            "D-full+paired-delta+counterfactual-margin+recurrence-only-lora"),
+        "model": "Qwen/Qwen3.5-2B", "neutral_delta": True,
+        "optimizer": "adamw", "paired_delta": True,
+        "recurrence_only_lora": True,
+        "revision": "15852e8c16360a2fea060d615a32b45270f8a8fc",
+        "runtime_contract": runtime_contract, "seed": 0, "steps": 280,
+        "suite_sha256": suite_sha, "trace_curriculum": False,
+        "train_examples": 280, "training_objective": "counterfactual_margin",
+        "warmup": 28, "weight_decay": 0.01,
+    }
+    expected_recipe = {
+        "clip": 0.5,
+        "config_sha256": (
+            "c4af610962e5713cc2c3f9e35d6a3ad5096438c3ad0e23c5ab6a2f881ff9e903"),
+        "detach_z0": False, "interval": [0, 24], "k": 4,
+        "lora_alpha": 16.0, "lora_r": 8, "lr": 0.00005,
+        "lr_schedule": "cosine", "max_k": 16,
+        "mode": cfg["mode"], "optimizer": "adamw", "seed": 0,
+        "steps": 280, "suite_sha256": suite_sha, "warmup": 28,
+        "weight_decay": 0.01,
+    }
+
+    assert latent_run._workspace_slots_from_config(cfg) == 1
+    assert "workspace_slots" not in latent_run._recurrence_config(cfg)
+    assert recipe_from_config(cfg, suite_sha) == expected_recipe
+    assert validate_recipe(expected_recipe) == expected_recipe
+
+    model = _tiny_qwen35(805, 4)
+    rec = LocalizedRecurrence(
+        model, None, interval=(0, 4), max_k=16, lora_r=2,
+        recurrence_only_lora=True, paired_delta=True)
+    assert rec.runtime_contract_for_config(cfg) == runtime_contract
+
+
 def test_recurrence_only_lora_k0_training_fails_before_model_load(tmp_path):
     from latent_lab.bench import latent_run
 
     args = SimpleNamespace(seed=0, recurrence_only_lora=True, k=0)
     with pytest.raises(ValueError, match="requires --k > 0"):
+        latent_run._train_inner(args, tmp_path, "cpu", REV_A)
+
+
+def test_multislot_cli_contract_fails_before_model_load(monkeypatch, tmp_path):
+    from latent_lab.bench import latent_run
+
+    def forbidden_load(*_args, **_kwargs):
+        raise AssertionError("model load must not run")
+
+    monkeypatch.setattr(latent_run, "load_model", forbidden_load)
+    args = SimpleNamespace(
+        seed=0, neutral_delta=False, paired_delta=True,
+        trace_curriculum=False, workspace_slots=4, interval="full",
+        recurrence_only_lora=False, training_objective="candidate_ce", k=4)
+    with pytest.raises(ValueError, match="workspace-slots > 1"):
         latent_run._train_inner(args, tmp_path, "cpu", REV_A)
 
 

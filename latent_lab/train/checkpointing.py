@@ -114,7 +114,7 @@ BUNDLE_FORMAT_VERSION = 2
 # Every training-semantic field is canonically bound into the recipe.
 # Missing/extra/invalid fields are rejected — never defaulted — so two
 # materially different trainings can never share an identity.
-RECIPE_KEYS = (
+LEGACY_RECIPE_KEYS = (
     "mode",            # D-full / E-localized / F-control
     "interval",        # [lo, hi) localized layers
     "k",               # latent steps used at train/eval time
@@ -133,6 +133,12 @@ RECIPE_KEYS = (
     "suite_sha256",    # exact suite manifest digest
     "config_sha256",   # canonical digest over the normalized config above
 )
+RECIPE_KEYS = LEGACY_RECIPE_KEYS[:-2] + (
+    "workspace_slots",
+    "workspace_layout",
+) + LEGACY_RECIPE_KEYS[-2:]
+
+_WORKSPACE_LAYOUT = "causal_last_slot_readout"
 
 _LR_SCHEDULES = ("constant", "cosine")
 
@@ -635,8 +641,9 @@ def canonical_config_digest(normalized_cfg: dict) -> str:
 def recipe_from_config(cfg: dict, suite_sha256: str) -> dict:
     """The exact training-semantic identity a config implies (validated).
 
-    Every field is REQUIRED — missing fields are rejected, never
-    defaulted. The returned recipe is the canonical normalized form; its
+    Every original field is required.  The sole migration default is an
+    absent workspace contract, which denotes the historical one-slot runtime.
+    The returned recipe is the canonical normalized form; its
     ``config_sha256`` binds all training-semantic fields at once so that
     any K/LR/steps/seed/optimizer/schedule/clip/detach change produces a
     materially different identity.
@@ -710,6 +717,19 @@ def recipe_from_config(cfg: dict, suite_sha256: str) -> dict:
         "clip": _recipe_float(cfg["clip"], "clip", minimum_exclusive=0.0),
         "detach_z0": detach_z0,
     }
+    has_workspace_slots = "workspace_slots" in cfg
+    has_workspace_layout = "workspace_layout" in cfg
+    if has_workspace_slots != has_workspace_layout:
+        raise AdapterBundleSchemaError(
+            "config.workspace_slots and config.workspace_layout must be "
+            "persisted together")
+    if has_workspace_slots:
+        normalized["workspace_slots"] = _recipe_int(
+            cfg["workspace_slots"], "workspace_slots", minimum=1)
+        if cfg["workspace_layout"] != _WORKSPACE_LAYOUT:
+            raise AdapterBundleSchemaError(
+                f"config.workspace_layout must be {_WORKSPACE_LAYOUT!r}")
+        normalized["workspace_layout"] = _WORKSPACE_LAYOUT
     normalized["config_sha256"] = canonical_config_digest(normalized)
     normalized["suite_sha256"] = suite_sha256
     # the built recipe must itself pass the strict schema it will be
@@ -720,15 +740,18 @@ def recipe_from_config(cfg: dict, suite_sha256: str) -> dict:
 def validate_recipe(recipe) -> dict:
     """Strictly validate the recurrence/training recipe bound into bundles.
 
-    The key set must match RECIPE_KEYS exactly (missing AND extra keys are
-    rejected), every field must be valid, and ``config_sha256`` must be
-    the exact canonical digest of the other semantic fields.
+    The key set must match either the current schema or the exact historical
+    one-slot schema.  Missing/extra keys in either schema are rejected, and
+    ``config_sha256`` must bind the exact semantic fields present.
     """
     if not isinstance(recipe, dict):
         raise AdapterBundleSchemaError("recipe must be a dict")
-    if set(recipe) != set(RECIPE_KEYS):
+    recipe_keys = (RECIPE_KEYS if set(recipe) == set(RECIPE_KEYS)
+                   else LEGACY_RECIPE_KEYS)
+    if set(recipe) != set(recipe_keys):
         raise AdapterBundleSchemaError(
-            f"recipe keys must be exactly {sorted(RECIPE_KEYS)}; "
+            "recipe keys must be exactly the current or legacy-M1 schema "
+            f"({sorted(RECIPE_KEYS)} or {sorted(LEGACY_RECIPE_KEYS)}); "
             f"got {sorted(recipe)}")
     interval = recipe["interval"]
     if (not isinstance(interval, (list, tuple)) or len(interval) != 2
@@ -781,12 +804,19 @@ def validate_recipe(recipe) -> dict:
         "detach_z0": recipe["detach_z0"],
         "suite_sha256": suite.lower(),
     }
+    if recipe_keys is RECIPE_KEYS:
+        out["workspace_slots"] = _recipe_int(
+            recipe["workspace_slots"], "workspace_slots", minimum=1)
+        if recipe["workspace_layout"] != _WORKSPACE_LAYOUT:
+            raise AdapterBundleSchemaError(
+                f"recipe.workspace_layout must be {_WORKSPACE_LAYOUT!r}")
+        out["workspace_layout"] = _WORKSPACE_LAYOUT
     digest = recipe["config_sha256"]
     if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
         raise AdapterBundleSchemaError(
             "recipe.config_sha256 must be a 64-hex canonical config digest")
     expected = canonical_config_digest({
-        k: out[k] for k in RECIPE_KEYS if k not in
+        k: out[k] for k in recipe_keys if k not in
         ("suite_sha256", "config_sha256")})
     if digest.lower() != expected:
         raise AdapterBundleIdentityError(

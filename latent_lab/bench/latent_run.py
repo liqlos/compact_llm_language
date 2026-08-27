@@ -36,6 +36,7 @@ from latent_lab.backends.localized import (
     RECURRENCE_ONLY_LORA_MODE_SUFFIX,
     TRACE_CURRICULUM_MODE_SUFFIX,
     TRAINING_OBJECTIVES,
+    WORKSPACE_LAYOUT,
     training_objective_from_config,
 )
 
@@ -973,6 +974,63 @@ def _counterfactual_margin_from_config(cfg: dict) -> bool:
     return True
 
 
+def _workspace_slots_from_config(cfg: dict) -> int:
+    """Recover the causal workspace; legacy configs are exactly one slot."""
+    has_slots = "workspace_slots" in cfg
+    has_layout = "workspace_layout" in cfg
+    if has_slots != has_layout:
+        raise ValueError(
+            "config.workspace_slots and config.workspace_layout must be "
+            "persisted together")
+    if not has_slots:
+        contract = cfg.get("runtime_contract")
+        if isinstance(contract, dict) and any(
+                key in contract for key in (
+                    "workspace_slots", "workspace_layout",
+                    "workspace_position_policy")):
+            raise ValueError(
+                "legacy M=1 config cannot carry unbound workspace contract "
+                "metadata")
+        return 1
+    slots = cfg["workspace_slots"]
+    if isinstance(slots, bool) or not isinstance(slots, int) or slots < 1:
+        raise ValueError("config.workspace_slots must be a positive integer")
+    if cfg["workspace_layout"] != WORKSPACE_LAYOUT:
+        raise ValueError(
+            f"config.workspace_layout must be {WORKSPACE_LAYOUT!r}")
+    if slots > 1:
+        if cfg.get("paired_delta") is not True \
+                or training_objective_from_config(cfg) != \
+                "counterfactual_margin" \
+                or cfg.get("trace_curriculum") is not False:
+            raise ValueError(
+                "workspace_slots > 1 requires paired_delta "
+                "counterfactual_margin without trace curriculum")
+        if cfg.get("k") != 4:
+            raise ValueError("workspace_slots > 1 requires k=4")
+    contract = cfg.get("runtime_contract")
+    if contract is not None:
+        if not isinstance(contract, dict):
+            raise ValueError("config.runtime_contract must be an object")
+        observed = {
+            "workspace_slots": contract.get("workspace_slots"),
+            "workspace_layout": contract.get("workspace_layout"),
+            "workspace_position_policy": contract.get(
+                "workspace_position_policy"),
+        }
+        expected = {
+            "workspace_slots": slots,
+            "workspace_layout": WORKSPACE_LAYOUT,
+            "workspace_position_policy": (
+                "fixed_prompt_end_contiguous_positions"),
+        }
+        if observed != expected:
+            raise ValueError(
+                "config.runtime_contract disagrees with workspace semantics: "
+                f"expected {expected}, got {observed}")
+    return slots
+
+
 def _recurrence_config(cfg: dict) -> dict:
     """Measured recurrence settings; unsupported flags cannot enter v3."""
     if cfg.get("grad_checkpoint") not in (None, False):
@@ -983,6 +1041,7 @@ def _recurrence_config(cfg: dict) -> dict:
     paired_delta = _paired_delta_from_config(cfg)
     trace_curriculum = _trace_curriculum_from_config(cfg)
     _counterfactual_margin_from_config(cfg)
+    workspace_slots = _workspace_slots_from_config(cfg)
     recurrence = {
         "mode": cfg["mode"],
         "interval": list(cfg["interval"]),
@@ -1000,6 +1059,9 @@ def _recurrence_config(cfg: dict) -> dict:
         recurrence["paired_delta"] = True
     if trace_curriculum:
         recurrence["trace_curriculum"] = True
+    if "workspace_slots" in cfg:
+        recurrence["workspace_slots"] = workspace_slots
+        recurrence["workspace_layout"] = WORKSPACE_LAYOUT
     return recurrence
 
 
@@ -1100,7 +1162,8 @@ def mode_from_spec(interval_spec: str, k: int,
                    training_objective: str = "gold_nll",
                    neutral_delta: bool = False,
                    paired_delta: bool = False,
-                   trace_curriculum: bool = False) -> str:
+                   trace_curriculum: bool = False,
+                   workspace_slots: int = 1) -> str:
     """The preregistered mode implied by the interval spec and K."""
     base = ("D-full" if interval_spec == "full"
             else "F-control" if k == 0 else "E-localized")
@@ -1111,6 +1174,15 @@ def mode_from_spec(interval_spec: str, k: int,
                 "paired_delta requires candidate_ce or counterfactual_margin")
         neutral_delta = True
         recurrence_only_lora = True
+    if isinstance(workspace_slots, bool) or not isinstance(
+            workspace_slots, int) or workspace_slots < 1:
+        raise ValueError("workspace_slots must be a positive integer")
+    if workspace_slots > 1 and (
+            not paired_delta or training_objective != "counterfactual_margin"
+            or trace_curriculum or k != 4 or interval_spec != "full"):
+        raise ValueError(
+            "workspace_slots > 1 requires full paired_delta "
+            "counterfactual_margin at K=4 without trace")
     if training_objective == "counterfactual_margin" and (
             not paired_delta or k != 4 or trace_curriculum):
         raise ValueError(
@@ -1135,10 +1207,11 @@ def train_recipe_digest(*, mode, interval, k, max_k, lora_r, lora_alpha,
                          lr_schedule, warmup, clip, detach_z0,
                          suite_sha256, grad_checkpoint=None,
                          recurrence_only_lora=False,
-                         training_objective="gold_nll",
-                         neutral_delta=False,
-                         paired_delta=False,
-                         trace_curriculum=False) -> str:
+                          training_objective="gold_nll",
+                          neutral_delta=False,
+                          paired_delta=False,
+                          trace_curriculum=False,
+                          workspace_slots=1) -> str:
     """ONE canonical digest binding EVERY behavior-changing field.
 
     The single source of truth shared by the trainer and the paid
@@ -1155,6 +1228,15 @@ def train_recipe_digest(*, mode, interval, k, max_k, lora_r, lora_alpha,
                 "paired_delta requires candidate_ce or counterfactual_margin")
         neutral_delta = True
         recurrence_only_lora = True
+    if isinstance(workspace_slots, bool) or not isinstance(
+            workspace_slots, int) or workspace_slots < 1:
+        raise ValueError("workspace_slots must be a positive integer")
+    if workspace_slots > 1 and (
+            not paired_delta or training_objective != "counterfactual_margin"
+            or trace_curriculum or k != 4 or tuple(interval)[0] != 0):
+        raise ValueError(
+            "workspace_slots > 1 requires full paired_delta "
+            "counterfactual_margin at K=4 without trace")
     if training_objective == "counterfactual_margin" and (
             not paired_delta or k != 4 or trace_curriculum):
         raise ValueError(
@@ -1181,6 +1263,8 @@ def train_recipe_digest(*, mode, interval, k, max_k, lora_r, lora_alpha,
         "optimizer": optimizer, "weight_decay": weight_decay,
         "lr_schedule": lr_schedule, "warmup": warmup, "clip": clip,
         "detach_z0": detach_z0,
+        "workspace_slots": workspace_slots,
+        "workspace_layout": WORKSPACE_LAYOUT,
     }
     if grad_checkpoint is not None:
         cfg["grad_checkpoint"] = grad_checkpoint
@@ -1338,6 +1422,10 @@ def _train_inner(args, out: Path, device: str, revision: str):
     trace_curriculum = getattr(args, "trace_curriculum", False)
     if not isinstance(trace_curriculum, bool):
         raise ValueError("--trace-curriculum must be a boolean flag")
+    workspace_slots = getattr(args, "workspace_slots", 1)
+    if isinstance(workspace_slots, bool) or not isinstance(
+            workspace_slots, int) or workspace_slots < 1:
+        raise ValueError("--workspace-slots must be a positive integer")
     neutral_delta = requested_neutral_delta or paired_delta
     if neutral_delta and args.interval != "full":
         raise ValueError("--neutral-delta/--paired-delta requires --interval full")
@@ -1360,6 +1448,13 @@ def _train_inner(args, out: Path, device: str, revision: str):
         raise ValueError(
             "--trace-curriculum requires --paired-delta, --k 4, and "
             "--training-objective candidate_ce")
+    if workspace_slots > 1 and (
+            not paired_delta or training_objective != "counterfactual_margin"
+            or trace_curriculum or args.k != 4 or args.interval != "full"):
+        raise ValueError(
+            "--workspace-slots > 1 requires --interval full, "
+            "--paired-delta, --training-objective counterfactual_margin, "
+            "--k 4, and no trace curriculum")
     if recurrence_only_lora and args.k == 0:
         raise ValueError(
             "--recurrence-only-lora requires --k > 0 for training; "
@@ -1372,7 +1467,8 @@ def _train_inner(args, out: Path, device: str, revision: str):
                               lora_r=args.lora_r, lora_alpha=args.lora_alpha,
                               recurrence_only_lora=recurrence_only_lora,
                               neutral_delta=neutral_delta,
-                              paired_delta=paired_delta)
+                              paired_delta=paired_delta,
+                              workspace_slots=workspace_slots)
     rec.clock.to(device)
     params = [p for p in rec.trainable_parameters()]
     if args.optimizer != "adamw":
@@ -1387,7 +1483,8 @@ def _train_inner(args, out: Path, device: str, revision: str):
     mode = mode_from_spec(
         args.interval, args.k, recurrence_only_lora=recurrence_only_lora,
         training_objective=training_objective, neutral_delta=neutral_delta,
-        paired_delta=paired_delta, trace_curriculum=trace_curriculum)
+        paired_delta=paired_delta, trace_curriculum=trace_curriculum,
+        workspace_slots=workspace_slots)
     cfg = {
         "mode": mode,
         "model": args.model, "revision": revision,
@@ -1403,6 +1500,8 @@ def _train_inner(args, out: Path, device: str, revision: str):
         "neutral_delta": neutral_delta,
         "paired_delta": paired_delta,
         "trace_curriculum": trace_curriculum,
+        "workspace_slots": workspace_slots,
+        "workspace_layout": WORKSPACE_LAYOUT,
         "runtime_contract": rec.runtime_contract(),
         "device": device,
         "label": getattr(args, "label", None),
@@ -1666,6 +1765,7 @@ def cmd_eval(args):
     paired_delta = _paired_delta_from_config(cfg)
     _trace_curriculum_from_config(cfg)
     _counterfactual_margin_from_config(cfg)
+    workspace_slots = _workspace_slots_from_config(cfg)
     model_id = cfg.get("model")
     if not isinstance(model_id, str) or not model_id:
         raise ValueError(
@@ -1773,10 +1873,11 @@ def cmd_eval(args):
                                lora_alpha=float(cfg.get("lora_alpha", 16.0)),
                                recurrence_only_lora=recurrence_only_lora,
                                neutral_delta=neutral_delta,
-                               paired_delta=paired_delta)
+                               paired_delta=paired_delta,
+                               workspace_slots=workspace_slots)
     stored_runtime_contract = cfg.get("runtime_contract")
     if stored_runtime_contract is not None \
-            and stored_runtime_contract != rec.runtime_contract():
+            and stored_runtime_contract != rec.runtime_contract_for_config(cfg):
         raise AdapterBundleIdentityError(
             "adapter runtime_contract disagrees with the constructed "
             "LocalizedRecurrence runtime")
@@ -1869,6 +1970,10 @@ def main():
         "--trace-curriculum", action="store_true",
         help="fixed visible-to-latent trace fade (1.0 through step 79, 0.3 "
              "through 139, then 0); requires paired delta at K=4")
+    tr.add_argument(
+        "--workspace-slots", type=int, default=1,
+        help="causal latent workspace width; values >1 require full paired "
+             "counterfactual-margin recurrence at K=4")
     tr.add_argument("--label", default=None,
                     help="preregistered run label (bound into evidence; "
                     "never derived from output path)")

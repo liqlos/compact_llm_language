@@ -16,6 +16,20 @@ from latent_lab.bench.latent_run import evaluate
 from latent_lab.bench.suite import Example
 
 
+@pytest.mark.parametrize(
+    ("extra", "expected"), (([], 1), (["--workspace-slots", "4"], 4)))
+def test_train_cli_parses_workspace_slots(monkeypatch, tmp_path, extra, expected):
+    from latent_lab.bench import latent_run
+
+    captured = []
+    monkeypatch.setattr(latent_run, "cmd_train", captured.append)
+    monkeypatch.setattr(
+        sys, "argv", ["latent-run", "train", "--out", str(tmp_path), *extra])
+    latent_run.main()
+    assert len(captured) == 1
+    assert captured[0].workspace_slots == expected
+
+
 def test_localized_data_contracts_import_without_torch():
     """Core users may import evidence records without installing lab deps."""
     script = r'''

@@ -455,8 +455,27 @@ def test_report_manifest_and_bundle_bind_one_canonical_recipe(tmp_path):
 
 def test_run_validator_recognizes_sealed_adapter_activation_metadata():
     assert {"training_objective", "recurrence_only_lora", "runtime_contract",
-            "neutral_delta", "paired_delta", "trace_curriculum"} <= \
+            "neutral_delta", "paired_delta", "trace_curriculum",
+            "workspace_slots", "workspace_layout"} <= \
         artifacts._TRAIN_CONFIG_KNOWN_KEYS
+
+
+def test_run_validator_rejects_partial_workspace_identity(tmp_path):
+    from latent_lab.train.checkpointing import (
+        RUN_MANIFEST_FILE, TRAIN_REPORT_FILE, atomic_write_json, sha256_file)
+
+    build_verified_run(tmp_path)
+    report_path = tmp_path / TRAIN_REPORT_FILE
+    report = json.loads(report_path.read_text())
+    report["config"]["workspace_slots"] = 4
+    atomic_write_json(report_path, report)
+    manifest_path = tmp_path / RUN_MANIFEST_FILE
+    manifest = json.loads(manifest_path.read_text())
+    manifest["report_sha256"] = sha256_file(report_path)
+    atomic_write_json(manifest_path, manifest)
+
+    with pytest.raises(ValueError, match="invalid workspace metadata"):
+        artifacts.validate_run(tmp_path)
 
 
 def test_run_validator_rejects_unsealed_paired_delta(tmp_path):
@@ -747,6 +766,34 @@ def _current_v3_eval_payload(**record_overrides):
     return payload, record, example
 
 
+def _explicit_workspace_v3_payload(*, record_slots=4, compute_slots=4):
+    _, base_record, _ = _current_v3_eval_payload()
+    recurrence = {
+        **base_record["recurrence_config"],
+        "workspace_slots": record_slots,
+        "workspace_layout": "causal_last_slot_readout",
+    }
+    compute = {
+        **base_record["compute"],
+        "workspace_slots": compute_slots,
+        "workspace_layout": "causal_last_slot_readout",
+    }
+    payload, record, example = _current_v3_eval_payload(
+        recurrence_config=recurrence, compute=compute)
+    payload["config"] = {
+        "mode": "D-full+paired-delta+counterfactual-margin+recurrence-only-lora",
+        "training_objective": "counterfactual_margin",
+        "paired_delta": True,
+        "neutral_delta": True,
+        "recurrence_only_lora": True,
+        "trace_curriculum": False,
+        "k": 4,
+        "workspace_slots": 4,
+        "workspace_layout": "causal_last_slot_readout",
+    }
+    return payload, record, example
+
+
 def test_validate_eval_accepts_only_self_consistent_latent_eval_v3(tmp_path):
     payload, _, _ = _current_v3_eval_payload()
     ep = tmp_path / "eval-v3.json"
@@ -757,6 +804,20 @@ def test_validate_eval_accepts_only_self_consistent_latent_eval_v3(tmp_path):
     ckpt.atomic_write_json(ep, payload)
     with pytest.raises(ValueError, match="content_sha256"):
         artifacts.validate_eval(ep)
+
+
+def test_validate_eval_binds_workspace_config_to_raw_execution(tmp_path):
+    ep = tmp_path / "workspace-v3.json"
+    payload, _, _ = _explicit_workspace_v3_payload()
+    ckpt.atomic_write_json(ep, payload)
+    assert artifacts.validate_eval(ep) == payload
+
+    for record_slots, compute_slots in ((1, 4), (4, 1)):
+        payload, _, _ = _explicit_workspace_v3_payload(
+            record_slots=record_slots, compute_slots=compute_slots)
+        ckpt.atomic_write_json(ep, payload)
+        with pytest.raises(ValueError, match="workspace identity mismatch"):
+            artifacts.validate_eval(ep)
 
 
 def test_validate_eval_rejects_relabelled_v3_ablation(tmp_path):
@@ -1252,7 +1313,10 @@ def test_train_recipe_digest_matches_trainer_recipe_binding():
         lora_alpha=16.0, lr=1e-4, steps=800, seed=0, optimizer="adamw",
         weight_decay=0.01, lr_schedule="constant", warmup=50, clip=0.5,
         detach_z0=False, suite_sha256=SUITE_SHA)
-    assert base == run_contract()["config_sha256"]
+    assert base == run_contract(config={
+        **fake_cfg(), "workspace_slots": 1,
+        "workspace_layout": "causal_last_slot_readout",
+    })["config_sha256"]
     drift = latent_run.train_recipe_digest(
         mode="E-localized", interval=[12, 18], k=4, max_k=16, lora_r=8,
         lora_alpha=16.0, lr=3e-4, steps=800, seed=0, optimizer="adamw",

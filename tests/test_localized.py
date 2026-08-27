@@ -440,12 +440,12 @@ def test_neutral_delta_rejects_non_full_or_shared_adapter_modes():
             max_k=2, neutral_delta=True)
 
 
-def build_paired_delta(max_k=4):
+def build_paired_delta(max_k=4, workspace_slots=1):
     model, tok = build_tiny_hybrid()
     return model, LocalizedRecurrence(
         model, tok, interval=(0, model.config.num_hidden_layers),
         max_k=max_k, lora_r=2, recurrence_only_lora=True,
-        paired_delta=True)
+        paired_delta=True, workspace_slots=workspace_slots)
 
 
 def test_paired_delta_init_is_bit_exact_k0_and_has_no_step_gates():
@@ -535,6 +535,113 @@ def test_paired_delta_full_reset_is_bit_exact_k0_after_training_signal():
     assert report.extra["compute"]["k_loops"] == 4
 
 
+def test_paired_workspace_m1_default_is_bit_exact_after_perturbation():
+    model_a, tok = build_tiny_hybrid()
+    rec_a = LocalizedRecurrence(
+        model_a, tok, interval=(0, model_a.config.num_hidden_layers),
+        max_k=4, lora_r=2, recurrence_only_lora=True, paired_delta=True)
+    model_b, tok = build_tiny_hybrid()
+    rec_b = LocalizedRecurrence(
+        model_b, tok, interval=(0, model_b.config.num_hidden_layers),
+        max_k=4, lora_r=2, recurrence_only_lora=True, paired_delta=True,
+        workspace_slots=1)
+    generator = torch.Generator().manual_seed(302)
+    with torch.no_grad():
+        rec_a.clock.weight.normal_(std=0.03, generator=generator)
+        for adapter in rec_a.injected:
+            adapter.lora_B.copy_(torch.randn(
+                adapter.lora_B.shape, generator=generator) * 0.03)
+    rec_b.load_adapter_state(rec_a.adapter_state_dict())
+    ids = torch.tensor([[2, 3, 5, 7, 11, 13, 17]])
+    candidates = ([19, 23], [29, 31, 37])
+
+    scores_a, _ = rec_a.score_candidates(ids, candidates, 4)
+    scores_b, _ = rec_b.score_candidates(ids, candidates, 4)
+    assert _token_logprobs(scores_a) == _token_logprobs(scores_b)
+
+    model_c, tok = build_tiny_hybrid()
+    rec_c = LocalizedRecurrence(
+        model_c, tok, interval=(0, model_c.config.num_hidden_layers),
+        max_k=4, lora_r=2, recurrence_only_lora=True, paired_delta=True,
+        workspace_slots=4)
+    rec_c.load_adapter_state(rec_a.adapter_state_dict())
+    m1_k0, _ = rec_a.score_candidates(ids, candidates, 0)
+    m4_k0, _ = rec_c.score_candidates(ids, candidates, 0)
+    assert _token_logprobs(m4_k0) == _token_logprobs(m1_k0)
+
+    cache_a, z0_a = rec_a._encode(ids)
+    cache_b, z0_b = rec_b._encode(ids)
+    z_a, pos_a = rec_a.latent_steps(z0_a, cache_a, ids.shape[1], 4)
+    z_b, pos_b = rec_b.latent_steps(z0_b, cache_b, ids.shape[1], 4)
+    assert pos_a == pos_b and torch.equal(z_a, z_b)
+
+
+def test_paired_workspace_m4_zero_init_and_fullreset_are_exact():
+    model, rec2 = build_paired_delta(workspace_slots=4)
+    ids = torch.tensor([[2, 3, 5, 7, 11, 13, 17]])
+    candidates = ([19, 23], [29, 31, 37])
+    cache, z0 = rec2._encode(ids)
+    assert z0.shape == (1, 4, model.config.hidden_size)
+
+    k0, _ = rec2.score_candidates(ids, candidates, 0)
+    k4, report = rec2.score_candidates(ids, candidates, 4)
+    assert _token_logprobs(k4) == _token_logprobs(k0)
+    layer_calls = 2 * 4 * model.config.num_hidden_layers
+    assert report.extra["recurrence_interval_layer_applications"] == layer_calls
+    assert report.extra["recurrence_interval_token_layer_applications"] == \
+        4 * layer_calls
+
+    generator = torch.Generator().manual_seed(303)
+    with torch.no_grad():
+        rec2.clock.weight.normal_(std=0.05, generator=generator)
+        for adapter in rec2.injected:
+            adapter.lora_B.copy_(torch.randn(
+                adapter.lora_B.shape, generator=generator) * 0.05)
+    trained_k0, _ = rec2.score_candidates(ids, candidates, 0)
+    reset, _ = rec2.score_candidates(
+        ids, candidates, 4,
+        ablate={"reset_state": True, "reset_cache": True})
+    assert _token_logprobs(reset) == _token_logprobs(trained_k0)
+
+
+def test_paired_workspace_early_slot_causally_changes_summary_delta():
+    _model, rec2 = build_paired_delta(workspace_slots=4)
+    ids = torch.tensor([[2, 3, 5, 7, 11, 13, 17]])
+    generator = torch.Generator().manual_seed(304)
+    with torch.no_grad():
+        for adapter in rec2.injected:
+            adapter.lora_B.copy_(torch.randn(
+                adapter.lora_B.shape, generator=generator) * 0.1)
+        cache_a, z0_a = rec2._encode(ids)
+        cache_b, z0_b = rec2._encode(ids)
+        cache_c, z0_c = rec2._encode(ids)
+        cache_d, z0_d = rec2._encode(ids)
+        future_perturbed = z0_d.clone()
+        future_perturbed[:, -1, :] += 0.25
+        proposal_c = rec2._run_workspace_layers(
+            range(rec2.n_layers), z0_c, cache_c, ids.shape[1])
+        proposal_d = rec2._run_workspace_layers(
+            range(rec2.n_layers), future_perturbed, cache_d, ids.shape[1])
+        assert torch.equal(proposal_c[:, :-1, :], proposal_d[:, :-1, :])
+
+        perturbed = z0_b.clone()
+        perturbed[:, 0, :] += 0.25
+        out_a, _ = rec2.latent_steps(z0_a, cache_a, ids.shape[1], 1)
+        out_b, _ = rec2.latent_steps(perturbed, cache_b, ids.shape[1], 1)
+        delta_a = (out_a - z0_a)[:, -1:, :]
+        delta_b = (out_b - perturbed)[:, -1:, :]
+    assert not torch.equal(delta_a, delta_b)
+
+    cache_grad, z0_grad = rec2._encode(ids)
+    workspace = z0_grad.detach().requires_grad_(True)
+    proposal = rec2._run_workspace_layers(
+        range(rec2.n_layers), workspace, cache_grad, ids.shape[1], grad=True)
+    input_grad = torch.autograd.grad(
+        proposal[:, -1, :].sum(), workspace, retain_graph=False)[0]
+    assert torch.isfinite(input_grad).all()
+    assert torch.count_nonzero(input_grad[:, :-1, :]).item() > 0
+
+
 def test_paired_delta_rejects_non_full_or_shared_adapter_modes():
     model, tok = build_tiny_hybrid()
     with pytest.raises(ValueError, match="full-decoder"):
@@ -546,6 +653,18 @@ def test_paired_delta_rejects_non_full_or_shared_adapter_modes():
         LocalizedRecurrence(
             model, tok, interval=(0, model.config.num_hidden_layers),
             max_k=2, paired_delta=True)
+    for invalid in (True, 0, -1, 1.5):
+        model, tok = build_tiny_hybrid()
+        with pytest.raises(ValueError, match="positive integer"):
+            LocalizedRecurrence(
+                model, tok, interval=(0, model.config.num_hidden_layers),
+                max_k=2, recurrence_only_lora=True, paired_delta=True,
+                workspace_slots=invalid)
+    model, tok = build_tiny_hybrid()
+    with pytest.raises(ValueError, match="requires full paired_delta"):
+        LocalizedRecurrence(
+            model, tok, interval=(0, model.config.num_hidden_layers),
+            max_k=2, recurrence_only_lora=True, workspace_slots=4)
 
 
 def test_paired_trace_lambda_zero_is_exact_ce_path_without_trajectory(
@@ -762,8 +881,10 @@ def test_counterfactual_correct_own_delta_lowers_loss_and_hard_distractor_wins()
     assert penalized > rescued
 
 
-def test_counterfactual_margin_first_backward_reaches_b_and_clock(monkeypatch):
-    _model, rec2 = build_paired_delta()
+@pytest.mark.parametrize("workspace_slots", [1, 4])
+def test_counterfactual_margin_first_backward_reaches_b_and_clock(
+        monkeypatch, workspace_slots):
+    _model, rec2 = build_paired_delta(workspace_slots=workspace_slots)
     prompt = torch.randint(0, 250, (1, 7))
     counterfactual = torch.randint(0, 250, (1, 8))
     candidates = ([10, 11], [12, 13], [14, 15])
