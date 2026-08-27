@@ -13,9 +13,10 @@ Structural guarantees (enforced, unit-tested):
     (validated on a tiny hybrid config in tests/test_localized.py).
 
 Adaptation: frozen backbone + LoRA on interval-layer projections +
-zero-initialized per-step clock embeddings.  The same adapter is active during
-prompt prefill, recurrence, and answer scoring; recurrence-dose comparisons
-therefore require evaluating one fixed adapter at every K.
+zero-initialized per-step clock embeddings.  By default the same adapter is
+active in every stage.  The recurrence-only policy instead activates LoRA only
+inside latent steps, leaving prompt prefill and answer scoring on the frozen
+base model so K=0 is an adapter-free control.
 """
 
 from __future__ import annotations
@@ -169,6 +170,8 @@ _Base = torch.nn.Module if torch is not None else object
 class LoRALinear(_Base):
     """y = W x + (alpha/r) * B A x ; W stays frozen."""
 
+    supports_runtime_toggle = True
+
     def __init__(self, base, r: int, alpha: float):
         _require_torch("LoRALinear")
         super().__init__()
@@ -176,6 +179,7 @@ class LoRALinear(_Base):
         for p in self.base.parameters():
             p.requires_grad_(False)
         self.scaling = alpha / r
+        self.enabled = True
         # master LoRA weights stay fp32 even over a lower-precision backbone
         dev = next(base.parameters()).device
         self.lora_A = torch.nn.Parameter(torch.zeros(r, base.in_features,
@@ -187,6 +191,8 @@ class LoRALinear(_Base):
         torch.nn.init.kaiming_uniform_(self.lora_A, a=5 ** 0.5)
 
     def forward(self, x):
+        if not self.enabled:
+            return self.base(x)
         # master LoRA weights stay fp32 even over a bf16 base layer
         delta = ((x.to(self.lora_A.dtype) @ self.lora_A.transpose(0, 1))
                  @ self.lora_B.transpose(0, 1)) * self.scaling
@@ -351,14 +357,17 @@ class CandidateScoreDetail:
 class LocalizedRecurrence:
     """Frozen-backbone localized recurrence with guarded latent loop."""
 
-    RUNTIME_CONTRACT_VERSION = "localized_recurrence.runtime.v2"
+    RUNTIME_CONTRACT_VERSION = "localized_recurrence.runtime.v3"
     TRAINING_GRADIENT_SEMANTICS = (
         "hidden_state_chain_bptt_with_detached_cache_recurrence"
     )
 
     def __init__(self, model, tokenizer=None, *, interval, max_k=16,
-                 lora_r=8, lora_alpha=16.0, use_clock=True):
+                 lora_r=8, lora_alpha=16.0, use_clock=True,
+                 recurrence_only_lora=False):
         _require_torch("LocalizedRecurrence")
+        if not isinstance(recurrence_only_lora, bool):
+            raise ValueError("recurrence_only_lora must be a boolean")
         self.model = model
         # frozen-backbone contract: nothing except LoRA/clock may train
         for p in model.parameters():
@@ -398,6 +407,11 @@ class LocalizedRecurrence:
             [self.base.layers[i] for i in range(lo, hi)],
             r=lora_r, alpha=lora_alpha)
         self.use_clock = use_clock
+        self.recurrence_only_lora = recurrence_only_lora
+        if self.recurrence_only_lora:
+            # Disabled is the fail-safe resting state.  Only latent_steps opens
+            # a narrowly scoped adapter-active window.
+            self._set_lora_enabled(False)
 
     def runtime_contract(self) -> dict:
         """Executable scientific metadata; generic RCC ABI is not this path."""
@@ -407,11 +421,47 @@ class LocalizedRecurrence:
             "generic_state_controller_abi": "SCAFFOLD_NOT_EVIDENCE_PATH",
             "training_gradient_semantics": self.TRAINING_GRADIENT_SEMANTICS,
             "cache_gradient_semantics": "detached_after_each_layer_application",
-            "prefill_adapter_active": True,
+            "adapter_activation_policy": (
+                "recurrence_only" if self.recurrence_only_lora else "all_stages"),
+            "prefill_adapter_active": not self.recurrence_only_lora,
+            "recurrence_adapter_active": True,
+            "candidate_adapter_active": not self.recurrence_only_lora,
             "gradient_checkpointing": "UNSUPPORTED_ABSENT",
             "candidate_scoring": "autoregressive_raw_per_token_logprobs",
             "same_adapter_supported_k": list(range(self.max_k + 1)),
         }
+
+    def _set_lora_enabled(self, enabled: bool) -> None:
+        """Toggle every injected adapter or fail before executing a stage."""
+        if not isinstance(enabled, bool):
+            raise TypeError("LoRA enabled state must be a boolean")
+        for adapter in self.injected:
+            if not isinstance(adapter, LoRALinear) \
+                    or not getattr(adapter, "supports_runtime_toggle", False) \
+                    or not hasattr(adapter, "enabled"):
+                raise RuntimeError(
+                    "recurrence-only LoRA requires runtime-toggleable "
+                    "LoRALinear adapters")
+        for adapter in self.injected:
+            adapter.enabled = enabled
+        if any(adapter.enabled is not enabled for adapter in self.injected):
+            raise RuntimeError("LoRA activation toggle did not take effect")
+
+    @contextlib.contextmanager
+    def _lora_scope(self, enabled: bool):
+        if not self.recurrence_only_lora:
+            yield
+            return
+        previous = tuple(adapter.enabled for adapter in self.injected)
+        self._set_lora_enabled(enabled)
+        try:
+            yield
+        finally:
+            for adapter, state in zip(self.injected, previous):
+                adapter.enabled = state
+            if any(adapter.enabled is not state
+                   for adapter, state in zip(self.injected, previous)):
+                raise RuntimeError("failed to restore LoRA activation state")
 
     # -- positional plumbing -------------------------------------------------
 
@@ -482,7 +532,7 @@ class LocalizedRecurrence:
                or input_ids_or_emb.dtype.is_floating_point
                else self.base.embed_tokens(input_ids_or_emb))
         ctx = contextlib.nullcontext() if grad else torch.no_grad()
-        with ctx:
+        with ctx, self._lora_scope(False):
             hi = self.interval[1]
             h = self._run_layers(range(hi), emb, cache, 0, grad=grad)
             boundary = h[:, -1:, :]
@@ -522,7 +572,7 @@ class LocalizedRecurrence:
         idxs = parse_clock_mode(mode, k_steps)[:eff_k]
 
         lo, hi = self.interval
-        with self.guard.window():
+        with self.guard.window(), self._lora_scope(True):
             pos = start_pos
             for ci in idxs:
                 zz = z
@@ -571,8 +621,9 @@ class LocalizedRecurrence:
 
         hi = self.interval[1]
         if hi < self.n_layers:
-            current = self._run_layers(
-                range(hi, self.n_layers), z, cache, pos, grad=grad)
+            with self._lora_scope(False):
+                current = self._run_layers(
+                    range(hi, self.n_layers), z, cache, pos, grad=grad)
             next_pos = pos + 1
             readout_tail_layers = self.n_layers - hi
         else:
@@ -590,8 +641,9 @@ class LocalizedRecurrence:
                 continue
             previous = candidate_ids[:, token_index:token_index + 1]
             hidden = self.base.embed_tokens(previous)
-            current = self._run_layers(
-                range(self.n_layers), hidden, cache, next_pos, grad=grad)
+            with self._lora_scope(False):
+                current = self._run_layers(
+                    range(self.n_layers), hidden, cache, next_pos, grad=grad)
             next_pos += 1
 
         return torch.stack(token_logprobs), {
@@ -749,6 +801,11 @@ class LocalizedRecurrence:
             # prevents a clean record from being relabeled as an intervention
             # by changing only the surrounding eval envelope.
             "eval_ablation": dict(ab),
+            "adapter_activation_policy": (
+                "recurrence_only" if self.recurrence_only_lora else "all_stages"),
+            "prefill_adapter_active": not self.recurrence_only_lora,
+            "recurrence_adapter_active": True,
+            "candidate_adapter_active": not self.recurrence_only_lora,
         }
         rep = RecurrenceReport(
             k_steps=k_steps,
@@ -800,7 +857,14 @@ class LocalizedRecurrence:
                 "tokenizer_decode_calls": measured_compute["decode_calls"],
                 "wall_clock_seconds": wall_seconds,
                 "peak_memory_bytes": measured_compute["peak_memory_bytes"],
-                "prefill_adapter_active": True,
+                "adapter_activation_policy":
+                    measured_compute["adapter_activation_policy"],
+                "prefill_adapter_active":
+                    measured_compute["prefill_adapter_active"],
+                "recurrence_adapter_active":
+                    measured_compute["recurrence_adapter_active"],
+                "candidate_adapter_active":
+                    measured_compute["candidate_adapter_active"],
                 "training_gradient_semantics": (
                     self.TRAINING_GRADIENT_SEMANTICS),
                 "compute": measured_compute,
@@ -850,8 +914,9 @@ class LocalizedRecurrence:
         hi = self.interval[1]
         if hi >= self.n_layers:
             return h
-        return self._run_layers(
-            range(hi, self.n_layers), h, cache, pos, grad=grad)
+        with self._lora_scope(False):
+            return self._run_layers(
+                range(hi, self.n_layers), h, cache, pos, grad=grad)
 
     # -- training ---------------------------------------------------------------
 
@@ -861,6 +926,10 @@ class LocalizedRecurrence:
         from ..backends.hf_qwen import cache_restore, cache_snapshot
 
         ab = validate_ablation(ablate or {}, k_steps)
+        if self.recurrence_only_lora and k_steps == 0:
+            raise ValueError(
+                "recurrence-only LoRA has no trainable path at K=0; "
+                "evaluate K=0 from a K>0-trained adapter instead")
         eval_only = [key for key in ("swap_state", "reset_state", "reset_cache")
                      if ab.get(key)]
         if eval_only:

@@ -231,6 +231,50 @@ def test_qwen35_lora_targets_cover_real_attention_and_gdn_projections():
             assert {"q_proj", "k_proj", "v_proj", "o_proj"} <= names
 
 
+def test_recurrence_only_lora_policy_is_recipe_and_runtime_bound():
+    from latent_lab.bench import latent_run
+
+    contract = {
+        "adapter_activation_policy": "recurrence_only",
+        "prefill_adapter_active": False,
+        "recurrence_adapter_active": True,
+        "candidate_adapter_active": False,
+    }
+    cfg = _cfg(
+        mode=latent_run.mode_from_spec(
+            "full", 4, recurrence_only_lora=True),
+        interval=[0, 4], recurrence_only_lora=True,
+        runtime_contract=contract)
+    recurrence_config = latent_run._recurrence_config(cfg)
+    assert recurrence_config["recurrence_only_lora"] is True
+    assert recurrence_config["adapter_activation_policy"] == "recurrence_only"
+
+    common = dict(
+        mode="D-full", interval=(0, 4), k=4, max_k=4,
+        lora_r=8, lora_alpha=16.0, lr=2e-4, steps=20, seed=0,
+        optimizer="adamw", weight_decay=0.01, lr_schedule="constant",
+        warmup=2, clip=0.5, detach_z0=False, suite_sha256=SUITE_SHA)
+    shared_digest = latent_run.train_recipe_digest(**common)
+    recurrence_only_digest = latent_run.train_recipe_digest(
+        **common, recurrence_only_lora=True)
+    assert shared_digest != recurrence_only_digest
+
+    with pytest.raises(ValueError, match="policy disagree"):
+        latent_run._recurrence_config({**cfg, "recurrence_only_lora": False})
+    with pytest.raises(ValueError, match="runtime_contract disagrees"):
+        latent_run._recurrence_config({
+            **cfg, "runtime_contract": {
+                **contract, "prefill_adapter_active": True}})
+
+
+def test_recurrence_only_lora_k0_training_fails_before_model_load(tmp_path):
+    from latent_lab.bench import latent_run
+
+    args = SimpleNamespace(seed=0, recurrence_only_lora=True, k=0)
+    with pytest.raises(ValueError, match="requires --k > 0"):
+        latent_run._train_inner(args, tmp_path, "cpu", REV_A)
+
+
 @pytest.mark.filterwarnings("ignore")
 def test_encode_returns_interval_boundary_not_final_decoder_state():
     from transformers import DynamicCache

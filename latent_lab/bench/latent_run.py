@@ -544,10 +544,63 @@ def _recipe_hash(recipe) -> str:
     return canonical_sha256(recipe)
 
 
+RECURRENCE_ONLY_LORA_MODE_SUFFIX = "+recurrence-only-lora"
+
+
+def _adapter_policy_mode(mode: str, recurrence_only_lora: bool) -> str:
+    if not isinstance(recurrence_only_lora, bool):
+        raise ValueError("recurrence_only_lora must be a boolean")
+    has_suffix = mode.endswith(RECURRENCE_ONLY_LORA_MODE_SUFFIX)
+    if recurrence_only_lora:
+        return mode if has_suffix else mode + RECURRENCE_ONLY_LORA_MODE_SUFFIX
+    if has_suffix:
+        raise ValueError(
+            "mode claims recurrence-only LoRA but recurrence_only_lora is false")
+    return mode
+
+
+def _recurrence_only_lora_from_config(cfg: dict) -> bool:
+    """Recover and cross-check the policy sealed into the recipe's mode."""
+    value = cfg.get("recurrence_only_lora", False)
+    if not isinstance(value, bool):
+        raise ValueError("config.recurrence_only_lora must be a boolean")
+    mode = cfg.get("mode")
+    if not isinstance(mode, str):
+        raise ValueError("config.mode must be a string")
+    expected_mode = _adapter_policy_mode(
+        mode.removesuffix(RECURRENCE_ONLY_LORA_MODE_SUFFIX), value)
+    if mode != expected_mode:
+        raise ValueError(
+            "config mode and recurrence_only_lora policy disagree; refusing "
+            "an unsealed adapter activation policy")
+
+    contract = cfg.get("runtime_contract")
+    if value and not isinstance(contract, dict):
+        raise ValueError(
+            "recurrence-only LoRA config lacks sealed runtime_contract metadata")
+    if contract is not None:
+        if not isinstance(contract, dict):
+            raise ValueError("config.runtime_contract must be an object")
+        expected = {
+            "adapter_activation_policy": (
+                "recurrence_only" if value else "all_stages"),
+            "prefill_adapter_active": not value,
+            "recurrence_adapter_active": True,
+            "candidate_adapter_active": not value,
+        }
+        observed = {key: contract.get(key) for key in expected}
+        if observed != expected:
+            raise ValueError(
+                "config.runtime_contract disagrees with adapter activation "
+                f"policy: expected {expected}, got {observed}")
+    return value
+
+
 def _recurrence_config(cfg: dict) -> dict:
     """Measured recurrence settings; unsupported flags cannot enter v3."""
     if cfg.get("grad_checkpoint") not in (None, False):
         raise ValueError("grad_checkpoint=true is unsupported")
+    recurrence_only_lora = _recurrence_only_lora_from_config(cfg)
     return {
         "mode": cfg["mode"],
         "interval": list(cfg["interval"]),
@@ -556,6 +609,9 @@ def _recurrence_config(cfg: dict) -> dict:
         "lora_r": cfg["lora_r"],
         "lora_alpha": cfg["lora_alpha"],
         "detach_z0": cfg["detach_z0"],
+        "recurrence_only_lora": recurrence_only_lora,
+        "adapter_activation_policy": (
+            "recurrence_only" if recurrence_only_lora else "all_stages"),
     }
 
 
@@ -651,16 +707,19 @@ def recipe_from_config(cfg: dict, suite_sha256: str) -> dict:
     return recipe_from_config(cfg, suite_sha256)
 
 
-def mode_from_spec(interval_spec: str, k: int) -> str:
+def mode_from_spec(interval_spec: str, k: int,
+                   recurrence_only_lora: bool = False) -> str:
     """The preregistered mode implied by the interval spec and K."""
-    return ("D-full" if interval_spec == "full"
+    base = ("D-full" if interval_spec == "full"
             else "F-control" if k == 0 else "E-localized")
+    return _adapter_policy_mode(base, recurrence_only_lora)
 
 
 def train_recipe_digest(*, mode, interval, k, max_k, lora_r, lora_alpha,
-                        lr, steps, seed, optimizer, weight_decay,
-                        lr_schedule, warmup, clip, detach_z0,
-                        suite_sha256, grad_checkpoint=None) -> str:
+                         lr, steps, seed, optimizer, weight_decay,
+                         lr_schedule, warmup, clip, detach_z0,
+                         suite_sha256, grad_checkpoint=None,
+                         recurrence_only_lora=False) -> str:
     """ONE canonical digest binding EVERY behavior-changing field.
 
     The single source of truth shared by the trainer and the paid
@@ -671,7 +730,8 @@ def train_recipe_digest(*, mode, interval, k, max_k, lora_r, lora_alpha,
     checkpointing.recipe_from_config rejects true and never persists it.
     """
     cfg = {
-        "mode": mode, "interval": list(interval), "k": k, "max_k": max_k,
+        "mode": _adapter_policy_mode(mode, recurrence_only_lora),
+        "interval": list(interval), "k": k, "max_k": max_k,
         "lora_r": lora_r, "lora_alpha": lora_alpha,
         "lr": lr, "steps": steps, "seed": seed,
         "optimizer": optimizer, "weight_decay": weight_decay,
@@ -787,11 +847,18 @@ def _train_inner(args, out: Path, device: str, revision: str):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
+    recurrence_only_lora = getattr(args, "recurrence_only_lora", False)
+    if recurrence_only_lora and args.k == 0:
+        raise ValueError(
+            "--recurrence-only-lora requires --k > 0 for training; "
+            "evaluate K=0 from the trained K>0 adapter")
+
     model, tok = load_model(device, args.model, revision)
     interval = interval_from_spec(
         args.interval, model.config.num_hidden_layers)
     rec = LocalizedRecurrence(model, None, interval=interval, max_k=args.max_k,
-                              lora_r=args.lora_r, lora_alpha=args.lora_alpha)
+                              lora_r=args.lora_r, lora_alpha=args.lora_alpha,
+                              recurrence_only_lora=recurrence_only_lora)
     rec.clock.to(device)
     params = [p for p in rec.trainable_parameters()]
     if args.optimizer != "adamw":
@@ -803,7 +870,8 @@ def _train_inner(args, out: Path, device: str, revision: str):
     suite = build_suite()
     suite_manifest = _suite_v3_contract(suite)
     suite_sha = suite_manifest["suite_hash"]
-    mode = mode_from_spec(args.interval, args.k)
+    mode = mode_from_spec(
+        args.interval, args.k, recurrence_only_lora=recurrence_only_lora)
     cfg = {
         "mode": mode,
         "model": args.model, "revision": revision,
@@ -814,6 +882,8 @@ def _train_inner(args, out: Path, device: str, revision: str):
         "optimizer": args.optimizer, "weight_decay": args.weight_decay,
         "lr_schedule": args.lr_schedule, "warmup": args.warmup,
         "clip": args.clip, "detach_z0": args.detach_z0,
+        "recurrence_only_lora": recurrence_only_lora,
+        "runtime_contract": rec.runtime_contract(),
         "device": device,
         "label": getattr(args, "label", None),
         "suite_sha256": suite_sha,
@@ -1063,6 +1133,7 @@ def cmd_eval(args):
     report = strict_json_loads(
         (Path(args.adapter) / "train_report.json").read_text())
     cfg = report["config"]
+    recurrence_only_lora = _recurrence_only_lora_from_config(cfg)
     model_id = cfg.get("model")
     if not isinstance(model_id, str) or not model_id:
         raise ValueError(
@@ -1166,8 +1237,15 @@ def cmd_eval(args):
     model, tok = load_model(device, model_id, revision)
     interval = tuple(cfg["interval"])
     rec = LocalizedRecurrence(model, None, interval=interval,
-                              max_k=cfg["max_k"], lora_r=cfg["lora_r"],
-                              lora_alpha=float(cfg.get("lora_alpha", 16.0)))
+                               max_k=cfg["max_k"], lora_r=cfg["lora_r"],
+                               lora_alpha=float(cfg.get("lora_alpha", 16.0)),
+                               recurrence_only_lora=recurrence_only_lora)
+    stored_runtime_contract = cfg.get("runtime_contract")
+    if stored_runtime_contract is not None \
+            and stored_runtime_contract != rec.runtime_contract():
+        raise AdapterBundleIdentityError(
+            "adapter runtime_contract disagrees with the constructed "
+            "LocalizedRecurrence runtime")
     rec.load_adapter_state(state)
 
     split_name = args.split
@@ -1236,6 +1314,10 @@ def main():
     tr.add_argument("--weight-decay", type=float, default=0.01)
     tr.add_argument("--clip", type=float, default=0.5)
     tr.add_argument("--detach-z0", action="store_true")
+    tr.add_argument(
+        "--recurrence-only-lora", action="store_true",
+        help="activate LoRA only inside latent recurrence; prompt/readout use "
+             "the frozen base model (K=0 training is unsupported)")
     tr.add_argument("--label", default=None,
                     help="preregistered run label (bound into evidence; "
                     "never derived from output path)")

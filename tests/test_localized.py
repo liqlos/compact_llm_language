@@ -15,6 +15,7 @@ transformers = pytest.importorskip("transformers")
 from latent_lab.backends.localized import (
     LatentLoopViolation,
     LocalizedRecurrence,
+    LoRALinear,
 )
 
 
@@ -166,6 +167,88 @@ def test_lora_freeze_and_zero_init_identity():
     with torch.no_grad():
         z_on, _ = rec2.latent_steps(z0, cache, 6, 2, ablate={"clocks": "off"})
         assert z_on.shape == z0.shape
+
+
+def test_lora_runtime_toggle_is_exact_frozen_base_bypass():
+    base = torch.nn.Linear(8, 8, bias=False)
+    lora = LoRALinear(base, r=2, alpha=4)
+    x = torch.randn(2, 3, 8)
+    with torch.no_grad():
+        lora.lora_B.normal_(mean=0.0, std=0.2)
+        lora.enabled = False
+        disabled = lora(x)
+        assert torch.equal(disabled, base(x))
+        lora.enabled = True
+        enabled = lora(x)
+    assert not torch.equal(enabled, disabled)
+
+
+def test_recurrence_only_lora_routes_stages_and_makes_k0_adapter_free():
+    model, tok = build_tiny_hybrid()
+    rec2 = LocalizedRecurrence(
+        model, tok, interval=INTERVAL, max_k=2, lora_r=2,
+        use_clock=False, recurrence_only_lora=True)
+    assert rec2.runtime_contract()["adapter_activation_policy"] == \
+        "recurrence_only"
+    assert all(not adapter.enabled for adapter in rec2.injected)
+
+    calls = []
+    handles = [adapter.register_forward_pre_hook(
+        lambda module, _inputs: calls.append(module.enabled))
+        for adapter in rec2.injected]
+    ids = torch.randint(0, 250, (1, 6))
+    answer = torch.tensor([[10, 11]])
+    with torch.no_grad():
+        cache, z0 = rec2._encode(ids)
+        assert calls and not any(calls), "prompt prefill used LoRA residuals"
+        calls.clear()
+        z1, pos = rec2.latent_steps(z0, cache, ids.shape[1], 1)
+        assert calls and all(calls), "latent recurrence did not enable LoRA"
+        calls.clear()
+        rec2._score_candidate_tokens(z1, cache, pos, answer)
+        assert calls and not any(calls), "candidate readout used LoRA residuals"
+    for handle in handles:
+        handle.remove()
+    assert all(not adapter.enabled for adapter in rec2.injected)
+
+    candidates = ([10, 11], [12, 13])
+    with torch.no_grad():
+        for adapter in rec2.injected:
+            adapter.lora_B.zero_()
+        k0_before, _ = rec2.score_candidates(ids, candidates, 0)
+        k1_before, _ = rec2.score_candidates(ids, candidates, 1)
+        generator = torch.Generator().manual_seed(17)
+        for adapter in rec2.injected:
+            adapter.lora_B.copy_(
+                torch.randn(adapter.lora_B.shape, generator=generator) * 0.2)
+        k0_after, k0_report = rec2.score_candidates(ids, candidates, 0)
+        k1_after, _ = rec2.score_candidates(ids, candidates, 1)
+
+    def sums(rows):
+        return [row.raw_sum_logprob for row in rows]
+
+    assert sums(k0_before) == sums(k0_after), \
+        "K=0 changed when recurrence-only adapter weights changed"
+    assert sums(k1_before) != sums(k1_after), \
+        "K>0 ignored recurrence-only adapter weights"
+    compute = k0_report.extra["compute"]
+    assert compute["prefill_adapter_active"] is False
+    assert compute["recurrence_adapter_active"] is True
+    assert compute["candidate_adapter_active"] is False
+
+    with pytest.raises(ValueError, match="no trainable path at K=0"):
+        rec2.loss_on_example(ids, answer, 0)
+
+    for parameter in rec2.trainable_parameters():
+        parameter.grad = None
+    loss = rec2.loss_on_example(ids, answer, 1)
+    assert loss.requires_grad
+    loss.backward()
+    assert any(parameter.grad is not None
+               and bool(torch.isfinite(parameter.grad).all())
+               and float(parameter.grad.abs().sum()) > 0.0
+               for parameter in rec2.trainable_parameters())
+    assert all(not adapter.enabled for adapter in rec2.injected)
 
 
 def test_clock_changes_state_after_perturbation(rec):
