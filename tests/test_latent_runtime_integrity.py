@@ -326,6 +326,54 @@ def test_candidate_ce_objective_is_mode_bound_before_adapter_policy():
             "recurrence_only_lora": False})
 
 
+def test_neutral_delta_is_mode_bound_before_objective_and_adapter_policy():
+    from latent_lab.bench import latent_run
+
+    mode = latent_run.mode_from_spec(
+        "full", 4, recurrence_only_lora=True,
+        training_objective="candidate_ce", neutral_delta=True)
+    assert mode == (
+        "D-full+neutral-delta+candidate-ce+recurrence-only-lora")
+    contract = {
+        "adapter_activation_policy": "recurrence_only",
+        "prefill_adapter_active": False,
+        "recurrence_adapter_active": True,
+        "candidate_adapter_active": False,
+    }
+    cfg = _cfg(
+        mode=mode, interval=[0, 4], training_objective="candidate_ce",
+        recurrence_only_lora=True, neutral_delta=True,
+        runtime_contract=contract)
+    recurrence = latent_run._recurrence_config(cfg)
+    assert recurrence["neutral_delta"] is True
+    assert recurrence["mode"] == mode
+
+    common = dict(
+        mode="D-full", interval=(0, 4), k=4, max_k=4,
+        lora_r=8, lora_alpha=16.0, lr=2e-4, steps=20, seed=0,
+        optimizer="adamw", weight_decay=0.01, lr_schedule="constant",
+        warmup=2, clip=0.5, detach_z0=False, suite_sha256=SUITE_SHA,
+        recurrence_only_lora=True)
+    assert latent_run.train_recipe_digest(**common) != \
+        latent_run.train_recipe_digest(**common, neutral_delta=True)
+
+    with pytest.raises(ValueError, match="interval='full'"):
+        latent_run.mode_from_spec(
+            "mid", 4, recurrence_only_lora=True, neutral_delta=True)
+    with pytest.raises(ValueError, match="recurrence-only LoRA"):
+        latent_run.mode_from_spec("full", 4, neutral_delta=True)
+    with pytest.raises(ValueError, match="mode and neutral_delta disagree"):
+        latent_run._neutral_delta_from_config({
+            **cfg, "mode": "D-full+candidate-ce+recurrence-only-lora"})
+    with pytest.raises(ValueError, match="malformed neutral-delta"):
+        latent_run._neutral_delta_from_config({
+            **cfg,
+            "mode": "D-full+candidate-ce+neutral-delta+recurrence-only-lora"})
+    with pytest.raises(ValueError, match="recurrence_only_lora=true"):
+        latent_run._neutral_delta_from_config({
+            **cfg, "recurrence_only_lora": False})
+
+
 def test_recurrence_only_lora_k0_training_fails_before_model_load(tmp_path):
     from latent_lab.bench import latent_run
 

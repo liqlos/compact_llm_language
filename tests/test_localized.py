@@ -251,6 +251,125 @@ def test_recurrence_only_lora_routes_stages_and_makes_k0_adapter_free():
     assert all(not adapter.enabled for adapter in rec2.injected)
 
 
+def build_neutral_delta(max_k=4):
+    model, tok = build_tiny_hybrid()
+    return model, LocalizedRecurrence(
+        model, tok, interval=(0, model.config.num_hidden_layers),
+        max_k=max_k, lora_r=2, recurrence_only_lora=True,
+        neutral_delta=True)
+
+
+def _token_logprobs(details):
+    return [row.token_logprobs for row in details]
+
+
+def test_neutral_delta_zero_gates_execute_k4_but_are_bit_exact_k0():
+    _model, rec2 = build_neutral_delta()
+    ids = torch.randint(0, 250, (1, 7))
+    candidates = ([10, 11, 12], [13, 14])
+    k0, report0 = rec2.score_candidates(ids, candidates, 0)
+    k4, report4 = rec2.score_candidates(ids, candidates, 4)
+
+    assert rec2.step_gates.dtype == torch.float32
+    assert rec2.step_gates.shape == (4,)
+    assert torch.count_nonzero(rec2.step_gates).item() == 0
+    assert "step_gates" in rec2.adapter_state_dict()
+    assert any(parameter is rec2.step_gates
+               for parameter in rec2.trainable_parameters())
+    assert _token_logprobs(k4) == _token_logprobs(k0)
+    assert report4.extra["recurrence_interval_layer_applications"] == 16
+    assert report4.extra["readout_position"] == ids.shape[1]
+    assert report0.extra["readout_position"] == ids.shape[1]
+    assert report4.extra["recurrence_cache_at_readout"] == \
+        "target_prompt_only"
+
+
+def test_neutral_delta_full_reset_is_bit_exact_k0_after_opening_adapter():
+    _model, rec2 = build_neutral_delta()
+    ids = torch.randint(0, 250, (1, 7))
+    candidates = ([10, 11, 12], [13, 14, 15])
+    generator = torch.Generator().manual_seed(91)
+    with torch.no_grad():
+        rec2.step_gates.fill_(0.7)
+        rec2.clock.weight.normal_(mean=0.0, std=0.1, generator=generator)
+        for adapter in rec2.injected:
+            adapter.lora_B.copy_(torch.randn(
+                adapter.lora_B.shape, generator=generator) * 0.1)
+    k0, _ = rec2.score_candidates(ids, candidates, 0)
+    reset, report = rec2.score_candidates(
+        ids, candidates, 4,
+        ablate={"reset_state": True, "reset_cache": True})
+    assert _token_logprobs(reset) == _token_logprobs(k0)
+    assert report.extra["compute"]["k_loops"] == 4
+    assert report.extra["readout_position"] == ids.shape[1]
+
+
+def test_neutral_delta_multitoken_k4_matches_direct_incremental_hf_at_init():
+    model, rec2 = build_neutral_delta()
+    ids = torch.randint(0, 250, (1, 8))
+    candidate = torch.tensor([[10, 11, 12, 13]])
+    details, _ = rec2.score_candidates(ids, [candidate[0].tolist()], 4)
+
+    from transformers import DynamicCache
+    cache = DynamicCache(config=model.config)
+    oracle = []
+    with torch.no_grad():
+        output = model(input_ids=ids, past_key_values=cache, use_cache=True)
+        for index, target in enumerate(candidate[0]):
+            logp = torch.log_softmax(output.logits[:, -1:, :].float(), dim=-1)
+            oracle.append(float(logp[0, 0, target]))
+            if index + 1 < candidate.shape[1]:
+                output = model(
+                    input_ids=candidate[:, index:index + 1],
+                    past_key_values=cache, use_cache=True)
+    assert details[0].token_logprobs == tuple(oracle)
+
+
+def test_neutral_delta_gate_gradient_at_init_then_lora_gradient_after_open():
+    _model, rec2 = build_neutral_delta(max_k=2)
+    ids = torch.randint(0, 250, (1, 7))
+    candidates = ([10, 11], [12, 13], [14, 15])
+
+    loss = rec2.candidate_ce_loss_on_example(
+        ids, candidates, gold_index=1, k_steps=2)
+    assert loss.requires_grad and torch.isfinite(loss)
+    loss.backward()
+    gate_grad = rec2.step_gates.grad
+    assert gate_grad is not None and torch.isfinite(gate_grad).all()
+    assert torch.count_nonzero(gate_grad).item() > 0
+
+    for parameter in rec2.trainable_parameters():
+        parameter.grad = None
+    with torch.no_grad():
+        rec2.step_gates.fill_(0.1)
+    opened_loss = rec2.candidate_ce_loss_on_example(
+        ids, candidates, gold_index=1, k_steps=2)
+    assert opened_loss.requires_grad and torch.isfinite(opened_loss)
+    opened_loss.backward()
+    lora_gradients = [
+        adapter.lora_B.grad for adapter in rec2.injected
+        if adapter.lora_B.grad is not None
+    ]
+    assert lora_gradients
+    assert all(torch.isfinite(gradient).all()
+               for gradient in lora_gradients)
+    assert any(torch.count_nonzero(gradient).item() > 0
+               for gradient in lora_gradients)
+
+
+def test_neutral_delta_rejects_non_full_or_shared_adapter_modes():
+    model, tok = build_tiny_hybrid()
+    with pytest.raises(ValueError, match="full-decoder"):
+        LocalizedRecurrence(
+            model, tok, interval=INTERVAL, max_k=2,
+            recurrence_only_lora=True, neutral_delta=True)
+    model, tok = build_tiny_hybrid()
+    with pytest.raises(ValueError, match="recurrence_only_lora"):
+        LocalizedRecurrence(
+            model, tok, interval=(0, model.config.num_hidden_layers),
+            max_k=2, neutral_delta=True)
+
+
 def test_clock_changes_state_after_perturbation(rec):
     with torch.no_grad():
         rec.clock.weight.fill_(0.01)

@@ -165,6 +165,7 @@ LORA_TARGET_SUFFIXES = (
 )
 RECURRENCE_ONLY_LORA_MODE_SUFFIX = "+recurrence-only-lora"
 CANDIDATE_CE_MODE_SUFFIX = "+candidate-ce"
+NEUTRAL_DELTA_MODE_SUFFIX = "+neutral-delta"
 TRAINING_OBJECTIVES = ("gold_nll", "candidate_ce")
 
 
@@ -382,17 +383,19 @@ class CandidateScoreDetail:
 class LocalizedRecurrence:
     """Frozen-backbone localized recurrence with guarded latent loop."""
 
-    RUNTIME_CONTRACT_VERSION = "localized_recurrence.runtime.v3"
+    RUNTIME_CONTRACT_VERSION = "localized_recurrence.runtime.v4"
     TRAINING_GRADIENT_SEMANTICS = (
         "hidden_state_chain_bptt_with_detached_cache_recurrence"
     )
 
     def __init__(self, model, tokenizer=None, *, interval, max_k=16,
                  lora_r=8, lora_alpha=16.0, use_clock=True,
-                 recurrence_only_lora=False):
+                 recurrence_only_lora=False, neutral_delta=False):
         _require_torch("LocalizedRecurrence")
         if not isinstance(recurrence_only_lora, bool):
             raise ValueError("recurrence_only_lora must be a boolean")
+        if not isinstance(neutral_delta, bool):
+            raise ValueError("neutral_delta must be a boolean")
         self.model = model
         # frozen-backbone contract: nothing except LoRA/clock may train
         for p in model.parameters():
@@ -417,6 +420,12 @@ class LocalizedRecurrence:
         if not (0 <= lo < hi <= self.n_layers):
             raise ValueError(f"bad interval {interval} for {self.n_layers}L")
         self.interval = (lo, hi)
+        if neutral_delta and self.interval != (0, self.n_layers):
+            raise ValueError(
+                "neutral_delta requires full-decoder interval=(0, n_layers)")
+        if neutral_delta and not recurrence_only_lora:
+            raise ValueError(
+                "neutral_delta requires recurrence_only_lora=True")
         if isinstance(max_k, bool) or not isinstance(max_k, int) or max_k < 0:
             raise ValueError("max_k must be a non-negative integer")
         self.max_k = max_k
@@ -427,6 +436,11 @@ class LocalizedRecurrence:
         dev = next(model.parameters()).device
         # clock trainables are explicitly fp32; never the global default dtype
         self.clock = make_step_clock(hidden, max_k, device=dev)
+        self.neutral_delta = neutral_delta
+        self.step_gates = None
+        if self.neutral_delta:
+            self.step_gates = torch.nn.Parameter(torch.zeros(
+                max_k, device=dev, dtype=torch.float32))
 
         self.injected = inject_lora(
             [self.base.layers[i] for i in range(lo, hi)],
@@ -451,6 +465,13 @@ class LocalizedRecurrence:
             "prefill_adapter_active": not self.recurrence_only_lora,
             "recurrence_adapter_active": True,
             "candidate_adapter_active": not self.recurrence_only_lora,
+            "neutral_delta": self.neutral_delta,
+            "recurrence_cache_policy": (
+                "restore_prompt_cache_each_step_fixed_position"
+                if self.neutral_delta else "append_recurrence_cache"),
+            "readout_state_policy": (
+                "canonical_decoder_boundary_plus_latent_delta"
+                if self.neutral_delta else "absolute_latent_carrier"),
             "gradient_checkpointing": "UNSUPPORTED_ABSENT",
             "candidate_scoring": "autoregressive_raw_per_token_logprobs",
             "same_adapter_supported_k": list(range(self.max_k + 1)),
@@ -597,19 +618,36 @@ class LocalizedRecurrence:
         idxs = parse_clock_mode(mode, k_steps)[:eff_k]
 
         lo, hi = self.interval
+        prompt_cache = None
+        if self.neutral_delta:
+            from ..backends.hf_qwen import cache_restore, cache_snapshot
+            prompt_cache = cache_snapshot(cache)
         with self.guard.window(), self._lora_scope(True):
             pos = start_pos
-            for ci in idxs:
-                zz = z
-                if self.use_clock and mode != "off":
-                    tok = torch.tensor([ci + 1], device=z.device)
-                    zz = zz + self.clock(tok).view(1, 1, -1).to(z.dtype)
-                if ab.get("bypass_interval"):
-                    z = zz
-                else:
-                    z = self._run_layers(range(lo, hi), zz, cache, pos,
-                                         grad=grad)
-                pos += 1
+            try:
+                for ci in idxs:
+                    if self.neutral_delta:
+                        cache_restore(cache, prompt_cache)
+                    zz = z
+                    if self.use_clock and mode != "off":
+                        tok = torch.tensor([ci + 1], device=z.device)
+                        zz = zz + self.clock(tok).view(1, 1, -1).to(z.dtype)
+                    if ab.get("bypass_interval"):
+                        proposal = zz
+                    else:
+                        proposal = self._run_layers(
+                            range(lo, hi), zz, cache, start_pos if
+                            self.neutral_delta else pos, grad=grad)
+                    if self.neutral_delta:
+                        gate = torch.tanh(self.step_gates[ci]).to(z.dtype)
+                        z = z + gate * (proposal - z)
+                        cache_restore(cache, prompt_cache)
+                    else:
+                        z = proposal
+                        pos += 1
+            finally:
+                if self.neutral_delta:
+                    cache_restore(cache, prompt_cache)
         # Causal state interventions happen after the requested recurrence,
         # immediately before readout.  Ablating z0 would let the loop rebuild
         # information from the prompt cache and could falsely look state-free.
@@ -631,7 +669,7 @@ class LocalizedRecurrence:
     # -- evaluation -------------------------------------------------------------
 
     def _score_candidate_tokens(self, z, cache, pos, candidate_ids, *,
-                                grad=False):
+                                grad=False, latent_delta=None):
         """Autoregressively score one non-empty candidate from raw token ids.
 
         The recurrence output predicts the first token.  Every preceding
@@ -643,6 +681,10 @@ class LocalizedRecurrence:
         if candidate_ids.ndim != 2 or candidate_ids.shape[0] != 1 \
                 or candidate_ids.shape[1] == 0:
             raise ValueError("candidate_ids must have shape [1, n] with n > 0")
+        if self.neutral_delta and latent_delta is None:
+            raise ValueError("neutral_delta readout requires latent_delta")
+        if not self.neutral_delta and latent_delta is not None:
+            raise ValueError("latent_delta readout requires neutral_delta mode")
 
         hi = self.interval[1]
         if hi < self.n_layers:
@@ -674,7 +716,8 @@ class LocalizedRecurrence:
             with self._lora_scope(False):
                 current = self._run_layers(
                     range(hi), hidden, cache, next_pos, grad=grad)
-                current = current + carrier
+                current = current + (
+                    latent_delta if self.neutral_delta else carrier)
                 current = self._run_layers(
                     range(hi, self.n_layers), current, cache, next_pos,
                     grad=grad)
@@ -755,6 +798,8 @@ class LocalizedRecurrence:
             # Orthogonal cache control: recurrence really executed and pos
             # remains prompt_len + effective_k, but readout sees prompt cache.
             cache_restore(cache, prompt_cache)
+        latent_delta = (z - z0) if self.neutral_delta else None
+        readout_state = z0 + latent_delta if self.neutral_delta else z
         if cuda_device is not None:
             torch.cuda.synchronize(cuda_device)
         t2 = time.perf_counter()
@@ -768,7 +813,7 @@ class LocalizedRecurrence:
             if ids.shape[1] == 0:
                 raise ValueError("candidate token sequences must be non-empty")
             token_tensors, counters = self._score_candidate_tokens(
-                z, cache, pos, ids)
+                readout_state, cache, pos, ids, latent_delta=latent_delta)
             token_logprobs = tuple(float(value) for value in token_tensors)
             if any(not math.isfinite(value) for value in token_logprobs):
                 bad = [i for i, value in enumerate(token_logprobs)
@@ -840,6 +885,7 @@ class LocalizedRecurrence:
             "prefill_adapter_active": not self.recurrence_only_lora,
             "recurrence_adapter_active": True,
             "candidate_adapter_active": not self.recurrence_only_lora,
+            "neutral_delta": self.neutral_delta,
         }
         rep = RecurrenceReport(
             k_steps=k_steps,
@@ -873,11 +919,15 @@ class LocalizedRecurrence:
                     if ab.get("reset_cache") else None),
                 "recurrence_cache_at_readout": (
                     "target_prompt_only"
-                    if (ab.get("reset_cache") or effective_k == 0
+                    if (self.neutral_delta or ab.get("reset_cache")
+                        or effective_k == 0
                         or ab.get("bypass_interval")) else
                     "prompt_plus_target_recurrence"),
                 "recurrence_start_position": loop_start,
                 "readout_position": pos,
+                "readout_position_policy": (
+                    "fixed_prompt_end" if self.neutral_delta
+                    else "prompt_end_plus_effective_k"),
                 "prefill_layer_applications": prefill_apps,
                 "recurrence_interval_layer_applications": recurrence_apps,
                 "recurrence_effective_k": effective_k,
@@ -979,8 +1029,11 @@ class LocalizedRecurrence:
                                    grad=True, ablate=ab)
         if prompt_cache is not None:
             cache_restore(cache, prompt_cache)
+        latent_delta = (z - z0) if self.neutral_delta else None
+        readout_state = z0 + latent_delta if self.neutral_delta else z
         token_logprobs, _counters = self._score_candidate_tokens(
-            z, cache, pos, answer_ids, grad=True)
+            readout_state, cache, pos, answer_ids, grad=True,
+            latent_delta=latent_delta)
         return -token_logprobs.mean()
 
     @staticmethod
@@ -1034,6 +1087,8 @@ class LocalizedRecurrence:
             cache_restore(cache, prompt_cache)
 
         recurrence_cache = cache_snapshot(cache)
+        latent_delta = (z - z0) if self.neutral_delta else None
+        readout_state = z0 + latent_delta if self.neutral_delta else z
         scores = []
         for candidate in candidate_ids:
             cache_restore(cache, recurrence_cache)
@@ -1042,7 +1097,8 @@ class LocalizedRecurrence:
             if ids.shape[1] == 0:
                 raise ValueError("candidate token sequences must be non-empty")
             token_logprobs, _counters = self._score_candidate_tokens(
-                z, cache, pos, ids, grad=True)
+                readout_state, cache, pos, ids, grad=True,
+                latent_delta=latent_delta)
             scores.append(token_logprobs.mean())
         return self.candidate_cross_entropy(scores, gold_index)
 
@@ -1050,6 +1106,8 @@ class LocalizedRecurrence:
         ps = lora_parameters(self.injected)
         if self.use_clock:
             ps += list(self.clock.parameters())
+        if getattr(self, "neutral_delta", False):
+            ps.append(self.step_gates)
         return ps
 
     def adapter_state_dict(self):
@@ -1060,6 +1118,8 @@ class LocalizedRecurrence:
                    for i, l in enumerate(self.injected)})
         if self.use_clock:
             sd["clock.weight"] = self.clock.weight.detach().to("cpu").clone()
+        if getattr(self, "neutral_delta", False):
+            sd["step_gates"] = self.step_gates.detach().to("cpu").clone()
         return sd
 
     def _expected_adapter_targets(self):
@@ -1069,6 +1129,8 @@ class LocalizedRecurrence:
             targets[f"lora.{i}.B"] = l.lora_B
         if self.use_clock:
             targets["clock.weight"] = self.clock.weight
+        if getattr(self, "neutral_delta", False):
+            targets["step_gates"] = self.step_gates
         return targets
 
     def load_adapter_state(self, sd):
@@ -1168,6 +1230,32 @@ class LocalizedRecurrence:
             drift.append(
                 f"recurrence_only_lora {claimed_policy} != runtime "
                 f"{self.recurrence_only_lora}")
+        claimed_neutral = config.get("neutral_delta", False)
+        if not isinstance(claimed_neutral, bool):
+            drift.append("neutral_delta is not a boolean")
+            claimed_neutral = None
+        neutral_count = recipe["mode"].count(NEUTRAL_DELTA_MODE_SUFFIX)
+        neutral_core = recipe["mode"].removesuffix(
+            RECURRENCE_ONLY_LORA_MODE_SUFFIX).removesuffix(
+                CANDIDATE_CE_MODE_SUFFIX)
+        mode_has_neutral = neutral_count == 1 and neutral_core.endswith(
+            NEUTRAL_DELTA_MODE_SUFFIX)
+        if neutral_count > 1 or (neutral_count == 1 and not mode_has_neutral):
+            drift.append("mode carries a malformed neutral-delta suffix")
+        if claimed_neutral is not None and claimed_neutral != mode_has_neutral:
+            drift.append(
+                f"mode {recipe['mode']!r} does not seal "
+                f"neutral_delta={claimed_neutral}")
+        if claimed_neutral is not None \
+                and claimed_neutral != getattr(self, "neutral_delta", False):
+            drift.append(
+                f"neutral_delta {claimed_neutral} != runtime "
+                f"{getattr(self, 'neutral_delta', False)}")
+        if claimed_neutral and not claimed_policy:
+            drift.append("neutral_delta requires recurrence_only_lora=true")
+        if claimed_neutral and self.interval != (
+                0, getattr(self, "n_layers", self.interval[1])):
+            drift.append("neutral_delta requires the full decoder interval")
         stored_contract = config.get("runtime_contract")
         if claimed_policy and stored_contract is None:
             drift.append("recurrence-only LoRA lacks runtime_contract metadata")

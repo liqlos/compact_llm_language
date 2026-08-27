@@ -30,6 +30,7 @@ from pathlib import Path
 
 from latent_lab.backends.localized import (
     CANDIDATE_CE_MODE_SUFFIX,
+    NEUTRAL_DELTA_MODE_SUFFIX,
     RECURRENCE_ONLY_LORA_MODE_SUFFIX,
     TRAINING_OBJECTIVES,
     training_objective_from_config,
@@ -585,6 +586,39 @@ def _training_objective_mode(mode: str, training_objective: str) -> str:
     return mode + recurrence_suffix
 
 
+def _neutral_delta_mode(mode: str, neutral_delta: bool) -> str:
+    """Seal neutral-delta before objective and adapter-policy suffixes."""
+    if not isinstance(neutral_delta, bool):
+        raise ValueError("neutral_delta must be a boolean")
+    recurrence_count = mode.count(RECURRENCE_ONLY_LORA_MODE_SUFFIX)
+    if recurrence_count > 1 or (recurrence_count == 1 and not mode.endswith(
+            RECURRENCE_ONLY_LORA_MODE_SUFFIX)):
+        raise ValueError("mode carries a malformed recurrence-only suffix")
+    recurrence_suffix = (RECURRENCE_ONLY_LORA_MODE_SUFFIX
+                         if recurrence_count else "")
+    core = mode.removesuffix(recurrence_suffix)
+    objective_count = core.count(CANDIDATE_CE_MODE_SUFFIX)
+    if objective_count > 1 or (objective_count == 1 and not core.endswith(
+            CANDIDATE_CE_MODE_SUFFIX)):
+        raise ValueError("mode carries a malformed candidate-CE suffix")
+    objective_suffix = CANDIDATE_CE_MODE_SUFFIX if objective_count else ""
+    core = core.removesuffix(objective_suffix)
+    count = core.count(NEUTRAL_DELTA_MODE_SUFFIX)
+    if count > 1 or (count == 1 and not core.endswith(
+            NEUTRAL_DELTA_MODE_SUFFIX)):
+        raise ValueError("mode carries a malformed neutral-delta suffix")
+    if neutral_delta:
+        base = core.removesuffix(NEUTRAL_DELTA_MODE_SUFFIX)
+        if base != "D-full":
+            raise ValueError("neutral_delta requires D-full mode")
+        if not count:
+            core += NEUTRAL_DELTA_MODE_SUFFIX
+        return core + objective_suffix + recurrence_suffix
+    if count:
+        raise ValueError("mode claims neutral_delta but neutral_delta is false")
+    return core + objective_suffix + recurrence_suffix
+
+
 def _recurrence_only_lora_from_config(cfg: dict) -> bool:
     """Recover and cross-check the policy sealed into the recipe's mode."""
     value = cfg.get("recurrence_only_lora", False)
@@ -622,12 +656,50 @@ def _recurrence_only_lora_from_config(cfg: dict) -> bool:
     return value
 
 
+def _neutral_delta_from_config(cfg: dict) -> bool:
+    """Recover neutral-delta and reject suffix/order/config disagreement."""
+    value = cfg.get("neutral_delta", False)
+    if not isinstance(value, bool):
+        raise ValueError("config.neutral_delta must be a boolean")
+    mode = cfg.get("mode")
+    if not isinstance(mode, str):
+        raise ValueError("config.mode must be a string")
+    core = mode.removesuffix(RECURRENCE_ONLY_LORA_MODE_SUFFIX)
+    if CANDIDATE_CE_MODE_SUFFIX in core \
+            and not core.endswith(CANDIDATE_CE_MODE_SUFFIX):
+        raise ValueError(
+            "config.mode carries malformed neutral-delta suffix ordering")
+    core = core.removesuffix(CANDIDATE_CE_MODE_SUFFIX)
+    count = mode.count(NEUTRAL_DELTA_MODE_SUFFIX)
+    sealed = count == 1 and core.endswith(NEUTRAL_DELTA_MODE_SUFFIX)
+    if count > 1 or (count == 1 and not sealed):
+        raise ValueError("config.mode carries a malformed neutral-delta suffix")
+    if value != sealed:
+        raise ValueError(
+            "config mode and neutral_delta disagree; refusing an unsealed "
+            "neutral recurrence architecture")
+    if value:
+        if cfg.get("recurrence_only_lora") is not True:
+            raise ValueError(
+                "neutral_delta requires recurrence_only_lora=true")
+        base = core.removesuffix(NEUTRAL_DELTA_MODE_SUFFIX)
+        if base != "D-full":
+            raise ValueError("neutral_delta requires D-full mode")
+        interval = cfg.get("interval")
+        if not isinstance(interval, (list, tuple)) or len(interval) != 2 \
+                or interval[0] != 0:
+            raise ValueError(
+                "neutral_delta requires a full decoder interval beginning at 0")
+    return value
+
+
 def _recurrence_config(cfg: dict) -> dict:
     """Measured recurrence settings; unsupported flags cannot enter v3."""
     if cfg.get("grad_checkpoint") not in (None, False):
         raise ValueError("grad_checkpoint=true is unsupported")
     training_objective_from_config(cfg)
     recurrence_only_lora = _recurrence_only_lora_from_config(cfg)
+    neutral_delta = _neutral_delta_from_config(cfg)
     return {
         "mode": cfg["mode"],
         "interval": list(cfg["interval"]),
@@ -637,6 +709,7 @@ def _recurrence_config(cfg: dict) -> dict:
         "lora_alpha": cfg["lora_alpha"],
         "detach_z0": cfg["detach_z0"],
         "recurrence_only_lora": recurrence_only_lora,
+        "neutral_delta": neutral_delta,
         "adapter_activation_policy": (
             "recurrence_only" if recurrence_only_lora else "all_stages"),
     }
@@ -736,10 +809,16 @@ def recipe_from_config(cfg: dict, suite_sha256: str) -> dict:
 
 def mode_from_spec(interval_spec: str, k: int,
                    recurrence_only_lora: bool = False,
-                   training_objective: str = "gold_nll") -> str:
+                   training_objective: str = "gold_nll",
+                   neutral_delta: bool = False) -> str:
     """The preregistered mode implied by the interval spec and K."""
     base = ("D-full" if interval_spec == "full"
             else "F-control" if k == 0 else "E-localized")
+    if neutral_delta and (interval_spec != "full" or
+                          not recurrence_only_lora):
+        raise ValueError(
+            "neutral_delta requires interval='full' and recurrence-only LoRA")
+    base = _neutral_delta_mode(base, neutral_delta)
     objective_mode = _training_objective_mode(base, training_objective)
     return _adapter_policy_mode(objective_mode, recurrence_only_lora)
 
@@ -749,7 +828,8 @@ def train_recipe_digest(*, mode, interval, k, max_k, lora_r, lora_alpha,
                          lr_schedule, warmup, clip, detach_z0,
                          suite_sha256, grad_checkpoint=None,
                          recurrence_only_lora=False,
-                         training_objective="gold_nll") -> str:
+                         training_objective="gold_nll",
+                         neutral_delta=False) -> str:
     """ONE canonical digest binding EVERY behavior-changing field.
 
     The single source of truth shared by the trainer and the paid
@@ -759,9 +839,12 @@ def train_recipe_digest(*, mode, interval, k, max_k, lora_r, lora_alpha,
     ``grad_checkpoint`` keyword is accepted only as a false migration input;
     checkpointing.recipe_from_config rejects true and never persists it.
     """
+    if neutral_delta and not recurrence_only_lora:
+        raise ValueError("neutral_delta requires recurrence_only_lora=true")
     cfg = {
         "mode": _adapter_policy_mode(
-            _training_objective_mode(mode, training_objective),
+            _training_objective_mode(
+                _neutral_delta_mode(mode, neutral_delta), training_objective),
             recurrence_only_lora),
         "interval": list(interval), "k": k, "max_k": max_k,
         "lora_r": lora_r, "lora_alpha": lora_alpha,
@@ -899,7 +982,14 @@ def _train_inner(args, out: Path, device: str, revision: str):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    recurrence_only_lora = getattr(args, "recurrence_only_lora", False)
+    neutral_delta = getattr(args, "neutral_delta", False)
+    if not isinstance(neutral_delta, bool):
+        raise ValueError("--neutral-delta must be a boolean flag")
+    if neutral_delta and args.interval != "full":
+        raise ValueError("--neutral-delta requires --interval full")
+    # Neutral-delta is defined with adapters active only in its proposal loop.
+    recurrence_only_lora = (
+        getattr(args, "recurrence_only_lora", False) or neutral_delta)
     training_objective = getattr(args, "training_objective", "gold_nll")
     _training_objective_mode("D-full", training_objective)
     if recurrence_only_lora and args.k == 0:
@@ -912,7 +1002,8 @@ def _train_inner(args, out: Path, device: str, revision: str):
         args.interval, model.config.num_hidden_layers)
     rec = LocalizedRecurrence(model, None, interval=interval, max_k=args.max_k,
                               lora_r=args.lora_r, lora_alpha=args.lora_alpha,
-                              recurrence_only_lora=recurrence_only_lora)
+                              recurrence_only_lora=recurrence_only_lora,
+                              neutral_delta=neutral_delta)
     rec.clock.to(device)
     params = [p for p in rec.trainable_parameters()]
     if args.optimizer != "adamw":
@@ -926,7 +1017,7 @@ def _train_inner(args, out: Path, device: str, revision: str):
     suite_sha = suite_manifest["suite_hash"]
     mode = mode_from_spec(
         args.interval, args.k, recurrence_only_lora=recurrence_only_lora,
-        training_objective=training_objective)
+        training_objective=training_objective, neutral_delta=neutral_delta)
     cfg = {
         "mode": mode,
         "model": args.model, "revision": revision,
@@ -939,6 +1030,7 @@ def _train_inner(args, out: Path, device: str, revision: str):
         "clip": args.clip, "detach_z0": args.detach_z0,
         "training_objective": training_objective,
         "recurrence_only_lora": recurrence_only_lora,
+        "neutral_delta": neutral_delta,
         "runtime_contract": rec.runtime_contract(),
         "device": device,
         "label": getattr(args, "label", None),
@@ -1192,6 +1284,7 @@ def cmd_eval(args):
     cfg = report["config"]
     training_objective_from_config(cfg)
     recurrence_only_lora = _recurrence_only_lora_from_config(cfg)
+    neutral_delta = _neutral_delta_from_config(cfg)
     model_id = cfg.get("model")
     if not isinstance(model_id, str) or not model_id:
         raise ValueError(
@@ -1297,7 +1390,8 @@ def cmd_eval(args):
     rec = LocalizedRecurrence(model, None, interval=interval,
                                max_k=cfg["max_k"], lora_r=cfg["lora_r"],
                                lora_alpha=float(cfg.get("lora_alpha", 16.0)),
-                               recurrence_only_lora=recurrence_only_lora)
+                               recurrence_only_lora=recurrence_only_lora,
+                               neutral_delta=neutral_delta)
     stored_runtime_contract = cfg.get("runtime_contract")
     if stored_runtime_contract is not None \
             and stored_runtime_contract != rec.runtime_contract():
@@ -1380,7 +1474,11 @@ def main():
     tr.add_argument(
         "--recurrence-only-lora", action="store_true",
         help="activate LoRA only inside latent recurrence; prompt/readout use "
-             "the frozen base model (K=0 training is unsupported)")
+              "the frozen base model (K=0 training is unsupported)")
+    tr.add_argument(
+        "--neutral-delta", action="store_true",
+        help="full-decoder ReZero delta recurrence at fixed prompt-end cache; "
+             "implies recurrence-only LoRA")
     tr.add_argument("--label", default=None,
                     help="preregistered run label (bound into evidence; "
                     "never derived from output path)")
