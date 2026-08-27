@@ -27,12 +27,13 @@ FAIL-CLOSED contract (every known fail-open is a blocker, never a skip):
 * Discovery is symmetric: orphan checkpoints, orphan eval files,
   byte-duplicate checkpoints bound to more than one run directory, and
   unreadable artifacts are explicit blockers.
-* Every retained loadable checkpoint (2B AND live 4B) needs valid
-  rescored raw-score eval evidence bound to it (adapter path + model +
-  revision + current suite hash) covering every required behavioral-v3
-  split (test_id, length OOD, semantic/template OOD, and untouched final)
-  over the COMPLETE preregistered example set of each declared split; a
-  lone labelled or relabelled record proves nothing globally.
+* Every retained loadable checkpoint (2B AND live 4B) needs validated and
+  independently rescored ``latent_eval.v3`` evidence bound to it (adapter
+  path + model + revision + current suite hash) covering every required
+  behavioral-v3 split (test_id, length OOD, semantic/template OOD, and
+  untouched final) over the COMPLETE preregistered example set of each
+  declared split; a lone labelled or relabelled record proves nothing
+  globally. Legacy salvage results are never current evidence.
 * The rejected 4B batch must be nonempty, markered, and complete: any
   known-invalid or byte-duplicate 4B artifact left in any live tree is a
   blocker; one differing file does not mask other identical live copies;
@@ -90,8 +91,8 @@ from pathlib import Path
 
 from .corrected_scoring import (
     INVALID_RECORDS,
+    LEGACY_RAW_RESCORED,
     MISSING_RAW_PREDICTION,
-    RESCORED_CORRECTED,
     select_best_checkpoint as select_legacy_checkpoint,
 )
 from .eval_v3 import (
@@ -139,6 +140,10 @@ REQUIRED_SPLITS = (
 SPLIT_MEMBERSHIP_VIOLATION = "SPLIT_MEMBERSHIP_VIOLATION"
 IRRECOVERABLE_LEGACY_SCORER = "IRRECOVERABLE_LEGACY_SCORER"
 HISTORICAL_UNBOUND_LEGACY_SCORER = "HISTORICAL_UNBOUND_LEGACY_SCORER"
+# Persisted status for records that passed the canonical latent_eval.v3
+# validator and exact offline rescore. It is deliberately distinct in code
+# from corrected_scoring.LEGACY_RAW_RESCORED.
+CURRENT_V3_RESCORED = "RESCORED_CORRECTED"
 
 _PINNED_REVISION_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 _SUITE_SHA_RE = re.compile(r"\A[0-9a-f]{64}\Z")
@@ -155,6 +160,7 @@ REQUIRED_CONFIG_FIELDS = {
 EVAL_BAD_STATUSES = frozenset({
     "unreadable", "malformed_json", "invalid_metadata", "suite_mismatch",
     "NO_RECORDS", INVALID_RECORDS, MISSING_RAW_PREDICTION,
+    LEGACY_RAW_RESCORED,
     SPLIT_MEMBERSHIP_VIOLATION, IRRECOVERABLE_LEGACY_SCORER,
     HISTORICAL_UNBOUND_LEGACY_SCORER,
 })
@@ -198,7 +204,7 @@ BLOCKER_ACTIONS = {
         "its owning run directory; delete or quarantine every other "
         "byte-identical copy so the binding is unambiguous.",
     "EVAL_SPLIT_COVERAGE_MISSING":
-        "Run the corrected raw-score evaluation for every listed "
+        "Run canonical latent_eval.v3 evaluation for every listed "
         "(run, split) pair before treating the checkpoint as proven.",
     "EVAL_SPLIT_MEMBERSHIP_VIOLATION":
         "Re-run evaluation per split over exactly the preregistered "
@@ -1004,7 +1010,7 @@ def evaluate_eval_file(path: Path, examples_by_id: dict | None,
         from .corrected_scoring import rescore_records
 
         outcome = rescore_records(records, examples_by_id)
-        if outcome.status == RESCORED_CORRECTED:
+        if outcome.status == LEGACY_RAW_RESCORED:
             out["status"] = HISTORICAL_UNBOUND_LEGACY_SCORER
             out["evidence_class"] = HISTORICAL_UNBOUND_LEGACY_SCORER
             out["legacy_rescore_fraction"] = outcome.corrected_accuracy
@@ -1016,7 +1022,7 @@ def evaluate_eval_file(path: Path, examples_by_id: dict | None,
         # Current-suite raw legacy rows still undergo split-membership
         # validation below. Derived-only/invalid or old-suite legacy rows are
         # already fully classified here.
-        if outcome.status == RESCORED_CORRECTED and matches:
+        if outcome.status == LEGACY_RAW_RESCORED and matches:
             legacy_outcome = outcome
         reasons = []
         if outcome.detail:
@@ -1097,7 +1103,7 @@ def evaluate_eval_file(path: Path, examples_by_id: dict | None,
         out["record_adapter_id"] = records[0][
             "checkpoint_identity"]["adapter_id"]
         out["record_recipe_hash"] = records[0]["recipe_hash"]
-        out["status"] = RESCORED_CORRECTED
+        out["status"] = CURRENT_V3_RESCORED
         out["evidence_class"] = "VALID_CURRENT"
         out["corrected_accuracy"] = metrics["micro_accuracy"]
         out["metrics"] = metrics
@@ -1323,8 +1329,7 @@ def _norm_adapter(value) -> str | None:
 def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
              dry_run: bool = False, skip_proof_tests: bool = False,
              proof_log_path: Path | None = None,
-             proof_result: dict | None = None,
-             corrected_scorer_tag: str = "corrected-gold-aware-v1") -> GateResult:
+             proof_result: dict | None = None) -> GateResult:
     """Execute every gate stage and return the assembled result.
 
     ``proof_result`` is a TEST-ONLY injection hook for the executed proof
@@ -1627,7 +1632,7 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
                              if e.get("status")
                              == SPLIT_MEMBERSHIP_VIOLATION]
     rescored = [e for e in retained_eval_verdicts
-                if e.get("status") == RESCORED_CORRECTED]
+                if e.get("status") == CURRENT_V3_RESCORED]
     orphan_evals = [e for e in retained_eval_verdicts
                     if e.get("bound_run") is None]
 
@@ -1650,7 +1655,7 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
             for ev in retained_eval_verdicts:
                 if ev.get("bound_run") != rid:
                     continue
-                if ev.get("status") != RESCORED_CORRECTED:
+                if ev.get("status") != CURRENT_V3_RESCORED:
                     continue
                 if ev.get("split") not in covered_ids:
                     continue

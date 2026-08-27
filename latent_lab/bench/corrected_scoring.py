@@ -1,7 +1,13 @@
-"""Corrected gold-aware scoring + deterministic checkpoint selection.
+"""Fail-closed salvage and classification for pre-v3 legacy evidence.
 
-Offline, stdlib-only primitives used by the no-spend integrity gate and by
-future eval drivers. FAIL-CLOSED contract:
+This module is **not** a current online scorer, checkpoint selector, or eval
+driver API.  ``latent_lab.bench.eval_v3`` is the sole scoring truth for new
+validation, selection, final evaluation, offline rescore, reports, and gates.
+These stdlib-only helpers exist only to inspect historical artifacts that
+predate ``latent_eval.v3`` and to demonstrate why they cannot become current
+evidence merely because some raw candidate data survived.
+
+LEGACY-ONLY contract:
 
 * ``normalize_answer`` / ``gold_indices`` — whitespace/parser-tolerant gold
   alignment that never assumes candidate zero is gold.
@@ -19,16 +25,19 @@ future eval drivers. FAIL-CLOSED contract:
     - duplicated (ambiguous) candidate sets.
   Gold absent from the ranking is a decisive, unambiguous INCORRECT — it
   stays a valid verdict flagged ``GOLD_ABSENT``.
-* ``rescore_records`` — recompute corrected accuracy ONLY where every
+* ``rescore_records`` — salvage a diagnostic fraction ONLY where every
   record retained exactly one usable raw representation; any malformed,
   ambiguous or invalid record fails the WHOLE file as
   ``INVALID_RECORDS``, and derived-only files stay
   ``NON_RESCORABLE_MISSING_RAW_PREDICTION``. Record-level flags are
   aggregated into ``flag_counts`` and can never be lost; no aggregation
-  of invalid records can yield ``RESCORED_CORRECTED``.
-* ``select_best_checkpoint`` — recompute the best step from a validation
-  history with finite-metric enforcement and earliest-step tie-breaking,
-  ignoring any stored/poisoned ``best_val_acc``/``best_step`` fields.
+  of invalid records can yield ``LEGACY_RAW_RESCORED``.  Even that success
+  status has ``current_evidence_eligible=False`` and is mapped by the gate to
+  ``HISTORICAL_UNBOUND_LEGACY_SCORER``.
+* ``select_best_checkpoint`` — audit historical validation histories with
+  finite-metric enforcement and earliest-step tie-breaking, ignoring any
+  stored/poisoned ``best_val_acc``/``best_step`` fields.  It is not used by
+  current latent_eval.v3 selection.
 """
 
 from __future__ import annotations
@@ -39,7 +48,9 @@ from dataclasses import dataclass, field
 MISSING_RAW_PREDICTION = "NON_RESCORABLE_MISSING_RAW_PREDICTION"
 INVALID_RECORDS = "INVALID_RECORDS"
 NO_RECORDS = "NO_RECORDS"
-RESCORED_CORRECTED = "RESCORED_CORRECTED"
+LEGACY_RAW_RESCORED = "LEGACY_RAW_RESCORED"
+LEGACY_EVIDENCE_SCOPE = "legacy_salvage_only"
+CURRENT_EVIDENCE_ELIGIBLE = False
 
 FLAG_DUPLICATE_CANDIDATES = "DUPLICATE_CANDIDATES"
 FLAG_GOLD_ABSENT = "GOLD_ABSENT"
@@ -165,12 +176,15 @@ def corrected_score(candidates, answer, *, order=None, scores=None) -> Corrected
 
 @dataclass(frozen=True)
 class RescoreOutcome:
-    status: str       # RESCORED_CORRECTED | MISSING_RAW_PREDICTION |
+    status: str       # LEGACY_RAW_RESCORED | MISSING_RAW_PREDICTION |
                       # NO_RECORDS | INVALID_RECORDS
     n_records: int = 0
     corrected_accuracy: float | None = None
     detail: str | None = None
     flag_counts: dict | None = None   # flag -> occurrences across records
+    evidence_scope: str = field(default=LEGACY_EVIDENCE_SCOPE, init=False)
+    current_evidence_eligible: bool = field(
+        default=CURRENT_EVIDENCE_ELIGIBLE, init=False)
 
 
 class _RecordError(Exception):
@@ -178,14 +192,15 @@ class _RecordError(Exception):
 
 
 def rescore_records(records, examples_by_id) -> RescoreOutcome:
-    """Recompute corrected accuracy over retained records.
+    """Salvage a legacy-only diagnostic over retained raw records.
 
     Fail-closed aggregation: ANY record that is malformed, references an
     unknown example, lacks a raw prediction, carries conflicting raw
     representations, or yields an invalid scorer verdict fails the whole
     file — a partial aggregate is never emitted, so invalid records can
-    never produce ``RESCORED_CORRECTED``. Record-level flags survive into
-    ``flag_counts``.
+    never produce ``LEGACY_RAW_RESCORED``. Record-level flags survive into
+    ``flag_counts``. A successful result remains historical-only and cannot
+    satisfy current-evidence gates.
     """
     if not isinstance(records, (list, tuple)):
         return RescoreOutcome(status=INVALID_RECORDS,
@@ -268,7 +283,7 @@ def rescore_records(records, examples_by_id) -> RescoreOutcome:
 
     if problems:
         return fail_invalid("")
-    return RescoreOutcome(status=RESCORED_CORRECTED,
+    return RescoreOutcome(status=LEGACY_RAW_RESCORED,
                           n_records=len(records),
                           corrected_accuracy=round(hits / len(records), 6),
                           flag_counts=dict(flag_counts) or None)
@@ -284,14 +299,15 @@ class SelectionResult:
 
 
 def select_best_checkpoint(history, *, metric_key: str = "accuracy") -> SelectionResult | None:
-    """Deterministically re-select the best validation entry.
+    """Deterministically audit a legacy best-validation entry.
 
     Ignores stored best_* fields entirely (they may be poisoned by a broken
     scorer); rejects entries whose metric is not a finite real number or
     whose step is not a non-negative integer (bool/float steps are
     rejected, never coerced); breaks accuracy ties toward the EARLIEST
     step so later training cannot win on noise. Returns None when nothing
-    valid remains.
+    valid remains. This diagnostic never establishes current checkpoint
+    selection provenance; current selection lives in ``eval_v3``.
     """
     considered, rejected = [], 0
     for h in history or ():

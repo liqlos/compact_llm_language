@@ -46,9 +46,11 @@ from latent_lab.bench.corrected_scoring import (
     FLAG_NONFINITE_SCORES,
     FLAG_NORMALIZED_MATCH,
     FLAG_ORDER_NOT_PERMUTATION,
+    CURRENT_EVIDENCE_ELIGIBLE,
     INVALID_RECORDS,
+    LEGACY_EVIDENCE_SCOPE,
+    LEGACY_RAW_RESCORED,
     MISSING_RAW_PREDICTION,
-    RESCORED_CORRECTED,
     corrected_score,
     normalize_answer,
     rescore_records,
@@ -67,7 +69,7 @@ def _strict_loads(blob: bytes) -> object:
 
 
 # ---------------------------------------------------------------------------
-# corrected scorer fail-closed contract
+# legacy scorer salvage/classification fail-closed contract
 # ---------------------------------------------------------------------------
 
 class TestCorrectedScorer:
@@ -228,8 +230,12 @@ class TestRescoreEligibility:
             {"ex_id": "e0", "candidate_scores": [0.9, 0.2, 0.1]},
         ]
         out = rescore_records(recs, {"e0": self.EX})
-        assert out.status == "RESCORED_CORRECTED"
+        assert out.status == LEGACY_RAW_RESCORED
         assert out.corrected_accuracy == pytest.approx(0.5)
+        assert out.evidence_scope == LEGACY_EVIDENCE_SCOPE
+        assert CURRENT_EVIDENCE_ELIGIBLE is False
+        assert out.current_evidence_eligible is False
+        assert g.CURRENT_V3_RESCORED != LEGACY_RAW_RESCORED
 
     def test_nan_score_record_makes_whole_file_INVALID_RECORDS(self):
         recs = [
@@ -265,7 +271,7 @@ class TestRescoreEligibility:
     def test_valid_ranked_candidates_rescore(self):
         recs = [{"ex_id": "e0", "ranked_candidates": ["b", "gold", "a"]}]
         out = rescore_records(recs, {"e0": self.EX})
-        assert out.status == "RESCORED_CORRECTED"
+        assert out.status == LEGACY_RAW_RESCORED
         assert out.corrected_accuracy == pytest.approx(0.0)
 
     def test_non_dict_records_fail_closed(self):
@@ -277,7 +283,7 @@ class TestRescoreEligibility:
     def test_flags_preserved_through_aggregation(self):
         recs = [{"ex_id": "e0", "predicted_answer": " gold "}]
         out = rescore_records(recs, {"e0": self.EX})
-        assert out.status == "RESCORED_CORRECTED"
+        assert out.status == LEGACY_RAW_RESCORED
         assert out.corrected_accuracy == 1.0
 
     def test_missing_example_blocks_whole_file(self):
@@ -363,7 +369,7 @@ def test_gate_recognizes_only_valid_independently_rescored_v3(tmp_path):
     payload = _gate_eval_payload(record)
     path.write_text(json.dumps(payload))
     verdict = g.evaluate_eval_file(path, {ex.ex_id: ex}, root_label="2b")
-    assert verdict["status"] == RESCORED_CORRECTED
+    assert verdict["status"] == g.CURRENT_V3_RESCORED
     assert verdict["record_schema_version"] == "latent_eval.v3"
     assert verdict["evidence_class"] == "VALID_CURRENT"
     assert verdict["corrected_accuracy"] == 1.0
@@ -1419,7 +1425,12 @@ class TestGateEndToEnd:
         entry = [e for e in res.artifact_verdicts["evaluations"]
                  if e["file"] == "ev_raw_test_id_clean.json"][0]
         assert entry["status"] == g.HISTORICAL_UNBOUND_LEGACY_SCORER
+        assert entry["status"] in g.EVAL_BAD_STATUSES
         assert entry["legacy_rescore_fraction"] == pytest.approx(0.5)
+        assert any(
+            blocker["code"] == "EVAL_FILE_INVALID"
+            and "ev_raw_test_id_clean.json" in blocker["detail"]
+            for blocker in res.gate_verdict["blockers"])
 
     def test_READY_positive_control_exit0_path(self, corpus):
         """Every prerequisite satisfiable offline IS provable — proves the
@@ -1507,6 +1518,31 @@ class TestGateEndToEnd:
         fp = v["inputs"]["source_fingerprints"]["results_2b"]["files"]
         assert fp == 4 + len(g.REQUIRED_SPLITS)
         assert g._exit_for("READY") == 0
+
+        # Even complete raw candidate scores from the pre-v3 schema are
+        # legacy salvage only. Adding one such file to an otherwise READY
+        # evidence set must make the current gate fail; it cannot become a
+        # second scoring truth beside latent_eval.v3.
+        legacy_path = (r2b / "results" /
+                       "ev_legacy_raw_test_id_clean.json")
+        legacy_ex = _suite_ex()
+        legacy_path.write_text(json.dumps(_eval_for(
+            "runs/E_k4_s0", "test_id", [_raw_record(legacy_ex)])))
+        legacy_rejected = g.run_gate(
+            r2b, r4b, repo_root=None, skip_proof_tests=True,
+            proof_result=PROOF_OK)
+        legacy_entry = next(
+            item for item in legacy_rejected.artifact_verdicts["evaluations"]
+            if item["file"] == legacy_path.name)
+        assert legacy_entry["status"] \
+            == g.HISTORICAL_UNBOUND_LEGACY_SCORER
+        assert legacy_entry["status"] in g.EVAL_BAD_STATUSES
+        assert legacy_rejected.gate_verdict["verdict"] == "NOT_READY"
+        assert any(
+            blocker["code"] == "EVAL_FILE_INVALID"
+            and legacy_path.name in blocker["detail"]
+            for blocker in legacy_rejected.gate_verdict["blockers"])
+        legacy_path.unlink()
 
         # A different, fully valid bundle cannot inherit the genuine raw
         # best-step history even if every bundle/file/eval digest is
