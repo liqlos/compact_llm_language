@@ -118,6 +118,14 @@ class _TrainingRec:
             trace_targets, trace_lambda, detach_z0))
         return "trace-loss"
 
+    def counterfactual_margin_loss_on_example(
+            self, prompt_ids, counterfactual_prompt_ids, candidate_ids,
+            gold_index, counterfactual_gold_index, k_steps, *, detach_z0):
+        self.calls.append((
+            "counterfactual_margin", counterfactual_prompt_ids, candidate_ids,
+            gold_index, counterfactual_gold_index, k_steps, detach_z0))
+        return "counterfactual-loss"
+
     def loss_on_example(self, prompt_ids, answer_ids, k_steps, *, detach_z0):
         self.calls.append(("gold_nll", answer_ids, k_steps, detach_z0))
         return "gold-loss"
@@ -167,6 +175,27 @@ def test_training_objective_dispatches_fixed_trace_targets_and_lambda():
         trace_targets, 0.3, True)]
 
 
+def test_training_objective_dispatches_counterfactual_prompt_and_changed_gold():
+    from latent_lab.bench.latent_run import _training_loss_on_example
+
+    ex = _ex(gold_pos=2)
+    data = SimpleNamespace(
+        examples=[ex], prompt_ids=[_Ids()], answer_ids=[_Ids()],
+        cand_ids=[["ids-c0", "ids-c1", "ids-c2", "ids-c3"]],
+        counterfactual_prompt_ids=[_Ids()],
+        counterfactual_gold_indices=[1])
+    rec = _TrainingRec()
+
+    loss = _training_loss_on_example(
+        rec, data, 0, device="cpu", k_steps=4,
+        training_objective="counterfactual_margin", detach_z0=True)
+
+    assert loss == "counterfactual-loss"
+    assert rec.calls == [(
+        "counterfactual_margin", data.counterfactual_prompt_ids[0],
+        data.cand_ids[0], 2, 1, 4, True)]
+
+
 def test_suite_tensors_cache_exact_answer_prefixed_safe_trace_targets():
     torch = pytest.importorskip("torch")
     from latent_lab.bench.latent_run import ANSWER_PREFIX, SuiteTensors
@@ -211,6 +240,40 @@ def test_suite_tensors_cache_exact_answer_prefixed_safe_trace_targets():
         assert torch.equal(ids, torch.tensor(
             [[token_id, token_id + 1000]], dtype=torch.long))
     assert all(state != example.answer for _step, state in expected)
+
+
+def test_all_train_counterfactuals_are_changed_closed_set_and_cached():
+    torch = pytest.importorskip("torch")
+    from latent_lab.bench.latent_run import SuiteTensors
+    from latent_lab.bench.suite_v3 import build_suite, counterfactual_prompt
+
+    class Tokenizer:
+        def __init__(self):
+            self.ids = {}
+
+        def __call__(self, text, **kwargs):
+            token_id = self.ids.setdefault(text, len(self.ids) + 1)
+            ids = [token_id]
+            if kwargs.get("return_tensors") == "pt":
+                ids = torch.tensor([ids], dtype=torch.long)
+            return SimpleNamespace(input_ids=ids)
+
+    examples = list(build_suite().train)
+    tokenizer = Tokenizer()
+    tensors = SuiteTensors(
+        tokenizer, examples, include_counterfactuals=True)
+    assert len(tensors.counterfactual_prompt_ids) == len(examples)
+    assert len(tensors.counterfactual_gold_indices) == len(examples)
+
+    for index, example in enumerate(examples):
+        prompt, new_gold = counterfactual_prompt(example)
+        assert new_gold != example.answer
+        assert example.candidates.count(new_gold) == 1
+        expected_index = example.candidates.index(new_gold)
+        assert tensors.counterfactual_gold_indices[index] == expected_index
+        assert torch.equal(
+            tensors.counterfactual_prompt_ids[index],
+            torch.tensor([[tokenizer.ids[prompt]]], dtype=torch.long))
 
 
 def test_gold_at_nonzero_position_top_ranked_is_correct():

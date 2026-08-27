@@ -174,7 +174,8 @@ def validate_run(run_dir, *, expected: dict | None = None) -> dict:
     """
     from latent_lab.backends.localized import training_objective_from_config
     from latent_lab.bench.latent_run import (
-        _neutral_delta_from_config, _paired_delta_from_config,
+        _counterfactual_margin_from_config, _neutral_delta_from_config,
+        _paired_delta_from_config,
         _recurrence_only_lora_from_config, _trace_curriculum_from_config,
         recipe_from_config,
         selected_v3_adapter_state_sha256)
@@ -233,6 +234,11 @@ def validate_run(run_dir, *, expected: dict | None = None) -> dict:
     except ValueError as e:
         raise ValueError(
             f"{where}: invalid trace-curriculum metadata: {e}") from e
+    try:
+        _counterfactual_margin_from_config(cfg)
+    except ValueError as e:
+        raise ValueError(
+            f"{where}: invalid counterfactual-margin metadata: {e}") from e
 
     # canonical recipe rebuilt from the report's own config must equal
     # BOTH the report's bound recipe AND the manifest's bound recipe

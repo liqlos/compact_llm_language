@@ -165,10 +165,11 @@ LORA_TARGET_SUFFIXES = (
 )
 RECURRENCE_ONLY_LORA_MODE_SUFFIX = "+recurrence-only-lora"
 CANDIDATE_CE_MODE_SUFFIX = "+candidate-ce"
+COUNTERFACTUAL_MARGIN_MODE_SUFFIX = "+counterfactual-margin"
 NEUTRAL_DELTA_MODE_SUFFIX = "+neutral-delta"
 PAIRED_DELTA_MODE_SUFFIX = "+paired-delta"
 TRACE_CURRICULUM_MODE_SUFFIX = "+trace-curriculum"
-TRAINING_OBJECTIVES = ("gold_nll", "candidate_ce")
+TRAINING_OBJECTIVES = ("gold_nll", "candidate_ce", "counterfactual_margin")
 
 
 def training_objective_from_config(config: dict) -> str:
@@ -181,11 +182,18 @@ def training_objective_from_config(config: dict) -> str:
     if not isinstance(mode, str):
         raise ValueError("config.mode must be a string")
     core_mode = mode.removesuffix(RECURRENCE_ONLY_LORA_MODE_SUFFIX)
-    suffix_count = core_mode.count(CANDIDATE_CE_MODE_SUFFIX)
-    sealed_candidate_ce = suffix_count == 1 \
-        and core_mode.endswith(CANDIDATE_CE_MODE_SUFFIX)
-    correctly_sealed = (sealed_candidate_ce if objective == "candidate_ce"
-                        else suffix_count == 0)
+    suffixes = {
+        "candidate_ce": CANDIDATE_CE_MODE_SUFFIX,
+        "counterfactual_margin": COUNTERFACTUAL_MARGIN_MODE_SUFFIX,
+    }
+    counts = {name: core_mode.count(suffix)
+              for name, suffix in suffixes.items()}
+    sealed = [name for name, suffix in suffixes.items()
+              if counts[name] == 1 and core_mode.endswith(suffix)]
+    malformed = any(count > 1 for count in counts.values()) \
+        or sum(counts.values()) != len(sealed) or len(sealed) > 1
+    expected = [] if objective == "gold_nll" else [objective]
+    correctly_sealed = not malformed and sealed == expected
     if not correctly_sealed:
         raise ValueError(
             "config mode and training_objective disagree; refusing an "
@@ -1149,6 +1157,160 @@ class LocalizedRecurrence:
                               dtype=torch.long)
         return torch.nn.functional.cross_entropy(scores, target)
 
+    @staticmethod
+    def counterfactual_margin_terms_from_scores(
+            p_own, p_zero, p_other, p_gold_index,
+            q_own, q_zero, q_other, q_gold_index):
+        """Return ``[Gp, Gq, Ap, Aq]`` from evaluator-aligned mean scores."""
+        _require_torch("counterfactual_margin_terms_from_scores")
+        vectors = (p_own, p_zero, p_other, q_own, q_zero, q_other)
+        if any(not torch.is_tensor(scores) or scores.ndim != 1
+               for scores in vectors):
+            raise ValueError("counterfactual score vectors must be 1-D tensors")
+        candidate_count = vectors[0].shape[0]
+        if candidate_count < 2 or any(
+                scores.shape != vectors[0].shape for scores in vectors[1:]):
+            raise ValueError(
+                "counterfactual score vectors must share length >= 2")
+        for name, index in (("p", p_gold_index), ("q", q_gold_index)):
+            if isinstance(index, bool) or not isinstance(index, int) \
+                    or not 0 <= index < candidate_count:
+                raise ValueError(f"{name}_gold_index must identify one candidate")
+        if p_gold_index == q_gold_index:
+            raise ValueError("counterfactual gold must differ from original gold")
+
+        # Candidate-specific frozen-model preference is subtracted before any
+        # margin is formed.  stopgrad is semantic, not merely an optimization.
+        rp_own = p_own - p_zero.detach()
+        rp_other = p_other - p_zero.detach()
+        rq_own = q_own - q_zero.detach()
+        rq_other = q_other - q_zero.detach()
+
+        def gold_vs_logsumexp(residual, gold_index):
+            mask = torch.ones(
+                candidate_count, device=residual.device, dtype=torch.bool)
+            mask[gold_index] = False
+            non_gold = residual[mask]
+            return residual[gold_index] - torch.logsumexp(non_gold, dim=0)
+
+        gp = gold_vs_logsumexp(rp_own, p_gold_index)
+        gq = gold_vs_logsumexp(rq_own, q_gold_index)
+        ap = ((rp_own[p_gold_index] - rp_own[q_gold_index])
+              - (rp_other[p_gold_index] - rp_other[q_gold_index]))
+        aq = ((rq_own[q_gold_index] - rq_own[p_gold_index])
+              - (rq_other[q_gold_index] - rq_other[p_gold_index]))
+        return torch.stack((gp, gq, ap, aq))
+
+    @classmethod
+    def counterfactual_margin_loss_from_scores(
+            cls, p_own, p_zero, p_other, p_gold_index,
+            q_own, q_zero, q_other, q_gold_index):
+        terms = cls.counterfactual_margin_terms_from_scores(
+            p_own, p_zero, p_other, p_gold_index,
+            q_own, q_zero, q_other, q_gold_index)
+        return torch.nn.functional.softplus(0.1 - terms).mean()
+
+    @staticmethod
+    def _norm_matched_detached(other_delta, reference_delta):
+        """Detach ``other_delta`` and match its norm to detached reference."""
+        if not torch.is_tensor(other_delta) or not torch.is_tensor(reference_delta) \
+                or other_delta.shape != reference_delta.shape:
+            raise ValueError("counterfactual deltas must be equal-shaped tensors")
+        with torch.no_grad():
+            other = other_delta.detach()
+            other_fp32 = other.float()
+            reference_norm = reference_delta.detach().float().norm()
+            denominator = other_fp32.norm().clamp_min(
+                torch.finfo(torch.float32).tiny)
+            return (other_fp32 * (reference_norm / denominator)).to(
+                other.dtype).detach()
+
+    def counterfactual_margin_loss_on_example(
+            self, input_ids, counterfactual_input_ids, candidate_ids,
+            gold_index, counterfactual_gold_index, k_steps, *,
+            detach_z0=False, return_terms=False):
+        """Residual-margin attribution across an original/CF prompt pair."""
+        from ..backends.hf_qwen import cache_restore, cache_snapshot
+
+        if not self.paired_delta:
+            raise ValueError("counterfactual_margin requires paired_delta mode")
+        if k_steps != 4:
+            raise ValueError("counterfactual_margin requires exactly K=4")
+        if not isinstance(return_terms, bool):
+            raise ValueError("return_terms must be a boolean")
+        if not candidate_ids or len(candidate_ids) < 2:
+            raise ValueError("counterfactual_margin requires at least 2 candidates")
+        candidate_count = len(candidate_ids)
+        for name, index in (("gold", gold_index),
+                            ("counterfactual_gold", counterfactual_gold_index)):
+            if isinstance(index, bool) or not isinstance(index, int) \
+                    or not 0 <= index < candidate_count:
+                raise ValueError(f"{name}_index must identify one candidate")
+        if gold_index == counterfactual_gold_index:
+            raise ValueError("counterfactual gold must differ from original gold")
+
+        device = input_ids.device
+        candidates = tuple(
+            torch.as_tensor(candidate, device=device, dtype=torch.long).view(1, -1)
+            for candidate in candidate_ids)
+        if any(ids.shape[1] == 0 for ids in candidates):
+            raise ValueError("candidate token sequences must be non-empty")
+        counterfactual_input_ids = torch.as_tensor(
+            counterfactual_input_ids, device=device,
+            dtype=torch.long).view(1, -1)
+        if counterfactual_input_ids.shape[1] == 0:
+            raise ValueError("counterfactual prompt token sequence must be non-empty")
+
+        def recurrent_context(prompt_ids):
+            cache, z0 = self._encode(prompt_ids, grad=True)
+            if detach_z0:
+                z0 = z0.detach()
+            prompt_cache = cache_snapshot(cache)
+            z, pos = self.latent_steps(
+                z0, cache, prompt_ids.shape[1], k_steps, grad=True)
+            cache_restore(cache, prompt_cache)
+            if pos != prompt_ids.shape[1]:
+                raise RuntimeError("paired recurrence changed the readout position")
+            return cache, prompt_cache, z0, z - z0, pos
+
+        p_cache, p_snapshot, p_z0, p_delta, p_pos = recurrent_context(input_ids)
+        q_cache, q_snapshot, q_z0, q_delta, q_pos = recurrent_context(
+            counterfactual_input_ids)
+        q_for_p = self._norm_matched_detached(q_delta, p_delta)
+        p_for_q = self._norm_matched_detached(p_delta, q_delta)
+
+        def score_delta(cache, snapshot, z0, pos, delta, *, grad):
+            scores = []
+            context = contextlib.nullcontext() if grad else torch.no_grad()
+            with context:
+                for ids in candidates:
+                    cache_restore(cache, snapshot)
+                    token_logprobs, _counters = self._score_candidate_tokens(
+                        z0 + delta, cache, pos, ids, grad=grad,
+                        latent_delta=delta)
+                    scores.append(token_logprobs.mean())
+            return torch.stack(scores)
+
+        p_own = score_delta(
+            p_cache, p_snapshot, p_z0, p_pos, p_delta, grad=True)
+        q_own = score_delta(
+            q_cache, q_snapshot, q_z0, q_pos, q_delta, grad=True)
+        p_zero = score_delta(
+            p_cache, p_snapshot, p_z0, p_pos, torch.zeros_like(p_delta),
+            grad=False)
+        q_zero = score_delta(
+            q_cache, q_snapshot, q_z0, q_pos, torch.zeros_like(q_delta),
+            grad=False)
+        p_other = score_delta(
+            p_cache, p_snapshot, p_z0, p_pos, q_for_p, grad=False)
+        q_other = score_delta(
+            q_cache, q_snapshot, q_z0, q_pos, p_for_q, grad=False)
+        terms = self.counterfactual_margin_terms_from_scores(
+            p_own, p_zero, p_other, gold_index,
+            q_own, q_zero, q_other, counterfactual_gold_index)
+        loss = torch.nn.functional.softplus(0.1 - terms).mean()
+        return (loss, terms.detach()) if return_terms else loss
+
     def candidate_ce_loss_on_example(self, input_ids, candidate_ids,
                                      gold_index, k_steps, *, ablate=None,
                                      detach_z0=False):
@@ -1434,8 +1596,21 @@ class LocalizedRecurrence:
             drift.append("trace_curriculum is not a boolean")
             claimed_trace = None
         architecture_core = recipe["mode"].removesuffix(
-            RECURRENCE_ONLY_LORA_MODE_SUFFIX).removesuffix(
-                CANDIDATE_CE_MODE_SUFFIX)
+            RECURRENCE_ONLY_LORA_MODE_SUFFIX)
+        objective_suffixes = (
+            CANDIDATE_CE_MODE_SUFFIX, COUNTERFACTUAL_MARGIN_MODE_SUFFIX)
+        sealed_objective_suffixes = [
+            suffix for suffix in objective_suffixes
+            if architecture_core.count(suffix) == 1
+            and architecture_core.endswith(suffix)]
+        if sum(architecture_core.count(suffix)
+               for suffix in objective_suffixes) != \
+                len(sealed_objective_suffixes) \
+                or len(sealed_objective_suffixes) > 1:
+            drift.append("mode carries a malformed training-objective suffix")
+        if len(sealed_objective_suffixes) == 1:
+            architecture_core = architecture_core.removesuffix(
+                sealed_objective_suffixes[0])
         trace_count = architecture_core.count(TRACE_CURRICULUM_MODE_SUFFIX)
         mode_has_trace = trace_count == 1 and architecture_core.endswith(
             TRACE_CURRICULUM_MODE_SUFFIX)
@@ -1484,14 +1659,23 @@ class LocalizedRecurrence:
             drift.append("neutral_delta requires recurrence_only_lora=true")
         if claimed_paired and not claimed_neutral:
             drift.append("paired_delta requires neutral_delta=true")
-        if claimed_paired and claimed_objective != "candidate_ce":
-            drift.append("paired_delta requires training_objective=candidate_ce")
+        if claimed_paired and claimed_objective not in (
+                "candidate_ce", "counterfactual_margin"):
+            drift.append(
+                "paired_delta requires candidate_ce or counterfactual_margin")
         if claimed_trace and not claimed_paired:
             drift.append("trace_curriculum requires paired_delta=true")
         if claimed_trace and claimed_objective != "candidate_ce":
             drift.append("trace_curriculum requires training_objective=candidate_ce")
         if claimed_trace and config.get("k") != 4:
             drift.append("trace_curriculum requires k=4")
+        if claimed_objective == "counterfactual_margin":
+            if not claimed_paired:
+                drift.append("counterfactual_margin requires paired_delta=true")
+            if config.get("k") != 4:
+                drift.append("counterfactual_margin requires k=4")
+            if claimed_trace:
+                drift.append("counterfactual_margin forbids trace_curriculum")
         if claimed_neutral and self.interval != (
                 0, getattr(self, "n_layers", self.interval[1])):
             drift.append("neutral_delta requires the full decoder interval")

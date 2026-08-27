@@ -688,6 +688,116 @@ def test_paired_trace_rejects_final_gold_supervision():
             trace_targets=((1, [10, 11]),), trace_lambda=1.0)
 
 
+def test_counterfactual_margin_score_invariances_and_identical_state_a_zero():
+    p_zero = torch.tensor([-1.0, 0.2, -0.4, 0.7])
+    p_own = p_zero + torch.tensor([1.3, -0.2, 0.1, -0.6])
+    p_other = p_zero + torch.tensor([-0.4, 1.1, 0.2, -0.1])
+    q_zero = torch.tensor([0.5, -0.7, 0.4, -0.2])
+    q_own = q_zero + torch.tensor([-0.3, 1.4, -0.1, 0.2])
+    q_other = q_zero + torch.tensor([1.0, -0.5, 0.2, -0.2])
+    args = (p_own, p_zero, p_other, 0,
+            q_own, q_zero, q_other, 1)
+    terms = LocalizedRecurrence.counterfactual_margin_terms_from_scores(*args)
+    loss = LocalizedRecurrence.counterfactual_margin_loss_from_scores(*args)
+
+    # Frozen-model candidate preferences cancel candidate by candidate.
+    p_constants = torch.tensor([7.0, -3.0, 4.0, 0.5])
+    q_constants = torch.tensor([-2.0, 8.0, 1.5, -6.0])
+    shifted = (
+        p_own + p_constants, p_zero + p_constants,
+        p_other + p_constants, 0,
+        q_own + q_constants, q_zero + q_constants,
+        q_other + q_constants, 1)
+    assert torch.allclose(
+        terms,
+        LocalizedRecurrence.counterfactual_margin_terms_from_scores(*shifted))
+    assert torch.allclose(
+        loss,
+        LocalizedRecurrence.counterfactual_margin_loss_from_scores(*shifted))
+
+    # Candidate order is irrelevant when both gold indices move with it.
+    permutation = torch.tensor([2, 0, 3, 1])
+    p_index = int((permutation == 0).nonzero()[0])
+    q_index = int((permutation == 1).nonzero()[0])
+    permuted = (
+        p_own[permutation], p_zero[permutation], p_other[permutation], p_index,
+        q_own[permutation], q_zero[permutation], q_other[permutation], q_index)
+    assert torch.allclose(
+        terms,
+        LocalizedRecurrence.counterfactual_margin_terms_from_scores(*permuted))
+    assert torch.allclose(
+        loss,
+        LocalizedRecurrence.counterfactual_margin_loss_from_scores(*permuted))
+
+    identical = LocalizedRecurrence.counterfactual_margin_terms_from_scores(
+        p_own, p_zero, p_own, 0, q_own, q_zero, q_own, 1)
+    assert torch.equal(identical[2:], torch.zeros(2))
+
+
+def test_counterfactual_correct_own_delta_lowers_loss_and_hard_distractor_wins():
+    zero = torch.zeros(3)
+    p_good = torch.tensor([2.0, -1.0, -1.0])
+    q_good = torch.tensor([-1.0, 2.0, -1.0])
+    good_args = (p_good, zero, q_good, 0,
+                 q_good, zero, p_good, 1)
+    bad_args = (q_good, zero, q_good, 0,
+                p_good, zero, p_good, 1)
+    good_loss = LocalizedRecurrence.counterfactual_margin_loss_from_scores(
+        *good_args)
+    bad_loss = LocalizedRecurrence.counterfactual_margin_loss_from_scores(
+        *bad_args)
+    assert good_loss < bad_loss
+
+    hard_distractor = torch.tensor([0.5, 0.6, -10.0])
+    terms = LocalizedRecurrence.counterfactual_margin_terms_from_scores(
+        hard_distractor, zero, q_good, 0,
+        q_good, zero, p_good, 1)
+    assert terms[0] < 0  # Gp uses logsumexp: the 0.6 distractor beats gold.
+    rescued = LocalizedRecurrence.counterfactual_margin_loss_from_scores(
+        torch.tensor([1.0, 0.6, -10.0]), zero, q_good, 0,
+        q_good, zero, p_good, 1)
+    penalized = LocalizedRecurrence.counterfactual_margin_loss_from_scores(
+        hard_distractor, zero, q_good, 0,
+        q_good, zero, p_good, 1)
+    assert penalized > rescued
+
+
+def test_counterfactual_margin_first_backward_reaches_b_and_clock(monkeypatch):
+    _model, rec2 = build_paired_delta()
+    prompt = torch.randint(0, 250, (1, 7))
+    counterfactual = torch.randint(0, 250, (1, 8))
+    candidates = ([10, 11], [12, 13], [14, 15])
+    original_score = rec2._score_candidate_tokens
+    readout_adapter_states = []
+
+    def capture_score(*args, **kwargs):
+        readout_adapter_states.append(
+            tuple(adapter.enabled for adapter in rec2.injected))
+        return original_score(*args, **kwargs)
+
+    monkeypatch.setattr(rec2, "_score_candidate_tokens", capture_score)
+    loss, terms = rec2.counterfactual_margin_loss_on_example(
+        prompt, counterfactual, candidates, 0, 1, 4, return_terms=True)
+    assert loss.requires_grad and torch.isfinite(loss)
+    assert terms.shape == (4,) and not terms.requires_grad
+    assert readout_adapter_states
+    assert all(not any(states) for states in readout_adapter_states)
+    loss.backward()
+
+    assert any(adapter.lora_B.grad is not None
+               and torch.count_nonzero(adapter.lora_B.grad).item() > 0
+               for adapter in rec2.injected)
+    assert rec2.clock.weight.grad is not None
+    assert torch.count_nonzero(rec2.clock.weight.grad).item() > 0
+    assert all(adapter.lora_A.grad is None
+               or torch.count_nonzero(adapter.lora_A.grad).item() == 0
+               for adapter in rec2.injected)
+
+    with pytest.raises(ValueError, match="exactly K=4"):
+        rec2.counterfactual_margin_loss_on_example(
+            prompt, counterfactual, candidates, 0, 1, 0)
+
+
 def test_clock_changes_state_after_perturbation(rec):
     with torch.no_grad():
         rec.clock.weight.fill_(0.01)

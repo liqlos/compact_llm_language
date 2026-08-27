@@ -30,6 +30,7 @@ from pathlib import Path
 
 from latent_lab.backends.localized import (
     CANDIDATE_CE_MODE_SUFFIX,
+    COUNTERFACTUAL_MARGIN_MODE_SUFFIX,
     NEUTRAL_DELTA_MODE_SUFFIX,
     PAIRED_DELTA_MODE_SUFFIX,
     RECURRENCE_ONLY_LORA_MODE_SUFFIX,
@@ -123,14 +124,20 @@ def load_model(device="mps", model_id=None, revision=None):
 class SuiteTensors:
     """Tokenized suite with cached candidate token ids."""
 
-    def __init__(self, tok, examples):
-        from latent_lab.bench.suite_v3 import safe_trace_targets
+    def __init__(self, tok, examples, *, include_counterfactuals=False):
+        from latent_lab.bench.suite_v3 import (
+            counterfactual_prompt, safe_trace_targets)
+
+        if not isinstance(include_counterfactuals, bool):
+            raise ValueError("include_counterfactuals must be a boolean")
 
         self.examples = examples
         self.prompt_ids = []
         self.answer_ids = []
         self.cand_ids = []
         self.trace_target_ids = []
+        self.counterfactual_prompt_ids = []
+        self.counterfactual_gold_indices = []
         for ex in examples:
             p = tok(ex.prompt, return_tensors="pt", return_dict=True
                     ).input_ids
@@ -158,6 +165,20 @@ class SuiteTensors:
                         f"{ex.ex_id}: trace target tokenization equals gold")
                 encoded_trace.append((step_index, target))
             self.trace_target_ids.append(tuple(encoded_trace))
+            if include_counterfactuals:
+                cf_prompt, cf_answer = counterfactual_prompt(ex)
+                if cf_answer == ex.answer:
+                    raise ValueError(
+                        f"{ex.ex_id}: counterfactual did not change gold")
+                cf_gold_index = derive_gold_index(
+                    ex.candidates, cf_answer, ex_id=f"{ex.ex_id}:counterfactual")
+                cf_ids = tok(
+                    cf_prompt, return_tensors="pt", return_dict=True).input_ids
+                if cf_ids.shape[1] == 0:
+                    raise ValueError(
+                        f"{ex.ex_id}: empty tokenized counterfactual prompt")
+                self.counterfactual_prompt_ids.append(cf_ids)
+                self.counterfactual_gold_indices.append(cf_gold_index)
 
     def __len__(self):
         return len(self.examples)
@@ -597,6 +618,24 @@ def _adapter_policy_mode(mode: str, recurrence_only_lora: bool) -> str:
     return mode
 
 
+def _split_training_objective_suffix(mode: str) -> tuple[str, str, str]:
+    """Return architecture core, suffix, and sealed objective."""
+    suffixes = {
+        "candidate_ce": CANDIDATE_CE_MODE_SUFFIX,
+        "counterfactual_margin": COUNTERFACTUAL_MARGIN_MODE_SUFFIX,
+    }
+    counts = {name: mode.count(suffix) for name, suffix in suffixes.items()}
+    sealed = [(name, suffix) for name, suffix in suffixes.items()
+              if counts[name] == 1 and mode.endswith(suffix)]
+    if any(count > 1 for count in counts.values()) \
+            or sum(counts.values()) != len(sealed) or len(sealed) > 1:
+        raise ValueError("mode carries a malformed training-objective suffix")
+    if not sealed:
+        return mode, "", "gold_nll"
+    objective, suffix = sealed[0]
+    return mode.removesuffix(suffix), suffix, objective
+
+
 def _training_objective_mode(mode: str, training_objective: str) -> str:
     """Seal the objective before any recurrence-only activation suffix."""
     if training_objective not in TRAINING_OBJECTIVES:
@@ -606,17 +645,17 @@ def _training_objective_mode(mode: str, training_objective: str) -> str:
     if mode.endswith(RECURRENCE_ONLY_LORA_MODE_SUFFIX):
         mode = mode.removesuffix(RECURRENCE_ONLY_LORA_MODE_SUFFIX)
         recurrence_suffix = RECURRENCE_ONLY_LORA_MODE_SUFFIX
-    suffix_count = mode.count(CANDIDATE_CE_MODE_SUFFIX)
-    if suffix_count > 1 or (suffix_count == 1 and
-                            not mode.endswith(CANDIDATE_CE_MODE_SUFFIX)):
-        raise ValueError("mode carries a malformed candidate-CE suffix")
-    if training_objective == "candidate_ce":
-        if suffix_count == 0:
-            mode += CANDIDATE_CE_MODE_SUFFIX
-    elif suffix_count:
+    core, suffix, sealed_objective = _split_training_objective_suffix(mode)
+    if suffix and sealed_objective != training_objective:
         raise ValueError(
-            "mode claims candidate CE but training_objective is gold_nll")
-    return mode + recurrence_suffix
+            f"mode claims {sealed_objective} but training_objective is "
+            f"{training_objective}")
+    if not suffix and training_objective != "gold_nll":
+        suffix = ({
+            "candidate_ce": CANDIDATE_CE_MODE_SUFFIX,
+            "counterfactual_margin": COUNTERFACTUAL_MARGIN_MODE_SUFFIX,
+        })[training_objective]
+    return core + suffix + recurrence_suffix
 
 
 def _neutral_delta_mode(mode: str, neutral_delta: bool) -> str:
@@ -630,12 +669,7 @@ def _neutral_delta_mode(mode: str, neutral_delta: bool) -> str:
     recurrence_suffix = (RECURRENCE_ONLY_LORA_MODE_SUFFIX
                          if recurrence_count else "")
     core = mode.removesuffix(recurrence_suffix)
-    objective_count = core.count(CANDIDATE_CE_MODE_SUFFIX)
-    if objective_count > 1 or (objective_count == 1 and not core.endswith(
-            CANDIDATE_CE_MODE_SUFFIX)):
-        raise ValueError("mode carries a malformed candidate-CE suffix")
-    objective_suffix = CANDIDATE_CE_MODE_SUFFIX if objective_count else ""
-    core = core.removesuffix(objective_suffix)
+    core, objective_suffix, _objective = _split_training_objective_suffix(core)
     count = core.count(NEUTRAL_DELTA_MODE_SUFFIX)
     if count > 1 or (count == 1 and not core.endswith(
             NEUTRAL_DELTA_MODE_SUFFIX)):
@@ -663,12 +697,7 @@ def _paired_delta_mode(mode: str, paired_delta: bool) -> str:
     recurrence_suffix = (RECURRENCE_ONLY_LORA_MODE_SUFFIX
                          if recurrence_count else "")
     core = mode.removesuffix(recurrence_suffix)
-    objective_count = core.count(CANDIDATE_CE_MODE_SUFFIX)
-    if objective_count > 1 or (objective_count == 1 and not core.endswith(
-            CANDIDATE_CE_MODE_SUFFIX)):
-        raise ValueError("mode carries a malformed candidate-CE suffix")
-    objective_suffix = CANDIDATE_CE_MODE_SUFFIX if objective_count else ""
-    core = core.removesuffix(objective_suffix)
+    core, objective_suffix, _objective = _split_training_objective_suffix(core)
     paired_count = core.count(PAIRED_DELTA_MODE_SUFFIX)
     neutral_count = core.count(NEUTRAL_DELTA_MODE_SUFFIX)
     if paired_count > 1 or (paired_count == 1 and not core.endswith(
@@ -700,12 +729,7 @@ def _trace_curriculum_mode(mode: str, trace_curriculum: bool) -> str:
     recurrence_suffix = (RECURRENCE_ONLY_LORA_MODE_SUFFIX
                          if recurrence_count else "")
     core = mode.removesuffix(recurrence_suffix)
-    objective_count = core.count(CANDIDATE_CE_MODE_SUFFIX)
-    if objective_count > 1 or (objective_count == 1 and not core.endswith(
-            CANDIDATE_CE_MODE_SUFFIX)):
-        raise ValueError("mode carries a malformed candidate-CE suffix")
-    objective_suffix = CANDIDATE_CE_MODE_SUFFIX if objective_count else ""
-    core = core.removesuffix(objective_suffix)
+    core, objective_suffix, _objective = _split_training_objective_suffix(core)
     count = core.count(TRACE_CURRICULUM_MODE_SUFFIX)
     sealed = count == 1 and core.endswith(TRACE_CURRICULUM_MODE_SUFFIX)
     if count > 1 or (count == 1 and not sealed):
@@ -769,11 +793,13 @@ def _neutral_delta_from_config(cfg: dict) -> bool:
     if not isinstance(mode, str):
         raise ValueError("config.mode must be a string")
     core = mode.removesuffix(RECURRENCE_ONLY_LORA_MODE_SUFFIX)
-    if CANDIDATE_CE_MODE_SUFFIX in core \
-            and not core.endswith(CANDIDATE_CE_MODE_SUFFIX):
+    try:
+        core, _objective_suffix, _objective = \
+            _split_training_objective_suffix(core)
+    except ValueError as e:
         raise ValueError(
-            "config.mode carries malformed neutral-delta suffix ordering")
-    core = core.removesuffix(CANDIDATE_CE_MODE_SUFFIX)
+            "config.mode carries malformed neutral-delta suffix ordering") \
+            from e
     trace_count = core.count(TRACE_CURRICULUM_MODE_SUFFIX)
     trace_sealed = trace_count == 1 and core.endswith(
         TRACE_CURRICULUM_MODE_SUFFIX)
@@ -824,11 +850,13 @@ def _paired_delta_from_config(cfg: dict) -> bool:
     if not isinstance(mode, str):
         raise ValueError("config.mode must be a string")
     core = mode.removesuffix(RECURRENCE_ONLY_LORA_MODE_SUFFIX)
-    if CANDIDATE_CE_MODE_SUFFIX in core \
-            and not core.endswith(CANDIDATE_CE_MODE_SUFFIX):
+    try:
+        core, _objective_suffix, _objective = \
+            _split_training_objective_suffix(core)
+    except ValueError as e:
         raise ValueError(
-            "config.mode carries malformed paired-delta suffix ordering")
-    core = core.removesuffix(CANDIDATE_CE_MODE_SUFFIX)
+            "config.mode carries malformed paired-delta suffix ordering") \
+            from e
     trace_count = core.count(TRACE_CURRICULUM_MODE_SUFFIX)
     trace_sealed = trace_count == 1 and core.endswith(
         TRACE_CURRICULUM_MODE_SUFFIX)
@@ -846,8 +874,10 @@ def _paired_delta_from_config(cfg: dict) -> bool:
             "paired recurrence architecture")
     if not value:
         return False
-    if training_objective_from_config(cfg) != "candidate_ce":
-        raise ValueError("paired_delta requires training_objective=candidate_ce")
+    if training_objective_from_config(cfg) not in (
+            "candidate_ce", "counterfactual_margin"):
+        raise ValueError(
+            "paired_delta requires candidate_ce or counterfactual_margin")
     if cfg.get("neutral_delta") is not True:
         raise ValueError("paired_delta requires neutral_delta=true")
     if cfg.get("recurrence_only_lora") is not True:
@@ -892,11 +922,13 @@ def _trace_curriculum_from_config(cfg: dict) -> bool:
     if not isinstance(mode, str):
         raise ValueError("config.mode must be a string")
     core = mode.removesuffix(RECURRENCE_ONLY_LORA_MODE_SUFFIX)
-    if CANDIDATE_CE_MODE_SUFFIX in core \
-            and not core.endswith(CANDIDATE_CE_MODE_SUFFIX):
+    try:
+        core, _objective_suffix, _objective = \
+            _split_training_objective_suffix(core)
+    except ValueError as e:
         raise ValueError(
-            "config.mode carries malformed trace-curriculum suffix ordering")
-    core = core.removesuffix(CANDIDATE_CE_MODE_SUFFIX)
+            "config.mode carries malformed trace-curriculum suffix ordering") \
+            from e
     count = core.count(TRACE_CURRICULUM_MODE_SUFFIX)
     sealed = count == 1 and core.endswith(TRACE_CURRICULUM_MODE_SUFFIX)
     if count > 1 or (count == 1 and not sealed):
@@ -924,6 +956,23 @@ def _trace_curriculum_from_config(cfg: dict) -> bool:
     return True
 
 
+def _counterfactual_margin_from_config(cfg: dict) -> bool:
+    """Validate the paired closed-set attribution objective."""
+    enabled = training_objective_from_config(cfg) == "counterfactual_margin"
+    if not enabled:
+        return False
+    if cfg.get("paired_delta") is not True \
+            or cfg.get("neutral_delta") is not True \
+            or cfg.get("recurrence_only_lora") is not True:
+        raise ValueError(
+            "counterfactual_margin requires paired_delta recurrence-only readout")
+    if cfg.get("k") != 4:
+        raise ValueError("counterfactual_margin requires k=4")
+    if cfg.get("trace_curriculum") is not False:
+        raise ValueError("counterfactual_margin forbids trace_curriculum")
+    return True
+
+
 def _recurrence_config(cfg: dict) -> dict:
     """Measured recurrence settings; unsupported flags cannot enter v3."""
     if cfg.get("grad_checkpoint") not in (None, False):
@@ -933,6 +982,7 @@ def _recurrence_config(cfg: dict) -> dict:
     neutral_delta = _neutral_delta_from_config(cfg)
     paired_delta = _paired_delta_from_config(cfg)
     trace_curriculum = _trace_curriculum_from_config(cfg)
+    _counterfactual_margin_from_config(cfg)
     recurrence = {
         "mode": cfg["mode"],
         "interval": list(cfg["interval"]),
@@ -1055,10 +1105,16 @@ def mode_from_spec(interval_spec: str, k: int,
     base = ("D-full" if interval_spec == "full"
             else "F-control" if k == 0 else "E-localized")
     if paired_delta:
-        if training_objective != "candidate_ce":
-            raise ValueError("paired_delta requires training_objective=candidate_ce")
+        if training_objective not in (
+                "candidate_ce", "counterfactual_margin"):
+            raise ValueError(
+                "paired_delta requires candidate_ce or counterfactual_margin")
         neutral_delta = True
         recurrence_only_lora = True
+    if training_objective == "counterfactual_margin" and (
+            not paired_delta or k != 4 or trace_curriculum):
+        raise ValueError(
+            "counterfactual_margin requires paired_delta, K=4, and no trace")
     if trace_curriculum and (not paired_delta or k != 4
                              or training_objective != "candidate_ce"):
         raise ValueError(
@@ -1093,10 +1149,16 @@ def train_recipe_digest(*, mode, interval, k, max_k, lora_r, lora_alpha,
     checkpointing.recipe_from_config rejects true and never persists it.
     """
     if paired_delta:
-        if training_objective != "candidate_ce":
-            raise ValueError("paired_delta requires training_objective=candidate_ce")
+        if training_objective not in (
+                "candidate_ce", "counterfactual_margin"):
+            raise ValueError(
+                "paired_delta requires candidate_ce or counterfactual_margin")
         neutral_delta = True
         recurrence_only_lora = True
+    if training_objective == "counterfactual_margin" and (
+            not paired_delta or k != 4 or trace_curriculum):
+        raise ValueError(
+            "counterfactual_margin requires paired_delta, K=4, and no trace")
     if trace_curriculum and (not paired_delta or k != 4
                              or training_objective != "candidate_ce"):
         raise ValueError(
@@ -1131,10 +1193,20 @@ def _training_loss_on_example(rec, train, index: int, *, device: str,
                               trace_lambda: float = 0.0):
     """Dispatch one example without trusting any supplied gold index."""
     prompt_ids = train.prompt_ids[index].to(device)
-    if training_objective == "candidate_ce":
+    if training_objective in ("candidate_ce", "counterfactual_margin"):
         ex = train.examples[index]
         gold_index = derive_gold_index(
             ex.candidates, ex.answer, ex_id=ex.ex_id)
+        if training_objective == "counterfactual_margin":
+            if trace_curriculum:
+                raise ValueError(
+                    "counterfactual_margin forbids trace curriculum")
+            return rec.counterfactual_margin_loss_on_example(
+                prompt_ids,
+                train.counterfactual_prompt_ids[index].to(device),
+                train.cand_ids[index], gold_index,
+                train.counterfactual_gold_indices[index], k_steps,
+                detach_z0=detach_z0)
         if trace_curriculum:
             return rec.candidate_ce_trace_loss_on_example(
                 prompt_ids, train.cand_ids[index], gold_index, k_steps,
@@ -1274,8 +1346,15 @@ def _train_inner(args, out: Path, device: str, revision: str):
         getattr(args, "recurrence_only_lora", False) or neutral_delta)
     training_objective = getattr(args, "training_objective", "gold_nll")
     _training_objective_mode("D-full", training_objective)
-    if paired_delta and training_objective != "candidate_ce":
-        raise ValueError("--paired-delta requires --training-objective candidate_ce")
+    if paired_delta and training_objective not in (
+            "candidate_ce", "counterfactual_margin"):
+        raise ValueError(
+            "--paired-delta requires candidate_ce or counterfactual_margin")
+    if training_objective == "counterfactual_margin" and (
+            not paired_delta or args.k != 4 or trace_curriculum):
+        raise ValueError(
+            "--training-objective counterfactual_margin requires "
+            "--paired-delta, --k 4, and no trace curriculum")
     if trace_curriculum and (not paired_delta or args.k != 4
                              or training_objective != "candidate_ce"):
         raise ValueError(
@@ -1334,7 +1413,10 @@ def _train_inner(args, out: Path, device: str, revision: str):
         out, _recipe_hash(recipe), args.seed,
         model_id=args.model, revision=revision)
     recurrence_config = _recurrence_config(cfg)
-    train = SuiteTensors(tok, list(suite.train))
+    train = SuiteTensors(
+        tok, list(suite.train),
+        include_counterfactuals=(
+            training_objective == "counterfactual_margin"))
     val = SuiteTensors(tok, list(suite.validation))
     cfg["train_examples"] = len(train)
     val_idx = list(range(len(val.examples)))
@@ -1583,6 +1665,7 @@ def cmd_eval(args):
     neutral_delta = _neutral_delta_from_config(cfg)
     paired_delta = _paired_delta_from_config(cfg)
     _trace_curriculum_from_config(cfg)
+    _counterfactual_margin_from_config(cfg)
     model_id = cfg.get("model")
     if not isinstance(model_id, str) or not model_id:
         raise ValueError(
