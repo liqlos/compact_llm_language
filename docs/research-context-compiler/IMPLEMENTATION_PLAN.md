@@ -14,6 +14,14 @@ Status legend (legacy phases): `NOT_STARTED` / `IN_PROGRESS` / `BLOCKED` / `DONE
 > EVALUATION_PROTOCOL.md, BLOCKERS.md. RIR/1 is repositioned as
 > audit/debug/fallback representation, not the "language of thought".
 
+> **R1 contract correction (2026-08-27):** the baseline delimiter dictionary
+> codec, substring numeric check, persisted run isolation and existing-object
+> RawStore dedupe were not as strong as this historical plan claimed. The R1
+> implementation replaces the codec with structural JSON arrays, validates
+> bounded normalized numeric tokens, rechecks run identity at load/compile/
+> expand, binds token counts to tokenizer identity, and verifies existing store
+> bytes before dedupe. These are unit/property contracts, not model evidence.
+
 ## 0. Evidence review (2026-08-22 literature pass)
 
 Key findings that shaped or validated this implementation:
@@ -96,9 +104,11 @@ assertion. Whole-state save/load kept as the simple path on top.
 refs and confidence; rendered as the LAST section of compiled context
 (`<SCRATCH format=RIR/1>`) so every update is a pure suffix append and the
 prompt prefix stays byte-stable (cache-friendly, anti-drift).
-Exactness guard enforced at `add()`: every numeric token must appear verbatim
-in cited sources (resolved through the hash-verified store) — fabricated or
-drifted digits raise `ScratchError`; negations survive as plain text.
+Provenance guard enforced at `add()`: signed integer, decimal and exponent
+tokens are normalized and must match bounded numeric tokens in every cited
+source (resolved through the hash-verified store). Substring matches such as
+`142` in `1420` and `2` in `20.1` raise `ScratchError`; this does not prove the
+semantic truth of a matched number. Negations survive as plain text.
 Persisted in session save/load. 12 dedicated tests.
 Format cost micro-benchmark (`bench/formats.py`, same content, 6 formats):
 RIR/1 cheapest on both counters (approx 365 tok vs prose 515; o200k 216 vs
@@ -117,11 +127,13 @@ actual model-backed compressor requires a live provider and stays behind the
 Phase-7 gate by construction.
 
 ### Phase 6 — Dictionary encoding for structured outputs — DONE
-`rcc/dictenc.py`: lossless JSON-object dictionary codec — schema stated once,
-objects become positional rows; exact type round-trip (strings stay strings,
-ints stay ints); declines non-conforming or non-shrinking payloads;
-fail-open at render time (`Policy.encode_jsonl`, off by default).
-Measured (o200k): 20-row JSONL tool dump 400 → 310 tokens (−22%), byte-exact decode.
+`rcc/dictenc.py`: structural JSON-object dictionary codec — schema stated once,
+objects become positional rows in an unambiguous JSON array; arbitrary JSON
+keys and nested values round-trip by structural equality. It does not claim to
+reproduce original whitespace or object bytes. Non-conforming or non-shrinking
+payloads are declined; render-time use remains feature-flagged
+(`Policy.encode_jsonl`, off by default). The historical 400 → 310 token
+observation is a format estimate, not evidence of byte-exact decoding.
 
 ### Phase 7 — Query-aware break-even gate — DONE (deterministic core)
 `rcc/gate.py`: per-turn amortised comparison `S·N + q·N·(s+c) < D·N·(1+pen)`;

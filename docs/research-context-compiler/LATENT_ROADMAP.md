@@ -1,10 +1,17 @@
 # Latent Roadmap — maturity-tracked
 
+> **R1 correction (2026-08-27): `VALID_EXPERIMENT_PENDING` ·
+> `PAID_SPEND_NOT_AUTHORIZED`.** `artifacts/milestone_r1_verdict.json` is the
+> current machine authority. The 50 historical latent eval files are
+> `IRRECOVERABLE_LEGACY_SCORER`, and all 13 checkpoints chosen from those
+> validation histories have `selection_provenance_invalid`. Nothing below is
+> permission to run paid 4B/27B work.
+
 Status vocabulary: `HYPOTHESIS` `SCAFFOLDED` `UNIT_VERIFIED` `MODEL_VERIFIED`
 `REPLICATED` `REJECTED_BY_EVIDENCE` `BLOCKED` (plus NOT_STARTED / NOT MEASURED).
 A file or class existing is never evidence of maturity by itself.
 
-Updated: 2026-08-25 (live-eval harness and consolidated runtime evidence).
+Updated: 2026-08-27 (R1 evidence invalidation and local runtime contracts).
 Measurements remain historical snapshots unless a row names a current receipt.
 
 ## Current status table
@@ -18,23 +25,34 @@ Measurements remain historical snapshots unless a row names a current receipt.
 | Router / dictenc / break-even gate | SCAFFOLDED (experimental) | unit tests only; no measured task benefit |
 | Behavioral fidelity of compiled context | NOT MEASURED | deterministic fixture only; no real-provider run exists |
 | Model-directed expansion (access-lossless) | HYPOTHESIS | design only |
-| Latent pipeline plumbing (latent_lab) | UNIT_VERIFIED (mock) | no-decode loop contract, K causality, ablations, provenance verifier |
+| Latent pipeline plumbing (latent_lab) | UNIT_VERIFIED (local tiny/mock) | hidden-state-chain BPTT with detached cache recurrence; unsupported `grad_checkpoint` removed; scoped no-decode guard; same-adapter K=0/1/2/4/8; autoregressive full-decoder reference |
 | Toy recurrence trainer (T1 analog) | UNIT_VERIFIED | loss 7.58→0.016, acc 100% vs 6.25% under loop ablation ⇒ latent path causally used at toy scale |
-| **Real Qwen hybrid runtime control** | MODEL_VERIFIED (Qwen3.5-0.8B proxy) | state probe JSON: cache snapshot/restore exact, inputs_embeds ok, K=3 recurrence with 0 lm_head calls, 16.9 ms/step MPS fp16 |
+| Historical Qwen hybrid runtime probe | HISTORICAL_UNBOUND | retained 0.8B state-probe JSON is runtime-only evidence, not reasoning quality or current scorer evidence |
 | MLX soft-embedding path | MEASURED / PARTIALLY BLOCKED | exact-vocab embeds bit-exact & fast; off-manifold inputs slow ~3.5–5×; hybrid prefix-cache trim unsupported |
-| Localized recurrence quality/speedup | MODEL_MEASURED @ Qwen3.5-2B; causal advantage not robust; speedup not validated | T1/T2 suite v2 and ablations below; see `latent_lab/bench/GATE_SUMMARY.md` |
-| Qwen3.8-27B speedup ≥2× | NOT MEASURED | gated by proxy gate below |
+| Localized recurrence quality/speedup | INVALIDATED / VALID_EXPERIMENT_PENDING | behavioral-v2 derived-only outputs cannot be rescored; no current model result exists |
+| Qwen3.8-27B speedup ≥2× | NOT MEASURED | no current scaling permission; valid small behavioral-v3 experiment pending |
 
 ## Stages
 
-### T0 — Baselines (DONE 2026-08-23, 2B)
+## INVALIDATED HISTORICAL TEXT — preserved, not current evidence
+
+> The historical paragraph below is preserved to show what was claimed before
+> the R1 audit; it must not be quoted as a current result. Behavioral-v2
+> `obj_track` leaked final state into “Initial situation”; the 50 latent evals
+> lack raw candidate scores and used the candidate-index-zero scorer; candidate
+> counts vary; K comparisons used separately trained adapters. The stored 2B
+> textual 0/112 flags do not establish a capability limit. Conversely, stored
+> 4B direct/no-thinking flags are 97/112 ID and 84/112 OOD versus native
+> thinking 1/112 and 0/112, but all are preview-only and non-rescorable.
+
+### T0 — Baselines (INVALIDATED HISTORICAL CLAIM, 2026-08-23, 2B)
 Behavioral suite v2: 7 procedural state-tracking families, parse-back
 verified answers, balanced candidates, leakage audit. Textual baselines on
 Qwen3.5-2B: ALL 0.0% accuracy (direct/thinking/capped, incl. 1024-token
 budget; up to 100% NON_TERMINATION from re-reading loops) =>
 MODEL_CAPABILITY_LIMIT for textual reasoning at this scale.
 
-### T1/T2 — Latent recurrence @2B (MEASURED 2026-08-23)
+### T1/T2 — Latent recurrence @2B (INVALIDATED HISTORICAL CLAIM, 2026-08-23)
 Frozen backbone + interval LoRA + zero-init step clock; guarded loop (zero
 lm_head/tokenizer calls, unit-tested). Attempt-1 (constant lr): E(K=4)
 test-ID 0.4375/0.5179/0.4286 (mean .461) vs K=0 control .375 vs full-decoder
@@ -72,10 +90,11 @@ path. Never instance-compilation as working memory.
 
 ## Go/no-go gates
 
-Execution environment (owner decision 2026-08-24): serious 4B/27B training
-and CUDA experiment matrices run on rented Vast.ai GPUs, only after the
-fail-closed no-spend READY gate; the local laptop runs unit/smoke tests,
-artifact validation and orchestration only (VISION.md).
+Execution environment (owner decision 2026-08-24): any serious 4B/27B
+training or CUDA matrix would use rented hardware, but only when both the
+fresh fail-closed gate and `artifacts/milestone_r1_verdict.json` explicitly
+authorize it. Current state is `PAID_SPEND_NOT_AUTHORIZED`; the local laptop
+runs unit/smoke tests, artifact validation and orchestration only (VISION.md).
 
 Proxy gate (before any 27B work): ≥1.5× end-to-end wall-clock speedup vs
 native visible CoT on reasoning-heavy deterministic tasks; ≤2 pp absolute

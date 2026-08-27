@@ -1,6 +1,8 @@
 # Evaluation Protocol — RCC latent experiments
 
-Version: 2026-08-22. All benchmark results must embed a config manifest
+Version: 2026-08-27. Status: `VALID_EXPERIMENT_PENDING`;
+`PAID_SPEND_NOT_AUTHORIZED` per `artifacts/milestone_r1_verdict.json`.
+All benchmark results must embed a config manifest
 (model repo+revision, runtime versions, dtype, hardware, seeds, exact command)
 and be committed as machine-readable JSON under `latent_lab/bench/results/`
 (gitignored if bulky; manifest always committed).
@@ -17,6 +19,23 @@ time; number of latent steps; number of sequential layer applications;
 generated visible tokens; generated reasoning tokens; replayed textual
 context; peak RAM/VRAM; cache/state bytes; estimated FLOPs; tool-call count;
 raw-evidence expansions; citation/evidence correctness.
+
+## Canonical behavioral-v3 scoring record
+
+Latent candidate evaluation has one record schema, `latent_eval.v3`, and one
+summary schema, `latent_eval.summary.v3`. The fixed primary candidate score is
+`mean_candidate_token_logprob_v1`; raw per-token log probabilities, raw sums
+and token counts are retained for independent rescore. Exact top ties produce
+`AMBIGUOUS_TOP_TIE` under `exact_top_tie_is_error_v1`; candidate index never
+breaks a tie. Validation checkpoint selection, online/final scoring, offline
+rescore, reports and the no-spend gate use this same implementation and source
+hash. Selection provenance is valid only as
+`latent_eval.v3_recomputed_from_raw_validation_records`.
+
+The immutable suite is `behavioral-v3`; its final test is untouched and never
+used for checkpoint selection. Historical behavioral-v2 derived-only records
+are `IRRECOVERABLE_LEGACY_SCORER`, not accuracy, and cannot be migrated by
+inventing missing raw scores.
 
 ## Mandatory baselines (same checkpoint, precision, seed policy, tasks)
 
@@ -54,6 +73,8 @@ coding and agent loops only after the gate passes.
 - matched layer-call/compute comparison;
 - proof that no hidden textual CoT is generated inside the latent loop;
 - causal check that K=0 vs K>0 actually differ.
+- K=0/1/2/4/8 evaluation of the same trained adapter; a separately trained K0
+  is reported only as an additional control, never a recurrence ablation.
 
 If zeroing/shuffling latent states does not hurt, the model ignores the
 latent path — such a run is recorded as failure, not success.

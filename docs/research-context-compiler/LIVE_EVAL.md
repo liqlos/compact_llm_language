@@ -1,5 +1,9 @@
 # Live-model evaluation harness
 
+> R1 status: harness-only work is allowed locally; paid or remote provider use
+> is `PAID_SPEND_NOT_AUTHORIZED` until
+> `artifacts/milestone_r1_verdict.json` explicitly says otherwise.
+
 Status: **harness DONE, fixture-tested, ground-truth vectors incorporated;
 live run pending a configured provider.** Implements the measurement the plan
 (§4/§8) called for: task quality scored over real model answers instead of

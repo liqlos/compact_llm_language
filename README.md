@@ -1,11 +1,20 @@
 # RCC — Research Context Compiler
 
+> **R1 evidence status (2026-08-27): `VALID_EXPERIMENT_PENDING` ·
+> `PAID_SPEND_NOT_AUTHORIZED`.** No retained historical model result is valid
+> current evidence for latent recurrence. The machine-readable source of truth
+> is `artifacts/milestone_r1_verdict.json`; artifact dispositions are in
+> `artifacts/ARTIFACT_CLASSIFICATION.json` and
+> `artifacts/HISTORICAL_EVAL_INVALIDATION.json`. A historical READY receipt or
+> prose roadmap never authorizes spend or scaling.
+
 **Strategic direction (2026-08-22):** RCC is pivoting to latent cognition on
 open-weight Qwen (`Qwen/Qwen3.8-27B` release target; Qwen3.5 proxies).
 Document authority:
 
 - current direction and decisions: `VISION.md` and `ADR-001`;
-- current maturity and gates: `LATENT_ROADMAP.md`;
+- current maturity and spend authority: `artifacts/milestone_r1_verdict.json`
+  and the freshly generated no-spend verdict; `LATENT_ROADMAP.md` is explanatory;
 - contribution/integration process: `CONTRIBUTING.md`;
 - experiment protocols: `EVALUATION_PROTOCOL.md`, `LIVE_EVAL.md`, and
   `docs/NO_SPEND_GATE.md`;
@@ -43,13 +52,15 @@ timeline()   ─► live per-turn audit: what is inline/masked/failopen + tokens
   weaker claims — see VISION.md; both unmeasured with a real-provider model.)
 - **Prefix-stable**: stubs are written once and never rewritten; the RIR/1
   block only appends → prompt-prefix caching stays valid across turns.
-- **Fine-fact guard**: numeric tokens in machine-state atoms must appear
-  verbatim in their cited sources or `Scratch.add()` raises — fabricated or
-  drifted digits cannot enter machine state.
+- **Fine-fact guard**: signed integer, decimal and exponent tokens in
+  machine-state atoms are normalized and must match whole numeric tokens in
+  their cited sources. Substrings such as `142` in `1420` or `2` in `20.1`
+  are rejected; this is a provenance guard, not a truth oracle.
 - **Fail-open availability / fail-closed integrity**: masking requires a
   verified store object (else verbatim text or an honest
   `<OBSERVATION_UNAVAILABLE/>` marker); tampered objects raise.
-- **Run isolation**: references carry run IDs; cross-run resolution raises.
+- **Run isolation**: references carry run IDs; load, compile and expand all
+  fail closed on cross-run or tampered persisted references.
 - **Injection quarantine**: untrusted content appears only inside
   `<OBSERVATION>` / `<UNTRUSTED_OBSERVATION>` wrappers.
 
@@ -90,6 +101,17 @@ uv run python -m bench.run_bench --exact --json .rcc_bench/results.json
 uv run python -m evals.run_live_eval --provider fake   # live-eval harness (offline fixture)
 ```
 
+## R1 benchmark and scorer contract
+
+New latent measurements use immutable `behavioral-v3` and record
+`latent_eval.v3` (`latent_eval.summary.v3`). The preregistered primary
+candidate score is `mean_candidate_token_logprob_v1`; raw per-token values,
+raw sums and token counts remain in every record. Exact top ties are
+`AMBIGUOUS_TOP_TIE` errors under `exact_top_tie_is_error_v1`, never index-based
+winners. Checkpoint selection is valid only from raw validation records
+recomputed by the same canonical scorer used for final and offline evaluation.
+No such model experiment has been executed yet.
+
 ## No-spend integrity gate (latent evidence)
 
 Deterministic, hardware-free-capable gate over the retained 2B/4B artifacts:
@@ -107,6 +129,15 @@ uv run python -m latent_lab.bench.no_spend_gate   # full mode (CPU-only; runs pr
 uv run python -m latent_lab.bench.no_spend_gate --dry-run   # hashes/metadata only
 ```
 
+Regenerate the historical classification from the canonical private evidence
+root without copying model files into Git:
+
+```bash
+RCC_R1_EVIDENCE_ROOT=/absolute/path/to/repository/.rcc_work
+.venv/bin/python tools/classify_r1_artifacts.py \
+  --evidence-root "$RCC_R1_EVIDENCE_ROOT"
+```
+
 Exit codes: `0` READY · `1` NOT_READY · `2` execution error (bad invocation,
 unreadable inputs, inputs mutated mid-run, unwritable outputs). `--out` may
 never overlap an input root. Every known fail-open is a blocker; negative
@@ -115,7 +146,9 @@ controls for each audited fail-open are pinned in
 Gate outputs are byte-stable across reruns against unchanged inputs and contain
 no wall-clock value (the timestamp is separate telemetry). Retained receipts are
 `.rcc_work/rcc.pre_spend.v2.json` and `.rcc_work/rcc.canary_attempt.v1.json`;
-rerun the gate before relying on either as current state. See
+they are historical only. The current authority is
+`artifacts/milestone_r1_verdict.json`, which keeps
+`paid_spend_authorized: false` (`PAID_SPEND_NOT_AUTHORIZED`). See
 `docs/NO_SPEND_GATE.md` for the contract and historical result.
 
 Live-model evaluation (`evals/`) replays the five benchmark scenarios plus a
@@ -151,13 +184,15 @@ representative scenarios; fact recall via expansion 100%; cumulative spend
 | 6 Dictionary encoding | SCAFFOLDED (experimental) |
 | 7 Break-even gate | SCAFFOLDED (deterministic core; q/N never calibrated) |
 | Behavioral fidelity on live model | NOT MEASURED — blocks all downstream claims |
-| Latent pipeline plumbing (`latent_lab/`) | UNIT_VERIFIED (mock; no-decode loop contract enforced) |
-| Real Qwen hybrid runtime control | MODEL_VERIFIED on Qwen3.5-0.8B proxy — cache snapshot/restore exact, K-step recurrence with zero lm_head calls (`latent_lab/bench/results/state_probe_*.json`) |
+| Latent pipeline plumbing (`latent_lab/`) | UNIT_VERIFIED locally: hidden-state-chain BPTT with explicitly detached KV/cache recurrence; same adapter accepts K=0/1/2/4/8; full-decoder candidate tails are autoregressive; unsupported `grad_checkpoint` was removed and historical `true` fails closed |
+| No-decode recurrence guard | UNIT_VERIFIED locally and scoped to the guarded recurrence context: tokenizer call/encode/decode/batch-decode/chat-template, model generate, and direct output-head paths raise; the guard is restored on exit |
+| Historical Qwen hybrid runtime probe | HISTORICAL_UNBOUND — retained 0.8B state-probe JSON is runtime evidence only, not reasoning-quality or current scorer evidence |
 | MLX off-vocabulary embedding path | MEASURED: exact-vocab embeds safe/fast; off-manifold inputs slow ~3.5–5×; hybrid prefix-cache trim unsupported (`results/mlx_soft_embedding_probe.json`) |
-| Localized recurrence quality / speedup | MODEL_MEASURED @ Qwen3.5-2B behavioral gate | suite v2 (7 families): latent E(K=4) LoRA 0.43–0.52 test-ID vs chance 0.07 vs K=0 control 0.375; partial OOD length-gen 0.29–0.49; causal ablations seed-dependent (`latent_lab/bench/GATE_SUMMARY.md`, `.rcc_work/GATE_SUMMARY.md`) |
-| Textual baselines @2B | REJECTED_BY_EVIDENCE (capability limit) | direct/thinking/capped all 0.0% acc, up to 100% NON_TERMINATION incl. 1024-token budget |
+| Historical 2B latent outputs | IRRECOVERABLE_LEGACY_SCORER — 50 derived-only files cannot be rescored; their old `correct`, rank, above-chance and K-dose values are not accuracy or current evidence; 13 selected checkpoints have `selection_provenance_invalid` |
+| Historical textual baselines @2B | HISTORICAL_UNBOUND — stored 0/112 derived correct flags do not establish a model capability limit; full outputs and canonical raw score records are absent |
+| Historical textual baselines @4B | HISTORICAL_UNBOUND, preview-only — stored direct/no-thinking flags are 97/112 ID and 84/112 OOD versus native-thinking 1/112 and 0/112; this strong contrary observation is not independently rescorable and must be rerun on behavioral-v3 |
 | MLX internal-recurrence path | MEASURED: bit-exact composition, speed BLOCKED without compile | `latent_lab/bench/mlx_internal_recurrence_probe.py` |
-| Qwen3.8-27B speedup ≥2× | NOT MEASURED | gated by 4B step (MODEL_CAPABILITY_LIMIT at 2B) |
+| Qwen3.8-27B speedup ≥2× | NOT MEASURED | no scaling permission; valid small behavioral-v3 experiment pending |
 | Live-model evaluation | UNIT_VERIFIED harness + deterministic fixture; real-provider run pending |
 
 ```

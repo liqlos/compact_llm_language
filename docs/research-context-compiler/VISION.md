@@ -1,5 +1,10 @@
 # RCC Vision — Latent Cognition on Open-Weight Qwen
 
+> **R1 status (2026-08-27): `VALID_EXPERIMENT_PENDING` and
+> `PAID_SPEND_NOT_AUTHORIZED`.** This document describes direction, not
+> evidence or spend authority. Current authority is
+> `artifacts/milestone_r1_verdict.json` plus the fresh no-spend verdict.
+
 Date: 2026-08-22. Supersedes the "textual RCC as end-state" reading of earlier
 plan documents.
 
@@ -37,7 +42,8 @@ covering the hybrid architecture.
 
 Qwen3.5-4B is used only because it reproduces the hybrid
 `3 × Gated DeltaNet + 1 × Attention` layer pattern cheaply. Proxy success is
-permission to scale, never proof of 27B success.
+one prerequisite for a future scaling decision, never standalone permission
+and never proof of 27B success.
 
 ## What exists today (honest)
 
@@ -84,8 +90,9 @@ ADR-001 and LATENT_ROADMAP.md for alternatives considered and rejected.
 
 Owner decision (2026-08-24):
 
-- all serious 4B/27B training and CUDA experiment matrices run on rented
-  Vast.ai GPUs, and only after the fail-closed no-spend READY gate;
+- any future serious 4B/27B training and CUDA experiment matrix would run on
+  rented hardware only after both the fail-closed no-spend gate and the
+  milestone verdict explicitly authorize spend; neither does so at R1;
 - the local laptop (Apple Silicon, 16 GB unified memory; measured M1 Pro,
   original plan assumed M4/32 GB) is for unit tests, smoke tests, artifact
   validation, and orchestration only — it is not a 27B training or final

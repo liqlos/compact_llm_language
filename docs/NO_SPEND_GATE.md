@@ -1,5 +1,12 @@
 # No-Spend Integrity Gate (2026-08-24)
 
+> **Current R1 authority (2026-08-27):**
+> `artifacts/milestone_r1_verdict.json` records
+> `PAID_SPEND_NOT_AUTHORIZED`; a valid model experiment is pending. Historical
+> READY receipts documented below are preserved audit records, not current
+> authorization. Paid or remote execution requires a fresh machine verdict
+> that explicitly changes `paid_spend_authorized` from false.
+
 Bounded, deterministic, zero-spend gate that decides whether the retained
 latent-recurrence evidence justifies ANY further GPU spend. It implements
 requirement R002/R005 of the 2026-08-24 requirements brief: a fail-closed

@@ -2,14 +2,16 @@
 
 Snapshot date: 2026-08-24. This is an evidence ledger, not the current task
 queue. Recheck environment-dependent claims before acting; current maturity and
-gates live in `LATENT_ROADMAP.md`.
+spend authority live in `artifacts/milestone_r1_verdict.json`. At R1 the status
+is `PAID_SPEND_NOT_AUTHORIZED`; the historical 2B latent outputs are
+`IRRECOVERABLE_LEGACY_SCORER`, and the rejected 4B runs remain quarantined.
 
-Execution environment (owner decision 2026-08-24): serious 4B/27B training
-and CUDA experiment matrices run on rented Vast.ai GPUs behind the fail-closed
-no-spend READY gate; this laptop runs unit/smoke tests, artifact validation,
-and orchestration only; final 27B validation runs later on an owner-supplied
-server. MLX entries below are preserved as measured historical evidence — MLX
-on this laptop is not the release gate (VISION.md).
+Execution environment (owner decision 2026-08-24): future serious 4B/27B
+training and CUDA matrices would use rented hardware only after a fresh
+fail-closed gate and milestone verdict explicitly authorize spend. They do not
+currently. This laptop runs unit/smoke tests, artifact validation, and
+orchestration only. MLX entries below are preserved as historical runtime
+observations — MLX on this laptop is not the release gate (VISION.md).
 
 ## B1 — Local hardware below original assumption
 

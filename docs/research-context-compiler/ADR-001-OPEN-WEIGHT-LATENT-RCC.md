@@ -5,6 +5,12 @@ Date: 2026-08-22
 Supersedes: implicit direction of IMPLEMENTATION_PLAN.md phases 5–7 (textual
 machine dialects as end state).
 
+> **R1 evidence addendum (2026-08-27):** the architectural target remains a
+> hypothesis. Historical behavioral-v2 latent metrics and checkpoint selection
+> are invalidated; no proxy result currently permits scaling. The machine
+> verdict in `artifacts/milestone_r1_verdict.json` is
+> `PAID_SPEND_NOT_AUTHORIZED`.
+
 ## Context
 
 RCC's founding goal is machine-native cognition: research state as tensors,

@@ -1,5 +1,12 @@
 # Parallel-work consolidation — 2026-08-25
 
+> **Historical snapshot:** paths, counts and aggregate `.rcc_work` digest below
+> describe the 2026-08-25 layout. The R1 audit preserved all content but moved
+> eight duplicate non-finite 4B live run directories into recoverable
+> quarantine. Current per-file hashes and dispositions are in
+> `artifacts/ARTIFACT_CLASSIFICATION.json`; spend remains
+> `PAID_SPEND_NOT_AUTHORIZED` per `artifacts/milestone_r1_verdict.json`.
+
 ## Recovery boundary
 
 - Canonical branch before consolidation: `main`.
