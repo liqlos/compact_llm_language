@@ -100,6 +100,43 @@ def _data(examples):
     )
 
 
+class _TrainingRec:
+    def __init__(self):
+        self.calls = []
+
+    def candidate_ce_loss_on_example(self, prompt_ids, candidate_ids,
+                                     gold_index, k_steps, *, detach_z0):
+        self.calls.append(("candidate_ce", candidate_ids, gold_index,
+                           k_steps, detach_z0))
+        return "candidate-loss"
+
+    def loss_on_example(self, prompt_ids, answer_ids, k_steps, *, detach_z0):
+        self.calls.append(("gold_nll", answer_ids, k_steps, detach_z0))
+        return "gold-loss"
+
+
+def test_training_objective_dispatch_derives_gold_and_preserves_gold_nll():
+    from latent_lab.bench.latent_run import _training_loss_on_example
+
+    ex = _ex(gold_pos=2)
+    data = SimpleNamespace(
+        examples=[ex], prompt_ids=[_Ids()], answer_ids=[_Ids()],
+        cand_ids=[["ids-c0", "ids-c1", "ids-c2", "ids-c3"]])
+    rec = _TrainingRec()
+    candidate_loss = _training_loss_on_example(
+        rec, data, 0, device="cpu", k_steps=4,
+        training_objective="candidate_ce", detach_z0=True)
+    assert candidate_loss == "candidate-loss"
+    assert rec.calls[-1] == (
+        "candidate_ce", data.cand_ids[0], 2, 4, True)
+
+    gold_loss = _training_loss_on_example(
+        rec, data, 0, device="cpu", k_steps=4,
+        training_objective="gold_nll", detach_z0=False)
+    assert gold_loss == "gold-loss"
+    assert rec.calls[-1] == ("gold_nll", data.answer_ids[0], 4, False)
+
+
 def test_gold_at_nonzero_position_top_ranked_is_correct():
     # Gold sits at candidate index 2 and the model ranks it first.
     ex = _ex(gold_pos=2)

@@ -28,7 +28,12 @@ import sys
 import time
 from pathlib import Path
 
-from latent_lab.backends.localized import RECURRENCE_ONLY_LORA_MODE_SUFFIX
+from latent_lab.backends.localized import (
+    CANDIDATE_CE_MODE_SUFFIX,
+    RECURRENCE_ONLY_LORA_MODE_SUFFIX,
+    TRAINING_OBJECTIVES,
+    training_objective_from_config,
+)
 
 DEFAULT_MODEL_ID = "Qwen/Qwen3.5-2B"
 DEFAULT_REVISION = "15852e8c16360a2fea060d615a32b45270f8a8fc"
@@ -558,6 +563,28 @@ def _adapter_policy_mode(mode: str, recurrence_only_lora: bool) -> str:
     return mode
 
 
+def _training_objective_mode(mode: str, training_objective: str) -> str:
+    """Seal the objective before any recurrence-only activation suffix."""
+    if training_objective not in TRAINING_OBJECTIVES:
+        raise ValueError(
+            f"training_objective must be one of {TRAINING_OBJECTIVES}")
+    recurrence_suffix = ""
+    if mode.endswith(RECURRENCE_ONLY_LORA_MODE_SUFFIX):
+        mode = mode.removesuffix(RECURRENCE_ONLY_LORA_MODE_SUFFIX)
+        recurrence_suffix = RECURRENCE_ONLY_LORA_MODE_SUFFIX
+    suffix_count = mode.count(CANDIDATE_CE_MODE_SUFFIX)
+    if suffix_count > 1 or (suffix_count == 1 and
+                            not mode.endswith(CANDIDATE_CE_MODE_SUFFIX)):
+        raise ValueError("mode carries a malformed candidate-CE suffix")
+    if training_objective == "candidate_ce":
+        if suffix_count == 0:
+            mode += CANDIDATE_CE_MODE_SUFFIX
+    elif suffix_count:
+        raise ValueError(
+            "mode claims candidate CE but training_objective is gold_nll")
+    return mode + recurrence_suffix
+
+
 def _recurrence_only_lora_from_config(cfg: dict) -> bool:
     """Recover and cross-check the policy sealed into the recipe's mode."""
     value = cfg.get("recurrence_only_lora", False)
@@ -599,6 +626,7 @@ def _recurrence_config(cfg: dict) -> dict:
     """Measured recurrence settings; unsupported flags cannot enter v3."""
     if cfg.get("grad_checkpoint") not in (None, False):
         raise ValueError("grad_checkpoint=true is unsupported")
+    training_objective_from_config(cfg)
     recurrence_only_lora = _recurrence_only_lora_from_config(cfg)
     return {
         "mode": cfg["mode"],
@@ -707,18 +735,21 @@ def recipe_from_config(cfg: dict, suite_sha256: str) -> dict:
 
 
 def mode_from_spec(interval_spec: str, k: int,
-                   recurrence_only_lora: bool = False) -> str:
+                   recurrence_only_lora: bool = False,
+                   training_objective: str = "gold_nll") -> str:
     """The preregistered mode implied by the interval spec and K."""
     base = ("D-full" if interval_spec == "full"
             else "F-control" if k == 0 else "E-localized")
-    return _adapter_policy_mode(base, recurrence_only_lora)
+    objective_mode = _training_objective_mode(base, training_objective)
+    return _adapter_policy_mode(objective_mode, recurrence_only_lora)
 
 
 def train_recipe_digest(*, mode, interval, k, max_k, lora_r, lora_alpha,
                          lr, steps, seed, optimizer, weight_decay,
                          lr_schedule, warmup, clip, detach_z0,
                          suite_sha256, grad_checkpoint=None,
-                         recurrence_only_lora=False) -> str:
+                         recurrence_only_lora=False,
+                         training_objective="gold_nll") -> str:
     """ONE canonical digest binding EVERY behavior-changing field.
 
     The single source of truth shared by the trainer and the paid
@@ -729,7 +760,9 @@ def train_recipe_digest(*, mode, interval, k, max_k, lora_r, lora_alpha,
     checkpointing.recipe_from_config rejects true and never persists it.
     """
     cfg = {
-        "mode": _adapter_policy_mode(mode, recurrence_only_lora),
+        "mode": _adapter_policy_mode(
+            _training_objective_mode(mode, training_objective),
+            recurrence_only_lora),
         "interval": list(interval), "k": k, "max_k": max_k,
         "lora_r": lora_r, "lora_alpha": lora_alpha,
         "lr": lr, "steps": steps, "seed": seed,
@@ -740,6 +773,26 @@ def train_recipe_digest(*, mode, interval, k, max_k, lora_r, lora_alpha,
     if grad_checkpoint is not None:
         cfg["grad_checkpoint"] = grad_checkpoint
     return recipe_from_config(cfg, suite_sha256)["config_sha256"]
+
+
+def _training_loss_on_example(rec, train, index: int, *, device: str,
+                              k_steps: int, training_objective: str,
+                              detach_z0: bool):
+    """Dispatch one example without trusting any supplied gold index."""
+    prompt_ids = train.prompt_ids[index].to(device)
+    if training_objective == "candidate_ce":
+        ex = train.examples[index]
+        gold_index = derive_gold_index(
+            ex.candidates, ex.answer, ex_id=ex.ex_id)
+        return rec.candidate_ce_loss_on_example(
+            prompt_ids, train.cand_ids[index], gold_index, k_steps,
+            detach_z0=detach_z0)
+    if training_objective != "gold_nll":
+        raise ValueError(
+            f"training_objective must be one of {TRAINING_OBJECTIVES}")
+    return rec.loss_on_example(
+        prompt_ids, train.answer_ids[index].to(device), k_steps,
+        detach_z0=detach_z0)
 
 
 def _mark_run_fatal(out: Path, e: BaseException) -> None:
@@ -847,6 +900,8 @@ def _train_inner(args, out: Path, device: str, revision: str):
         torch.cuda.manual_seed_all(args.seed)
 
     recurrence_only_lora = getattr(args, "recurrence_only_lora", False)
+    training_objective = getattr(args, "training_objective", "gold_nll")
+    _training_objective_mode("D-full", training_objective)
     if recurrence_only_lora and args.k == 0:
         raise ValueError(
             "--recurrence-only-lora requires --k > 0 for training; "
@@ -870,7 +925,8 @@ def _train_inner(args, out: Path, device: str, revision: str):
     suite_manifest = _suite_v3_contract(suite)
     suite_sha = suite_manifest["suite_hash"]
     mode = mode_from_spec(
-        args.interval, args.k, recurrence_only_lora=recurrence_only_lora)
+        args.interval, args.k, recurrence_only_lora=recurrence_only_lora,
+        training_objective=training_objective)
     cfg = {
         "mode": mode,
         "model": args.model, "revision": revision,
@@ -881,6 +937,7 @@ def _train_inner(args, out: Path, device: str, revision: str):
         "optimizer": args.optimizer, "weight_decay": args.weight_decay,
         "lr_schedule": args.lr_schedule, "warmup": args.warmup,
         "clip": args.clip, "detach_z0": args.detach_z0,
+        "training_objective": training_objective,
         "recurrence_only_lora": recurrence_only_lora,
         "runtime_contract": rec.runtime_contract(),
         "device": device,
@@ -924,9 +981,10 @@ def _train_inner(args, out: Path, device: str, revision: str):
         for g in opt.param_groups:
             g["lr"] = lr_at(step)
         i = perm[step % len(order)]
-        loss = rec.loss_on_example(train.prompt_ids[i].to(device),
-                                   train.answer_ids[i].to(device),
-                                   args.k, detach_z0=args.detach_z0)
+        loss = _training_loss_on_example(
+            rec, train, i, device=device, k_steps=args.k,
+            training_objective=training_objective,
+            detach_z0=args.detach_z0)
         opt.zero_grad()
         loss.backward()
         # fail-stop: any fault here raises FatalRunInvalidError and kills
@@ -1132,6 +1190,7 @@ def cmd_eval(args):
     report = strict_json_loads(
         (Path(args.adapter) / "train_report.json").read_text())
     cfg = report["config"]
+    training_objective_from_config(cfg)
     recurrence_only_lora = _recurrence_only_lora_from_config(cfg)
     model_id = cfg.get("model")
     if not isinstance(model_id, str) or not model_id:
@@ -1313,6 +1372,11 @@ def main():
     tr.add_argument("--weight-decay", type=float, default=0.01)
     tr.add_argument("--clip", type=float, default=0.5)
     tr.add_argument("--detach-z0", action="store_true")
+    tr.add_argument(
+        "--training-objective", choices=TRAINING_OBJECTIVES,
+        default="gold_nll",
+        help="gold-token NLL (default) or listwise candidate CE aligned to "
+             "evaluation scoring")
     tr.add_argument(
         "--recurrence-only-lora", action="store_true",
         help="activate LoRA only inside latent recurrence; prompt/readout use "

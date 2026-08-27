@@ -283,6 +283,49 @@ def test_recurrence_only_lora_policy_is_recipe_and_runtime_bound():
                 **contract, "prefill_adapter_active": True}})
 
 
+def test_candidate_ce_objective_is_mode_bound_before_adapter_policy():
+    from latent_lab.backends.localized import training_objective_from_config
+    from latent_lab.bench import latent_run
+
+    mode = latent_run.mode_from_spec(
+        "full", 4, recurrence_only_lora=True,
+        training_objective="candidate_ce")
+    assert mode == "D-full+candidate-ce+recurrence-only-lora"
+    cfg = _cfg(
+        mode=mode, interval=[0, 4], training_objective="candidate_ce",
+        recurrence_only_lora=True,
+        runtime_contract={
+            "adapter_activation_policy": "recurrence_only",
+            "prefill_adapter_active": False,
+            "recurrence_adapter_active": True,
+            "candidate_adapter_active": False,
+        })
+    assert training_objective_from_config(cfg) == "candidate_ce"
+    assert latent_run._recurrence_config(cfg)["mode"] == mode
+
+    common = dict(
+        mode="D-full", interval=(0, 4), k=4, max_k=4,
+        lora_r=8, lora_alpha=16.0, lr=2e-4, steps=20, seed=0,
+        optimizer="adamw", weight_decay=0.01, lr_schedule="constant",
+        warmup=2, clip=0.5, detach_z0=False, suite_sha256=SUITE_SHA,
+        recurrence_only_lora=True)
+    assert latent_run.train_recipe_digest(**common) != \
+        latent_run.train_recipe_digest(
+            **common, training_objective="candidate_ce")
+
+    with pytest.raises(ValueError, match="training_objective disagree"):
+        training_objective_from_config({
+            **cfg, "mode": "D-full+recurrence-only-lora"})
+    with pytest.raises(ValueError, match="training_objective disagree"):
+        training_objective_from_config({
+            **cfg, "training_objective": "gold_nll"})
+    with pytest.raises(ValueError, match="training_objective disagree"):
+        training_objective_from_config({
+            **cfg, "mode": "D-full+candidate-ce+other",
+            "training_objective": "gold_nll",
+            "recurrence_only_lora": False})
+
+
 def test_recurrence_only_lora_k0_training_fails_before_model_load(tmp_path):
     from latent_lab.bench import latent_run
 

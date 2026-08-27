@@ -164,6 +164,30 @@ LORA_TARGET_SUFFIXES = (
     "in_proj", "in_proj_qkvz", "in_proj_ba",
 )
 RECURRENCE_ONLY_LORA_MODE_SUFFIX = "+recurrence-only-lora"
+CANDIDATE_CE_MODE_SUFFIX = "+candidate-ce"
+TRAINING_OBJECTIVES = ("gold_nll", "candidate_ce")
+
+
+def training_objective_from_config(config: dict) -> str:
+    """Recover and verify the training objective sealed into config.mode."""
+    objective = config.get("training_objective", "gold_nll")
+    if objective not in TRAINING_OBJECTIVES:
+        raise ValueError(
+            f"config.training_objective must be one of {TRAINING_OBJECTIVES}")
+    mode = config.get("mode")
+    if not isinstance(mode, str):
+        raise ValueError("config.mode must be a string")
+    core_mode = mode.removesuffix(RECURRENCE_ONLY_LORA_MODE_SUFFIX)
+    suffix_count = core_mode.count(CANDIDATE_CE_MODE_SUFFIX)
+    sealed_candidate_ce = suffix_count == 1 \
+        and core_mode.endswith(CANDIDATE_CE_MODE_SUFFIX)
+    correctly_sealed = (sealed_candidate_ce if objective == "candidate_ce"
+                        else suffix_count == 0)
+    if not correctly_sealed:
+        raise ValueError(
+            "config mode and training_objective disagree; refusing an "
+            "unsealed training objective")
+    return objective
 
 _Base = torch.nn.Module if torch is not None else object
 
@@ -959,6 +983,69 @@ class LocalizedRecurrence:
             z, cache, pos, answer_ids, grad=True)
         return -token_logprobs.mean()
 
+    @staticmethod
+    def candidate_cross_entropy(candidate_scores, gold_index):
+        """Listwise CE over evaluator-aligned mean candidate logprobs."""
+        _require_torch("candidate_cross_entropy")
+        if not candidate_scores:
+            raise ValueError("candidate_scores must be non-empty")
+        if isinstance(gold_index, bool) or not isinstance(gold_index, int) \
+                or not 0 <= gold_index < len(candidate_scores):
+            raise ValueError("gold_index must identify one candidate score")
+        if any(not torch.is_tensor(score) or score.ndim != 0
+               for score in candidate_scores):
+            raise ValueError("candidate_scores must be scalar tensors")
+        scores = torch.stack(tuple(candidate_scores)).view(1, -1)
+        target = torch.tensor([gold_index], device=scores.device,
+                              dtype=torch.long)
+        return torch.nn.functional.cross_entropy(scores, target)
+
+    def candidate_ce_loss_on_example(self, input_ids, candidate_ids,
+                                     gold_index, k_steps, *, ablate=None,
+                                     detach_z0=False):
+        """Listwise candidate CE using exactly the evaluator's mean score."""
+        from ..backends.hf_qwen import cache_restore, cache_snapshot
+
+        ab = validate_ablation(ablate or {}, k_steps)
+        if self.recurrence_only_lora and k_steps == 0:
+            raise ValueError(
+                "recurrence-only LoRA has no trainable path at K=0; "
+                "evaluate K=0 from a K>0-trained adapter instead")
+        eval_only = [key for key in ("swap_state", "reset_state", "reset_cache")
+                     if ab.get(key)]
+        if eval_only:
+            raise ValueError(
+                f"evaluation-only ablation(s) {eval_only} are unsupported in "
+                "candidate_ce_loss_on_example")
+        if not candidate_ids:
+            raise ValueError("candidate set must be non-empty")
+        if isinstance(gold_index, bool) or not isinstance(gold_index, int) \
+                or not 0 <= gold_index < len(candidate_ids):
+            raise ValueError("gold_index must identify one candidate")
+
+        cache, z0 = self._encode(input_ids, grad=True)
+        if detach_z0:
+            z0 = z0.detach()
+        state_intervention = bool(ab.get("zero_state") or ab.get("noise_state"))
+        prompt_cache = cache_snapshot(cache) if state_intervention else None
+        z, pos = self.latent_steps(z0, cache, input_ids.shape[1], k_steps,
+                                   grad=True, ablate=ab)
+        if prompt_cache is not None:
+            cache_restore(cache, prompt_cache)
+
+        recurrence_cache = cache_snapshot(cache)
+        scores = []
+        for candidate in candidate_ids:
+            cache_restore(cache, recurrence_cache)
+            ids = torch.as_tensor(candidate, device=input_ids.device,
+                                  dtype=torch.long).view(1, -1)
+            if ids.shape[1] == 0:
+                raise ValueError("candidate token sequences must be non-empty")
+            token_logprobs, _counters = self._score_candidate_tokens(
+                z, cache, pos, ids, grad=True)
+            scores.append(token_logprobs.mean())
+        return self.candidate_cross_entropy(scores, gold_index)
+
     def trainable_parameters(self):
         ps = lora_parameters(self.injected)
         if self.use_clock:
@@ -1062,6 +1149,10 @@ class LocalizedRecurrence:
         runtime_alpha = float(self.injected[0].scaling
                               * self.injected[0].lora_A.shape[0])
         drift = []
+        try:
+            training_objective_from_config(config)
+        except ValueError as e:
+            drift.append(str(e))
         claimed_policy = config.get("recurrence_only_lora", False)
         if not isinstance(claimed_policy, bool):
             drift.append("recurrence_only_lora is not a boolean")

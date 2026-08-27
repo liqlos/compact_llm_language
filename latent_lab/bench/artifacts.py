@@ -132,7 +132,7 @@ _TRAIN_CONFIG_KNOWN_KEYS = frozenset((
     "steps", "seed", "optimizer", "weight_decay", "lr_schedule",
     "warmup", "clip", "detach_z0", "grad_checkpoint", "model",
     "revision", "label", "device", "train_examples", "suite_sha256",
-    "recurrence_only_lora", "runtime_contract",
+    "training_objective", "recurrence_only_lora", "runtime_contract",
 ))
 
 
@@ -171,6 +171,7 @@ def validate_run(run_dir, *, expected: dict | None = None) -> dict:
     every remaining behavior-changing field. Unknown expectation keys
     are rejected; nothing is silently ignored.
     """
+    from latent_lab.backends.localized import training_objective_from_config
     from latent_lab.bench.latent_run import (
         _recurrence_only_lora_from_config, recipe_from_config,
         selected_v3_adapter_state_sha256)
@@ -204,6 +205,11 @@ def validate_run(run_dir, *, expected: dict | None = None) -> dict:
         raise ValueError(
             f"{where}: unexpected config metadata {unknown_cfg}; "
             "identity/config fields are never ignored")
+    try:
+        training_objective_from_config(cfg)
+    except ValueError as e:
+        raise ValueError(
+            f"{where}: invalid training objective metadata: {e}") from e
     try:
         _recurrence_only_lora_from_config(cfg)
     except ValueError as e:

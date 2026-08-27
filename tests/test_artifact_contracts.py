@@ -454,8 +454,26 @@ def test_report_manifest_and_bundle_bind_one_canonical_recipe(tmp_path):
 
 
 def test_run_validator_recognizes_sealed_adapter_activation_metadata():
-    assert {"recurrence_only_lora", "runtime_contract"} <= \
+    assert {"training_objective", "recurrence_only_lora", "runtime_contract"} <= \
         artifacts._TRAIN_CONFIG_KNOWN_KEYS
+
+
+def test_run_validator_rejects_unsealed_training_objective(tmp_path):
+    from latent_lab.train.checkpointing import (
+        RUN_MANIFEST_FILE, TRAIN_REPORT_FILE, atomic_write_json, sha256_file)
+
+    build_verified_run(tmp_path)
+    report_path = tmp_path / TRAIN_REPORT_FILE
+    report = json.loads(report_path.read_text())
+    report["config"]["training_objective"] = "candidate_ce"
+    atomic_write_json(report_path, report)
+    manifest_path = tmp_path / RUN_MANIFEST_FILE
+    manifest = json.loads(manifest_path.read_text())
+    manifest["report_sha256"] = sha256_file(report_path)
+    atomic_write_json(manifest_path, manifest)
+
+    with pytest.raises(ValueError, match="invalid training objective metadata"):
+        artifacts.validate_run(tmp_path)
 
 
 def test_valid_but_different_bundle_cannot_claim_selected_raw_history(

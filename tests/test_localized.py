@@ -278,3 +278,37 @@ def test_rank_candidates_mechanics(rec):
     assert rec.guard.lm_head_calls - lm_before == sum(map(len, cands))
     assert rep.extra["candidate_token_counts"] == [2, 2, 2]
     assert rep.extra["candidate_raw_sum_logprobs"] == scores
+
+
+def test_candidate_cross_entropy_tracks_margin_and_candidate_permutation():
+    weak = LocalizedRecurrence.candidate_cross_entropy(
+        [torch.tensor(0.0), torch.tensor(0.5), torch.tensor(-0.5)], 0)
+    strong = LocalizedRecurrence.candidate_cross_entropy(
+        [torch.tensor(1.0), torch.tensor(0.5), torch.tensor(-0.5)], 0)
+    permuted = LocalizedRecurrence.candidate_cross_entropy(
+        [torch.tensor(0.5), torch.tensor(-0.5), torch.tensor(1.0)], 2)
+    assert strong < weak
+    assert torch.equal(strong, permuted)
+
+
+def test_candidate_ce_reaches_recurrence_only_lora_gradients():
+    model, tok = build_tiny_hybrid()
+    rec2 = LocalizedRecurrence(
+        model, tok, interval=INTERVAL, max_k=2, lora_r=2,
+        use_clock=False, recurrence_only_lora=True)
+    ids = torch.randint(0, 250, (1, 6))
+    candidates = ([10, 11], [12, 13], [14, 15])
+    loss = rec2.candidate_ce_loss_on_example(
+        ids, candidates, gold_index=1, k_steps=1)
+    assert loss.requires_grad and torch.isfinite(loss)
+    loss.backward()
+    lora_gradients = [
+        parameter.grad for adapter in rec2.injected
+        for parameter in (adapter.lora_A, adapter.lora_B)
+        if parameter.grad is not None
+    ]
+    assert lora_gradients
+    assert all(torch.isfinite(gradient).all() for gradient in lora_gradients)
+    assert any(torch.count_nonzero(gradient).item() > 0
+               for gradient in lora_gradients)
+    assert all(not adapter.enabled for adapter in rec2.injected)
