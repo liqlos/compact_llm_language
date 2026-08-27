@@ -1,11 +1,11 @@
 # Latent Roadmap — maturity-tracked
 
-> **R1 correction (2026-08-27): `VALID_EXPERIMENT_PENDING` ·
-> `PAID_SPEND_NOT_AUTHORIZED`.** `artifacts/milestone_r1_verdict.json` is the
-> current machine authority. The 50 historical latent eval files are
-> `IRRECOVERABLE_LEGACY_SCORER`, and all 13 checkpoints chosen from those
-> validation histories have `selection_provenance_invalid`. Nothing below is
-> permission to run paid 4B/27B work.
+> **Current real-model status:** see
+> [`LATENT_EXPERIMENT_STATUS.md`](LATENT_EXPERIMENT_STATUS.md). The direct owner
+> authorization on 2026-08-27 permits up to approximately USD 20 of paid
+> compute for the current 2B investigation. Historical R1 artifacts remain
+> invalidated; that authorization does not rehabilitate their scorer or
+> checkpoint provenance.
 
 Status vocabulary: `HYPOTHESIS` `SCAFFOLDED` `UNIT_VERIFIED` `MODEL_VERIFIED`
 `REPLICATED` `REJECTED_BY_EVIDENCE` `BLOCKED` (plus NOT_STARTED / NOT MEASURED).
