@@ -130,7 +130,6 @@ RECIPE_KEYS = (
     "warmup",
     "clip",
     "detach_z0",
-    "grad_checkpoint",
     "suite_sha256",    # exact suite manifest digest
     "config_sha256",   # canonical digest over the normalized config above
 )
@@ -636,7 +635,7 @@ def recipe_from_config(cfg: dict, suite_sha256: str) -> dict:
     _SEMANTIC_CFG_KEYS = ("mode", "interval", "k", "max_k", "lora_r",
                           "lora_alpha", "lr", "steps", "seed", "optimizer",
                           "weight_decay", "lr_schedule", "warmup", "clip",
-                          "detach_z0", "grad_checkpoint")
+                          "detach_z0")
     missing = [k for k in _SEMANTIC_CFG_KEYS if k not in cfg]
     if missing:
         raise AdapterBundleSchemaError(
@@ -655,11 +654,20 @@ def recipe_from_config(cfg: dict, suite_sha256: str) -> dict:
         raise AdapterBundleSchemaError(
             f"config.interval must satisfy 0<=lo<hi; got {[lo, hi]}")
     detach_z0 = cfg["detach_z0"]
-    grad_checkpoint = cfg["grad_checkpoint"]
-    for name, v in (("detach_z0", detach_z0), ("grad_checkpoint",
-                                               grad_checkpoint)):
-        if not isinstance(v, bool):
-            raise AdapterBundleSchemaError(f"config.{name} must be a bool")
+    if not isinstance(detach_z0, bool):
+        raise AdapterBundleSchemaError("config.detach_z0 must be a bool")
+    # Migration input only: old callers may still send the inert flag as
+    # false.  It is never persisted or hashed.  True claimed a mechanism the
+    # runtime did not implement and therefore fails closed.
+    if "grad_checkpoint" in cfg:
+        legacy_flag = cfg["grad_checkpoint"]
+        if not isinstance(legacy_flag, bool):
+            raise AdapterBundleSchemaError(
+                "config.grad_checkpoint migration value must be a bool")
+        if legacy_flag:
+            raise AdapterBundleSchemaError(
+                "config.grad_checkpoint=true is unsupported; no executed "
+                "gradient-checkpointing mechanism exists")
     schedule = cfg["lr_schedule"]
     if schedule not in _LR_SCHEDULES:
         raise AdapterBundleSchemaError(
@@ -690,7 +698,6 @@ def recipe_from_config(cfg: dict, suite_sha256: str) -> dict:
         "warmup": _recipe_int(cfg["warmup"], "warmup", minimum=0),
         "clip": _recipe_float(cfg["clip"], "clip", minimum_exclusive=0.0),
         "detach_z0": detach_z0,
-        "grad_checkpoint": grad_checkpoint,
     }
     normalized["config_sha256"] = canonical_config_digest(normalized)
     normalized["suite_sha256"] = suite_sha256
@@ -733,9 +740,8 @@ def validate_recipe(recipe) -> dict:
         raise AdapterBundleSchemaError(
             f"recipe.lr_schedule must be one of {_LR_SCHEDULES}; got "
             f"{schedule!r}")
-    for name in ("detach_z0", "grad_checkpoint"):
-        if not isinstance(recipe[name], bool):
-            raise AdapterBundleSchemaError(f"recipe.{name} must be a bool")
+    if not isinstance(recipe["detach_z0"], bool):
+        raise AdapterBundleSchemaError("recipe.detach_z0 must be a bool")
     seed = recipe["seed"]
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise AdapterBundleSchemaError("recipe.seed must be an int")
@@ -760,9 +766,8 @@ def validate_recipe(recipe) -> dict:
         "lr_schedule": schedule,
         "warmup": _recipe_int(recipe["warmup"], "warmup", minimum=0),
         "clip": _recipe_float(recipe["clip"], "clip",
-                              minimum_exclusive=0.0),
+                               minimum_exclusive=0.0),
         "detach_z0": recipe["detach_z0"],
-        "grad_checkpoint": recipe["grad_checkpoint"],
         "suite_sha256": suite.lower(),
     }
     digest = recipe["config_sha256"]
@@ -788,6 +793,25 @@ def _tensor_entry(t) -> dict:
     return {"shape": list(t.shape),
             "dtype": str(t.dtype),
             "sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def adapter_state_sha256(state) -> str:
+    """Deterministically bind an in-memory adapter state to its bytes.
+
+    Validation checkpoints are scored before an on-disk bundle exists.  This
+    digest gives each such checkpoint a real content identity; the recipe and
+    model identities remain separate fields in ``latent_eval.v3``.
+    """
+    clean = validated_state_clone(state)
+    h = hashlib.sha256()
+    for name in sorted(clean):
+        entry = _tensor_entry(clean[name])
+        h.update(name.encode("utf-8"))
+        h.update(b"\0")
+        h.update(json.dumps(entry, sort_keys=True,
+                            separators=(",", ":")).encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
 
 
 def compute_content_digest(bundle_core: dict) -> str:

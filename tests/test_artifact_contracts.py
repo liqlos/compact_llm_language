@@ -336,7 +336,6 @@ _BASE_RECIPE_CFG = fake_cfg()
     ("warmup", {"warmup": 10}),
     ("clip", {"clip": 1.0}),
     ("detach_z0", {"detach_z0": True}),
-    ("grad_checkpoint", {"grad_checkpoint": False}),
     ("interval", {"interval": [6, 18]}),
     ("mode", {"mode": "D-full"}),
 ])
@@ -380,11 +379,21 @@ def test_recipe_rejects_missing_extra_and_invalid_fields():
 
 
 def test_missing_semantic_config_fields_are_never_defaulted():
-    for drop in ("lr", "seed", "warmup", "clip", "optimizer",
-                 "grad_checkpoint"):
+    for drop in ("lr", "seed", "warmup", "clip", "optimizer"):
         broken = {k: v for k, v in _BASE_RECIPE_CFG.items() if k != drop}
         with pytest.raises(AdapterBundleSchemaError):
             ckpt.recipe_from_config(broken, SUITE_SHA)
+
+
+def test_removed_grad_checkpoint_is_false_only_migration_input():
+    canonical = ckpt.recipe_from_config(_BASE_RECIPE_CFG, SUITE_SHA)
+    migrated = ckpt.recipe_from_config(
+        {**_BASE_RECIPE_CFG, "grad_checkpoint": False}, SUITE_SHA)
+    assert migrated == canonical
+    assert "grad_checkpoint" not in canonical
+    with pytest.raises(AdapterBundleSchemaError, match="unsupported"):
+        ckpt.recipe_from_config(
+            {**_BASE_RECIPE_CFG, "grad_checkpoint": True}, SUITE_SHA)
 
 
 @pytest.mark.parametrize("field,over", [
@@ -595,6 +604,50 @@ def test_validate_eval_requires_full_identity_block(tmp_path):
         assert drop in str(ei.value)
 
 
+def test_validate_eval_accepts_only_self_consistent_latent_eval_v3(tmp_path):
+    from latent_lab.bench.eval_v3 import aggregate_records, build_eval_record
+
+    payload = build_eval_payload()
+    ident = payload["identity"]
+    record = build_eval_record(
+        run_id="run-v3", recipe_hash="a" * 64,
+        model_id=ident["model_id"], model_revision=ident["revision"],
+        adapter_id=payload["adapter"], checkpoint_id="best_params.pt",
+        checkpoint_content_hash=ident["checkpoint_content_digest"],
+        suite_id="behavioral-v3", suite_version=3,
+        suite_hash=ident["suite_sha256"], example_id="e-v3",
+        split=ident["split"], family="fsm", prompt="prompt",
+        candidates=("A", "B"), candidate_permutation_seed=1,
+        candidate_permutation=(1, 0), gold_answer="B",
+        per_token_logprobs=((-2.0,), (-0.1, -0.1)), k=ident["k_steps"],
+        recurrence_config={"interval": [12, 18],
+                           "gradient_semantics": "truncated_cache"},
+        compute={
+            "prefill_layers": 12,
+            "recurrence_interval_applications": 24,
+            "k_loops": 4,
+            "candidate_tail_layers": 12,
+            "lm_head_calls": 2,
+            "tokenizer_calls": 3,
+            "decode_calls": 0,
+            "wall_seconds": 0.1,
+            "peak_memory_bytes": None,
+            "successful_task": True,
+        },
+    )
+    payload["results"]["clean"].update(
+        n=1, metrics=aggregate_records([record]), records=[record])
+    payload["results"]["clean"].pop("accuracy")
+    ep = tmp_path / "eval-v3.json"
+    ckpt.atomic_write_json(ep, payload)
+    assert artifacts.validate_eval(ep) == payload
+
+    payload["identity"]["checkpoint_content_digest"] = "0" * 64
+    ckpt.atomic_write_json(ep, payload)
+    with pytest.raises(ValueError, match="content_sha256"):
+        artifacts.validate_eval(ep)
+
+
 def test_validate_eval_binds_expected_split_ablation_k_seed(tmp_path):
     ep = tmp_path / "ev.json"
     ep.write_text(json.dumps(build_eval_payload()))
@@ -613,7 +666,11 @@ def test_cmd_eval_identity_block_covers_the_required_key_set():
     from latent_lab.bench.artifacts import _EVAL_IDENTITY_KEYS
 
     src = Path(latent_run.__file__).read_text()
-    region = src[src.index("def cmd_eval"):]
+    payload_start = src.index("def build_v3_eval_payload")
+    payload_end = src.index("def _dependency_versions")
+    region = src[payload_start:payload_end]
+    cmd_region = src[src.index("def cmd_eval"):]
+    assert "build_v3_eval_payload(" in cmd_region
     start = region.index('"identity": {')
     depth = 0
     for i in range(start, len(region)):
@@ -935,7 +992,6 @@ def test_resume_rejects_old_partial_contract_structurally(tmp_path):
     ("warmup", dict(warmup=10)),
     ("clip", dict(clip=1.0)),
     ("detach_z0", dict(detach_z0=True)),
-    ("grad_checkpoint", dict(grad_checkpoint=False)),
     ("k", dict(k=8)),
     ("max_k", dict(max_k=8)),
     ("steps", dict(steps=400)),
@@ -1019,17 +1075,29 @@ def test_train_recipe_digest_matches_trainer_recipe_binding():
         mode="E-localized", interval=[12, 18], k=4, max_k=16, lora_r=8,
         lora_alpha=16.0, lr=1e-4, steps=800, seed=0, optimizer="adamw",
         weight_decay=0.01, lr_schedule="constant", warmup=50, clip=0.5,
-        detach_z0=False, grad_checkpoint=True, suite_sha256=SUITE_SHA)
+        detach_z0=False, suite_sha256=SUITE_SHA)
     assert base == run_contract()["config_sha256"]
     drift = latent_run.train_recipe_digest(
         mode="E-localized", interval=[12, 18], k=4, max_k=16, lora_r=8,
         lora_alpha=16.0, lr=3e-4, steps=800, seed=0, optimizer="adamw",
         weight_decay=0.01, lr_schedule="constant", warmup=50, clip=0.5,
-        detach_z0=False, grad_checkpoint=True, suite_sha256=SUITE_SHA)
+        detach_z0=False, suite_sha256=SUITE_SHA)
     assert drift != base
     assert latent_run.mode_from_spec("full", 4) == "D-full"
     assert latent_run.mode_from_spec("mid", 0) == "F-control"
     assert latent_run.mode_from_spec("mid", 4) == "E-localized"
+
+
+def test_in_memory_adapter_state_digest_binds_exact_tensor_bytes():
+    from latent_lab.train.checkpointing import adapter_state_sha256
+
+    left = {"b": torch.tensor([2.0]), "a": torch.tensor([1.0])}
+    same_different_order = {"a": torch.tensor([1.0]),
+                            "b": torch.tensor([2.0])}
+    changed = {"a": torch.tensor([1.0]), "b": torch.tensor([2.5])}
+    assert adapter_state_sha256(left) == \
+        adapter_state_sha256(same_different_order)
+    assert adapter_state_sha256(left) != adapter_state_sha256(changed)
 
 
 # ---------------------------------------------------------------------------

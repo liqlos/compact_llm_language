@@ -207,7 +207,12 @@ def test_preregistered_seed_and_no_result_based_selection():
 def test_paired_k_arms_use_same_adapter_and_bounded_evals():
     src = _src()
     ev_calls = re.findall(r'^ev "\$LABEL" (\S+) "\$K_\w+"$', src, re.M)
-    assert ev_calls == ["test_id", "test_id", "test_ood", "test_ood"], \
+    assert ev_calls == [
+        "test_id", "test_id",
+        "test_ood_length", "test_ood_length",
+        "test_ood_semantic", "test_ood_semantic",
+        "final_test", "final_test",
+    ], \
         f"unexpected eval plan: {ev_calls}"
     # both arms come from the SAME single adapter ($LABEL / $RUN_DIR),
     # never from separately trained F adapters; only one eval invocation
@@ -262,7 +267,6 @@ def _render_preregistration_python(**overrides) -> str:
         "CLIP": _const(src, "CLIP"),
         "SUITE_SHA": "ab" * 32,    # injected suite identity; no network
         "PY_DETACH_Z0": _driver_py_bool(_const(src, "DETACH_Z0")),
-        "PY_GRAD_CHECKPOINT": _driver_py_bool(_const(src, "GRAD_CHECKPOINT")),
     }
     subs.update(overrides)
     code = _heredoc_body(src)
@@ -305,7 +309,7 @@ def test_recipe_preregistration_heredoc_executes_to_real_64hex_digest():
         weight_decay=float(_const(s, "WEIGHT_DECAY")),
         lr_schedule=_const(s, "LR_SCHEDULE"),
         warmup=int(_const(s, "WARMUP")), clip=float(_const(s, "CLIP")),
-        detach_z0=False, grad_checkpoint=True,
+        detach_z0=False,
         suite_sha256="ab" * 32)
     assert digest == expected, (
         "driver-preregistered digest drifted from the canonical "
@@ -316,8 +320,7 @@ def test_recipe_heredoc_with_raw_shell_booleans_reproduces_nameerror():
     """Negative control proving the harness above executes REAL code:
     substituting the pre-fix raw lowercase shell values must blow up
     with NameError — exactly the paid-run abort this fix eliminates."""
-    code = _render_preregistration_python(PY_DETACH_Z0="false",
-                                          PY_GRAD_CHECKPOINT="true")
+    code = _render_preregistration_python(PY_DETACH_Z0="false")
     r = subprocess.run([sys.executable, "-c", code], cwd=str(REPO),
                        capture_output=True, text=True)
     assert r.returncode != 0
@@ -327,25 +330,26 @@ def test_recipe_heredoc_with_raw_shell_booleans_reproduces_nameerror():
 def test_driver_binds_digest_and_trainer_flags_to_one_boolean_source():
     """Static drift guards: raw shell booleans can never re-enter a
     Python heredoc; the digest input and the --detach-z0 flag binding
-    both derive from ONE validated constant; an impossible checkpointing
-    preregistration fails closed instead of desyncing the digest."""
+    both derive from ONE validated constant.  The removed, unsupported
+    checkpointing flag must not reappear in a runnable recipe."""
     src = _src()
     body = _heredoc_body(src)
-    assert "${PY_DETACH_Z0}" in body and "${PY_GRAD_CHECKPOINT}" in body
-    assert "${DETACH_Z0}" not in body and "${GRAD_CHECKPOINT}" not in body, \
+    assert "${PY_DETACH_Z0}" in body
+    assert "${DETACH_Z0}" not in body, \
         "raw shell boolean interpolated straight into Python again"
     assert 'PY_DETACH_Z0=$(py_bool "$DETACH_Z0")' in src
-    assert 'PY_GRAD_CHECKPOINT=$(py_bool "$GRAD_CHECKPOINT")' in src
     # trainer flag binding comes from the SAME validated source
     assert '[ "$DETACH_Z0" = "true" ] && TRAIN_ARGS+=(--detach-z0)' in src
-    # the trainer pins grad-checkpointing ON; the driver refuses any
-    # preregistration the trainer could not honor (digest/behavior sync)
-    assert re.search(
-        r'\[ "\$GRAD_CHECKPOINT" = "true" \] \\\n'
-        r'\s*\|\| \{ echo "FATAL: GRAD_CHECKPOINT', src), \
-        "grad-checkpoint digest/trainer sync gate missing"
-    gate_start = src.index("[ \"$GRAD_CHECKPOINT\" = \"true\" ]")
-    assert "exit 5" in src[gate_start:gate_start + 400]
+    assert "GRAD_CHECKPOINT" not in src
+    assert "grad_checkpoint" not in src
+
+
+def test_driver_binds_behavioral_v3_suite_and_canonical_metric():
+    src = _src()
+    assert "latent_lab.bench.suite_v3" in src
+    assert "manifest()['suite_hash']" in src
+    assert "r['metrics']['micro_accuracy']" in src
+    assert "--val-examples 28" not in src
 
 
 # ---------------------------------------------------------------------------

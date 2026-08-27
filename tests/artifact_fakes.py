@@ -31,7 +31,7 @@ BASE_CFG = {
     "lr": 1e-4, "steps": 800, "seed": 0,
     "optimizer": "adamw", "weight_decay": 0.01,
     "lr_schedule": "constant", "warmup": 50, "clip": 0.5,
-    "detach_z0": False, "grad_checkpoint": True,
+    "detach_z0": False,
     "model": MODEL, "revision": REV_OK,
     "label": "E4_k4_s0", "device": "cpu",
     "train_examples": 10,

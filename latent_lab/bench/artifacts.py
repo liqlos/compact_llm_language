@@ -117,8 +117,8 @@ _EXPECT_FLAGS = {
 # of these at once. The canonical config/recipe digest (config_sha256)
 # canonically covers ALL behavior-changing training fields (mode,
 # interval, k, max_k, LoRA rank/alpha, LR, steps, seed, optimizer,
-# weight decay, schedule, warmup, grad clip, detach policy, gradient
-# checkpointing, suite) — so a partial hand-written allowlist that could
+# weight decay, schedule, warmup, grad clip, detach policy, and suite) — so a
+# partial hand-written allowlist that could
 # silently omit a semantic field is structurally impossible here.
 _RUN_EXPECT_REQUIRED = frozenset((
     "model_id", "revision", "suite_sha256", "seed", "label", "k",
@@ -308,10 +308,64 @@ def _bad_number(v) -> bool:
         or v != v or v in (float("inf"), float("-inf"))
 
 
-def _validate_eval_result(where: str, name: str, res) -> None:
+def _validate_eval_result(where: str, name: str, res, identity=None) -> None:
     """One eval result block must carry recomputable lossless evidence."""
     if not isinstance(res, dict):
         raise ValueError(f"{where}: results[{name!r}] is not an object")
+    records = res.get("records")
+    if not isinstance(records, list) or not records:
+        raise ValueError(
+            f"{where}: results[{name!r}] has no complete raw records")
+    from latent_lab.bench.eval_v3 import (
+        SCHEMA_VERSION, EvalV3Error, aggregate_records)
+    v3_flags = [isinstance(record, dict)
+                and record.get("schema_version") == SCHEMA_VERSION
+                for record in records]
+    if any(v3_flags) and not all(v3_flags):
+        raise ValueError(
+            f"{where}: results[{name!r}] mixes v3 and legacy records")
+    if all(v3_flags):
+        n = res.get("n")
+        if isinstance(n, bool) or not isinstance(n, int) or n != len(records):
+            raise ValueError(
+                f"{where}: results[{name!r}].n must equal v3 record count")
+        try:
+            recomputed = aggregate_records(records)
+        except EvalV3Error as exc:
+            raise ValueError(
+                f"{where}: results[{name!r}] invalid latent_eval.v3: "
+                f"{exc}") from exc
+        if res.get("metrics") != recomputed:
+            raise ValueError(
+                f"{where}: results[{name!r}].metrics disagree with "
+                "independent latent_eval.v3 rescore")
+        if identity is not None:
+            for index, record in enumerate(records):
+                expected_model = {
+                    "model_id": identity["model_id"],
+                    "revision": identity["revision"],
+                }
+                checks = (
+                    ("model_identity", record["model_identity"],
+                     expected_model),
+                    ("suite_identity.sha256",
+                     record["suite_identity"]["sha256"],
+                     identity["suite_sha256"]),
+                    ("checkpoint_identity.content_sha256",
+                     record["checkpoint_identity"]["content_sha256"],
+                     identity["checkpoint_content_digest"]),
+                    ("split", record["split"], identity["split"]),
+                    ("k", record["k"], identity["k_steps"]),
+                )
+                for field, actual, expected in checks:
+                    if actual != expected:
+                        raise ValueError(
+                            f"{where}: results[{name!r}] record[{index}] "
+                            f"{field} {actual!r} != identity {expected!r}")
+        return
+
+    # Historical compatibility is validation-only; this branch can never
+    # create a latent_eval.v3/current-evidence classification.
     acc = res.get("accuracy")
     if _bad_number(acc) or not 0.0 <= float(acc) <= 1.0:
         raise ValueError(
@@ -320,7 +374,6 @@ def _validate_eval_result(where: str, name: str, res) -> None:
     n = res.get("n")
     if isinstance(n, bool) or not isinstance(n, int) or n < 1:
         raise ValueError(f"{where}: results[{name!r}].n missing/invalid")
-    records = res.get("records")
     if not isinstance(records, list) or len(records) != n:
         raise ValueError(
             f"{where}: results[{name!r}] has no complete raw records "
@@ -551,7 +604,7 @@ def validate_eval(eval_path, *, expected: dict | None = None) -> dict:
     if not isinstance(results, dict) or not results:
         raise ValueError(f"{where}: no results block")
     for name, res in results.items():
-        _validate_eval_result(where, name, res)
+        _validate_eval_result(where, name, res, ident)
     if ablation not in results:
         raise ValueError(
             f"{where}: identity.ablation {ablation!r} has no matching "

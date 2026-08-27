@@ -48,6 +48,7 @@ from latent_lab.bench.corrected_scoring import (
     FLAG_ORDER_NOT_PERMUTATION,
     INVALID_RECORDS,
     MISSING_RAW_PREDICTION,
+    RESCORED_CORRECTED,
     corrected_score,
     normalize_answer,
     rescore_records,
@@ -286,6 +287,106 @@ class TestRescoreEligibility:
         assert out.status == MISSING_RAW_PREDICTION
 
 
+def _gate_v3_record(ex, *, split="test_id", hit=True,
+                    checkpoint_content_hash="b" * 64):
+    from latent_lab.bench.eval_v3 import build_eval_record, canonical_sha256
+
+    scores = [([-0.01] if (candidate == ex.answer) == hit else [-2.0])
+              for candidate in ex.candidates]
+    permutation = getattr(ex, "candidate_permutation", None) \
+        or tuple(range(len(ex.candidates)))
+    permutation_seed = getattr(ex, "candidate_permutation_seed", 0)
+    return build_eval_record(
+        run_id="run-v3", recipe_hash=canonical_sha256(_canonical_recipe()),
+        model_id="Qwen/Qwen3.5-2B", model_revision=PINNED_REV_2B,
+        adapter_id="runs/E_k4_s0", checkpoint_id="best_params.pt",
+        checkpoint_content_hash=checkpoint_content_hash,
+        suite_id="behavioral-v3", suite_version=3,
+        suite_hash=g.current_suite_sha256(), example_id=ex.ex_id,
+        split=split, family=ex.family, prompt=ex.prompt,
+        candidates=ex.candidates,
+        candidate_permutation_seed=permutation_seed,
+        candidate_permutation=permutation, gold_answer=ex.answer,
+        per_token_logprobs=scores, k=4,
+        recurrence_config={"interval": [12, 18], "trained_k": 4},
+        compute={
+            "prefill_layers": 12,
+            "recurrence_interval_applications": 24,
+            "k_loops": 4,
+            "candidate_tail_layers": len(ex.candidates) * 6,
+            "lm_head_calls": len(ex.candidates),
+            "tokenizer_calls": len(ex.candidates) + 1,
+            "decode_calls": 0,
+            "wall_seconds": 0.1,
+            "peak_memory_bytes": None,
+            "successful_task": True,
+        },
+    )
+
+
+def _gate_eval_payload(record, *, adapter="runs/E_k4_s0", records=None):
+    from latent_lab.bench.eval_v3 import aggregate_records
+    from latent_lab.bench.latent_run import build_v3_eval_payload
+
+    records = list(records or [record])
+    metrics = aggregate_records(records)
+    split = record["split"]
+    k_steps = record["k"]
+    result = {
+        "schema_version": metrics["schema_version"],
+        "tag": f"E-localized|{split}|clean|K={k_steps}",
+        "ablate": {}, "k_steps": k_steps, "n": len(records),
+        "metrics": metrics, "seconds": 0.1, "records": records,
+    }
+    cfg = {
+        "mode": "E-localized",
+        "model": record["model_identity"]["model_id"],
+        "revision": record["model_identity"]["revision"],
+        "suite_sha256": record["suite_identity"]["sha256"],
+        "interval": [12, 18], "max_k": 16, "k": k_steps, "seed": 0,
+    }
+    return build_v3_eval_payload(
+        adapter=adapter, split=split, config=cfg,
+        model_id=record["model_identity"]["model_id"],
+        revision=record["model_identity"]["revision"],
+        suite_hash=record["suite_identity"]["sha256"],
+        tokenizer_class="GateTestTokenizer", interval=[12, 18],
+        k_steps=k_steps, ablation=None, seed=0,
+        checkpoint_content_digest=record["checkpoint_identity"][
+            "content_sha256"], result=result, device="cpu")
+
+
+def test_gate_recognizes_only_valid_independently_rescored_v3(tmp_path):
+    ex = _suite_ex()
+    record = _gate_v3_record(ex)
+    path = tmp_path / "eval.json"
+    payload = _gate_eval_payload(record)
+    path.write_text(json.dumps(payload))
+    verdict = g.evaluate_eval_file(path, {ex.ex_id: ex}, root_label="2b")
+    assert verdict["status"] == RESCORED_CORRECTED
+    assert verdict["record_schema_version"] == "latent_eval.v3"
+    assert verdict["evidence_class"] == "VALID_CURRENT"
+    assert verdict["corrected_accuracy"] == 1.0
+    assert verdict["record_run_id"] == "run-v3"
+    assert verdict["record_adapter_id"] == "runs/E_k4_s0"
+    assert verdict["checkpoint_content_digest"] == "b" * 64
+
+    payload["results"]["clean"]["records"][0]["correctness"] = False
+    path.write_text(json.dumps(payload))
+    rejected = g.evaluate_eval_file(path, {ex.ex_id: ex}, root_label="2b")
+    assert rejected["status"] == INVALID_RECORDS
+
+
+def test_gate_classifies_derived_only_legacy_as_irrecoverable(tmp_path):
+    ex = _suite_ex()
+    path = tmp_path / "legacy.json"
+    path.write_text(json.dumps(_eval_for("runs/E_k4_s0", "test_id", [{
+        "ex_id": ex.ex_id, "correct": 1.0, "rank_of_gold": 0,
+    }])))
+    verdict = g.evaluate_eval_file(path, {ex.ex_id: ex}, root_label="2b")
+    assert verdict["status"] == g.IRRECOVERABLE_LEGACY_SCORER
+
+
 # ---------------------------------------------------------------------------
 # synthetic corpus + gate end-to-end
 # ---------------------------------------------------------------------------
@@ -302,7 +403,7 @@ def _semantic_config() -> dict:
         "lora_r": 8, "lora_alpha": 16.0, "lr": 0.0001, "steps": 800,
         "seed": 0, "max_k": 16, "optimizer": "adamw",
         "weight_decay": 0.01, "lr_schedule": "constant", "warmup": 20,
-        "clip": 1.0, "detach_z0": False, "grad_checkpoint": True,
+        "clip": 1.0, "detach_z0": False,
     }
 
 
@@ -345,15 +446,37 @@ def _valid_report(**over) -> dict:
         "wall_seconds": 10.0,
         "peak_rss_mib": 1.0,
         "platform": "test",
+        "run_id": "run-v3",
+        "adapter_id": "runs/E_k4_s0",
+        "selection_provenance":
+            "latent_eval.v3_recomputed_from_raw_validation_records",
     }
     rep.update(over)
     rep["recipe"] = _canonical_recipe(rep["config"])
     return rep
 
 
-def _suite_ex(prefix="ti-"):
+def test_train_report_selection_accepts_only_latent_eval_v3_history():
+    from latent_lab.bench.latent_run import canonical_v3_history_entry
+
+    record = _gate_v3_record(_suite_ex("validation-"), split="validation")
+    report = _valid_report(best_val_acc=1.0, best_step=100)
+    report["val_history"] = [
+        canonical_v3_history_entry(200, [record]),
+        canonical_v3_history_entry(100, [record]),
+    ]
+    check = g.validate_train_report(report)
+    assert "val_history:legacy_scorer_noncanonical" not in check["problems"]
+    assert check["history_schema"] == "latent_eval.summary.v3"
+    assert check["selection_check"]["consistent_with_reported"] is True
+    assert check["selection_check"]["provenance"] == "latent_eval.v3"
+
+
+def _suite_ex(prefix="test_id-"):
     from latent_lab.bench.no_spend_gate import suite_examples_by_id
 
+    prefix = {"ti-": "test_id-", "to-": "test_ood_length-"}.get(
+        prefix, prefix)
     for ex_id, ex in suite_examples_by_id().items():
         if ex_id.startswith(prefix):
             return ex
@@ -395,6 +518,21 @@ def _full_split_records(split: str) -> list[dict]:
     by_id = g.suite_examples_by_id()
     return [_raw_record(by_id[eid])
             for eid in sorted(g.suite_examples_by_split()[split])]
+
+
+def _v3_eval_for(adapter, split, records) -> dict:
+    assert records and records[0]["split"] == split
+    return _gate_eval_payload(records[0], adapter=adapter, records=records)
+
+
+def _full_split_v3_records(split: str, checkpoint_digest: str) -> list[dict]:
+    by_id = g.suite_examples_by_id()
+    return [
+        _gate_v3_record(
+            by_id[eid], split=split,
+            checkpoint_content_hash=checkpoint_digest)
+        for eid in sorted(g.suite_examples_by_split()[split])
+    ]
 
 
 def _clean_retained_evidence(corpus):
@@ -514,7 +652,7 @@ class TestGateEndToEnd:
         assert v["verdict"] == "NOT_READY"
         codes = {b["code"] for b in v["blockers"]}
         assert "CKPT_LEGACY_UNBOUND_IDENTITY" in codes
-        assert "NON_RESCORABLE_MISSING_RAW_PREDICTION" in codes
+        assert "IRRECOVERABLE_LEGACY_SCORER" in codes
         assert "REPORT_SCHEMA_MISSING_FIELDS" in codes      # unpinned rev
         assert "REPORT_TRAINABLE_PRECISION_MISSING" in codes
         assert "TRAINABLES_NOT_FP32_IN_RETAINED_CHECKPOINTS" in codes
@@ -918,14 +1056,14 @@ class TestGateEndToEnd:
         (r2b / "results" / "ev_E_k4_s0_test_id_clean.json").write_text(
             json.dumps(_eval_for("runs/E_k4_s0", "test_id",
                                  [_raw_record(ex_ti)])))
-        # NO test_ood eval at all.
+        # NO length-OOD eval at all.
         res = g.run_gate(r2b, r4b, repo_root=None, skip_proof_tests=True,
                          proof_result=PROOF_OK)
         codes = {b["code"] for b in res.gate_verdict["blockers"]}
         assert "EVAL_SPLIT_COVERAGE_MISSING" in codes
         detail = [b["detail"] for b in res.gate_verdict["blockers"]
                   if b["code"] == "EVAL_SPLIT_COVERAGE_MISSING"][0]
-        assert "test_ood" in detail
+        assert "test_ood_length" in detail
         assert res.verdict == "NOT_READY"
 
     def test_single_record_cannot_cover_full_preregistered_split(self, corpus):
@@ -937,9 +1075,9 @@ class TestGateEndToEnd:
         (r2b / "results" / "ev_E_k4_s0_test_id_clean.json").write_text(
             json.dumps(_eval_for("runs/E_k4_s0", "test_id",
                                  [_raw_record(ex_ti)])))
-        (r2b / "results" / "ev_E_k4_s0_test_ood_clean.json").write_text(
-            json.dumps(_eval_for("runs/E_k4_s0", "test_ood",
-                                 _full_split_records("test_ood"))))
+        (r2b / "results" / "ev_E_k4_s0_test_ood_length_clean.json").write_text(
+            json.dumps(_eval_for("runs/E_k4_s0", "test_ood_length",
+                                 _full_split_records("test_ood_length"))))
         res = g.run_gate(r2b, r4b, repo_root=None, skip_proof_tests=True,
                          proof_result=PROOF_OK)
         codes = {b["code"] for b in res.gate_verdict["blockers"]}
@@ -952,15 +1090,15 @@ class TestGateEndToEnd:
     def test_test_id_records_relabelled_test_ood_violate_membership(
             self, corpus):
         """Regression (audit 91e842f defect 2): copying test_id examples
-        into a file declared test_ood must not satisfy OOD coverage; every
+        into a file declared test_ood_length must not satisfy OOD coverage; every
         record's ex_id must belong to the preregistered membership of the
         declared split."""
         r2b, r4b = _clean_retained_evidence(corpus)
         ti_records = _full_split_records("test_id")
         (r2b / "results" / "ev_E_k4_s0_test_id_clean.json").write_text(
             json.dumps(_eval_for("runs/E_k4_s0", "test_id", ti_records)))
-        (r2b / "results" / "ev_E_k4_s0_test_ood_clean.json").write_text(
-            json.dumps(_eval_for("runs/E_k4_s0", "test_ood",
+        (r2b / "results" / "ev_E_k4_s0_test_ood_length_clean.json").write_text(
+            json.dumps(_eval_for("runs/E_k4_s0", "test_ood_length",
                                  list(ti_records))))
         res = g.run_gate(r2b, r4b, repo_root=None, skip_proof_tests=True,
                          proof_result=PROOF_OK)
@@ -968,10 +1106,10 @@ class TestGateEndToEnd:
         assert "EVAL_SPLIT_MEMBERSHIP_VIOLATION" in codes
         detail = [b["detail"] for b in res.gate_verdict["blockers"]
                   if b["code"] == "EVAL_SPLIT_MEMBERSHIP_VIOLATION"][0]
-        assert "test_ood" in detail
+        assert "test_ood_length" in detail
         cov = [b["detail"] for b in res.gate_verdict["blockers"]
                if b["code"] == "EVAL_SPLIT_COVERAGE_MISSING"][0]
-        assert "test_ood" in cov
+        assert "test_ood_length" in cov
         assert res.verdict == "NOT_READY"
 
     def test_live_4b_retained_checkpoint_requires_full_prerequisites(
@@ -1157,7 +1295,7 @@ class TestGateEndToEnd:
         assert "best_step:type" in joined
         assert "val_history:bad_entries[0]" in joined
 
-    def test_rescorable_records_get_RESCORED_CORRECTED(self, corpus):
+    def test_legacy_raw_records_remain_historical_unbound(self, corpus):
         ex = _suite_ex()
         ev = _derived_only_eval()
         ev["results"]["clean"]["records"] = [
@@ -1171,8 +1309,8 @@ class TestGateEndToEnd:
         res = self.run_gate(corpus)
         entry = [e for e in res.artifact_verdicts["evaluations"]
                  if e["file"] == "ev_raw_test_id_clean.json"][0]
-        assert entry["status"] == "RESCORED_CORRECTED"
-        assert entry["corrected_accuracy"] == pytest.approx(0.5)
+        assert entry["status"] == g.HISTORICAL_UNBOUND_LEGACY_SCORER
+        assert entry["legacy_rescore_fraction"] == pytest.approx(0.5)
 
     def test_READY_positive_control_exit0_path(self, corpus):
         """Every prerequisite satisfiable offline IS provable — proves the
@@ -1188,28 +1326,37 @@ class TestGateEndToEnd:
         r2b, r4b = corpus
         shutil.rmtree(r4b / "runs")           # live 4B tree holds nothing
         run = r2b / "runs" / "E_k4_s0"
-        rep = _valid_report()
-        rep["config"]["scorer"] = "corrected-gold-aware-v1"
+        from latent_lab.bench.latent_run import canonical_v3_history_entry
+
+        val_ex = _suite_ex("validation-")
+        losing = _gate_v3_record(val_ex, split="validation", hit=False,
+                                 checkpoint_content_hash="1" * 64)
+        winning = _gate_v3_record(val_ex, split="validation", hit=True,
+                                  checkpoint_content_hash="2" * 64)
+        rep = _valid_report(best_val_acc=1.0, best_step=200,
+                            val_history=[
+                                canonical_v3_history_entry(100, [losing]),
+                                canonical_v3_history_entry(200, [winning]),
+                            ])
         rep["trainable_precision"] = "fp32"
         (run / "train_report.json").write_text(json.dumps(rep))
         os.remove(run / "best_params.pt")
-        save_adapter_bundle(run / "best_params.pt",
-                            {"lora.A": torch.eye(2, dtype=torch.float32)},
-                            model_id="Qwen/Qwen3.5-2B",
-                            revision=PINNED_REV_2B,
-                            recipe=rep["recipe"],
-                            metrics={"best_score": 0.5, "best_step": 200})
+        bundle = save_adapter_bundle(
+            run / "best_params.pt",
+            {"lora.A": torch.eye(2, dtype=torch.float32)},
+            model_id="Qwen/Qwen3.5-2B", revision=PINNED_REV_2B,
+            recipe=rep["recipe"],
+            metrics={"best_score": 1.0, "best_step": 200})
         # remove legacy_run's schema-violating report tree entirely
         shutil.rmtree(r2b / "runs" / "legacy_run")
 
-        # Full preregistered coverage: EVERY test_id and test_ood example,
-        # in its own split-labelled file (honest READY control).
-        (r2b / "results" / "ev_E_k4_s0_test_id_clean.json").write_text(
-            json.dumps(_eval_for("runs/E_k4_s0", "test_id",
-                                 _full_split_records("test_id"))))
-        (r2b / "results" / "ev_E_k4_s0_test_ood_clean.json").write_text(
-            json.dumps(_eval_for("runs/E_k4_s0", "test_ood",
-                                 _full_split_records("test_ood"))))
+        # Full preregistered behavioral-v3 coverage, bound to the exact
+        # checkpoint content digest (honest READY control).
+        for split in g.REQUIRED_SPLITS:
+            records = _full_split_v3_records(split, bundle["content_digest"])
+            (r2b / "results" /
+             f"ev_E_k4_s0_{split}_clean.json").write_text(
+                json.dumps(_v3_eval_for("runs/E_k4_s0", split, records)))
 
         res = g.run_gate(r2b, r4b, repo_root=None, skip_proof_tests=True,
                          proof_result=PROOF_OK)
@@ -1220,7 +1367,7 @@ class TestGateEndToEnd:
         assert v["blockers"] == []
         assert v["inputs"]["source_fingerprints"]["unchanged_during_gate"]
         fp = v["inputs"]["source_fingerprints"]["results_2b"]["files"]
-        assert fp == 4
+        assert fp == 2 + len(g.REQUIRED_SPLITS)
         assert g._exit_for("READY") == 0
 
     def test_canonical_outputs_byte_stable_and_timestamp_free(

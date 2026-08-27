@@ -29,10 +29,10 @@ FAIL-CLOSED contract (every known fail-open is a blocker, never a skip):
   unreadable artifacts are explicit blockers.
 * Every retained loadable checkpoint (2B AND live 4B) needs valid
   rescored raw-score eval evidence bound to it (adapter path + model +
-  revision + current suite hash) covering BOTH required splits (test_id
-  AND test_ood) over the COMPLETE preregistered example set of each
-  declared split; a lone labelled record, or a test_id record relabelled
-  into a test_ood file, proves nothing globally.
+  revision + current suite hash) covering every required behavioral-v3
+  split (test_id, length OOD, semantic/template OOD, and untouched final)
+  over the COMPLETE preregistered example set of each declared split; a
+  lone labelled or relabelled record proves nothing globally.
 * The rejected 4B batch must be nonempty, markered, and complete: any
   known-invalid or byte-duplicate 4B artifact left in any live tree is a
   blocker; one differing file does not mask other identical live copies;
@@ -92,7 +92,14 @@ from .corrected_scoring import (
     INVALID_RECORDS,
     MISSING_RAW_PREDICTION,
     RESCORED_CORRECTED,
-    select_best_checkpoint,
+    select_best_checkpoint as select_legacy_checkpoint,
+)
+from .eval_v3 import (
+    SCHEMA_VERSION as EVAL_V3_SCHEMA_VERSION,
+    SUMMARY_SCHEMA_VERSION as EVAL_V3_SUMMARY_SCHEMA_VERSION,
+    EvalV3Error,
+    aggregate_records as aggregate_v3_records,
+    canonical_sha256 as canonical_v3_sha256,
 )
 
 GATE_SCHEMA_VERSION = 1
@@ -122,12 +129,16 @@ CKPT_DUPLICATE = "duplicate"
 CKPT_UNPROVEN = "unproven"
 CKPT_NON_FP32_PAYLOAD = "non-fp32-payload"
 
-REQUIRED_SPLITS = ("test_id", "test_ood")
+REQUIRED_SPLITS = (
+    "test_id", "test_ood_length", "test_ood_semantic", "final_test",
+)
 
 # Eval status for records whose ex_id is outside the preregistered
 # membership of the file's declared split (relabelling cannot manufacture
 # coverage).
 SPLIT_MEMBERSHIP_VIOLATION = "SPLIT_MEMBERSHIP_VIOLATION"
+IRRECOVERABLE_LEGACY_SCORER = "IRRECOVERABLE_LEGACY_SCORER"
+HISTORICAL_UNBOUND_LEGACY_SCORER = "HISTORICAL_UNBOUND_LEGACY_SCORER"
 
 _PINNED_REVISION_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 _SUITE_SHA_RE = re.compile(r"\A[0-9a-f]{64}\Z")
@@ -144,7 +155,8 @@ REQUIRED_CONFIG_FIELDS = {
 EVAL_BAD_STATUSES = frozenset({
     "unreadable", "malformed_json", "invalid_metadata", "suite_mismatch",
     "NO_RECORDS", INVALID_RECORDS, MISSING_RAW_PREDICTION,
-    SPLIT_MEMBERSHIP_VIOLATION,
+    SPLIT_MEMBERSHIP_VIOLATION, IRRECOVERABLE_LEGACY_SCORER,
+    HISTORICAL_UNBOUND_LEGACY_SCORER,
 })
 
 BLOCKER_ACTIONS = {
@@ -156,7 +168,7 @@ BLOCKER_ACTIONS = {
         "historical files.",
     "REPORT_SUITE_HASH_MISMATCH":
         "Re-evaluate against the current suite revision so the retained "
-        "report pins the recomputed behavioral-v2 digest; never edit the "
+        "report pins the recomputed behavioral-v3 digest; never edit the "
         "hash by hand.",
     "REPORT_TRAINABLE_PRECISION_MISSING":
         "Add explicit trainable dtype/precision fields to the train "
@@ -209,6 +221,10 @@ BLOCKER_ACTIONS = {
         "Rerun evaluation with raw per-candidate score capture enabled "
         "(capped CUDA canary scope) or formally invalidate the latent "
         "conclusions; never relabel derived records as a rescore.",
+    "IRRECOVERABLE_LEGACY_SCORER":
+        "Retain and hash the historical file, but exclude it from measured "
+        "metrics and checkpoint-selection evidence; raw token scores do not "
+        "exist, so independent v3 rescore is impossible.",
     "SELECTION_PROVENANCE_NOT_CORRECTED":
         "Apply select_best_checkpoint over corrected-metric histories "
         "produced by the next validated run; discard historical best_step "
@@ -500,15 +516,29 @@ def validate_train_report(report: dict) -> dict:
         problems.append("suite_sha256:not_64hex")
 
     hist = report.get("val_history")
+    history_schema = None
+    raw_v3_selection = None
+    raw_v3_records = []
     if not isinstance(hist, list) or not hist:
         problems.append("val_history:missing_or_empty")
     else:
+        history_schema = (
+            EVAL_V3_SUMMARY_SCHEMA_VERSION
+            if all(isinstance(entry, dict)
+                   and isinstance(entry.get("metrics"), dict)
+                   and entry["metrics"].get("schema_version")
+                   == EVAL_V3_SUMMARY_SCHEMA_VERSION
+                   for entry in hist)
+            else "legacy"
+        )
         bad_idx = []
         for i, entry in enumerate(hist):
             ok = isinstance(entry, dict)
             if ok:
                 s = entry.get("step")
-                m = entry.get("accuracy")
+                m = (entry.get("metrics", {}).get("micro_accuracy")
+                     if history_schema == EVAL_V3_SUMMARY_SCHEMA_VERSION
+                     else entry.get("accuracy"))
                 ok = (isinstance(s, int) and not isinstance(s, bool)
                       and s >= 0
                       and isinstance(m, (int, float))
@@ -520,6 +550,52 @@ def validate_train_report(report: dict) -> dict:
             shown = ",".join(str(i) for i in bad_idx[:8])
             more = "" if len(bad_idx) <= 8 else ",…"
             problems.append(f"val_history:bad_entries[{shown}{more}]")
+        if history_schema != EVAL_V3_SUMMARY_SCHEMA_VERSION:
+            problems.append("val_history:legacy_scorer_noncanonical")
+        else:
+            # Summary labels are not evidence.  Recompute every validation
+            # checkpoint from its retained raw token rows through the exact
+            # helper used by the trainer before permitting selection.
+            from latent_lab.bench.latent_run import \
+                select_v3_checkpoint_from_raw_history
+            try:
+                raw_v3_selection = select_v3_checkpoint_from_raw_history(hist)
+            except (ValueError, EvalV3Error) as exc:
+                problems.append(
+                    "val_history:v3_raw_records_invalid:" + str(exc))
+            else:
+                raw_v3_records = [record for entry in hist
+                                  for record in entry["records"]]
+                run_id = report.get("run_id")
+                adapter_id = report.get("adapter_id")
+                provenance = report.get("selection_provenance")
+                if not isinstance(run_id, str) or not run_id:
+                    problems.append("run_id:missing_for_v3_history")
+                if not isinstance(adapter_id, str) or not adapter_id:
+                    problems.append("adapter_id:missing_for_v3_history")
+                if provenance != \
+                        "latent_eval.v3_recomputed_from_raw_validation_records":
+                    problems.append("selection_provenance:not_raw_v3")
+                for index, record in enumerate(raw_v3_records):
+                    checks = (
+                        ("run_id", record["run_id"], run_id),
+                        ("adapter_id",
+                         record["checkpoint_identity"]["adapter_id"],
+                         adapter_id),
+                        ("model_id", record["model_identity"]["model_id"],
+                         model),
+                        ("revision", record["model_identity"]["revision"],
+                         rev),
+                        ("suite_sha256", record["suite_identity"]["sha256"],
+                         suite),
+                        ("split", record["split"], "validation"),
+                        ("k", record["k"], config.get("k")),
+                    )
+                    for field, actual, expected in checks:
+                        if actual != expected:
+                            problems.append(
+                                f"val_history:record[{index}].{field}:"
+                                "identity_mismatch")
 
     loss = report.get("final_train_loss")
     if "final_train_loss" not in report:
@@ -555,10 +631,19 @@ def validate_train_report(report: dict) -> dict:
             if isinstance(declared_recipe, dict) \
                     and declared_recipe != derived_recipe:
                 problems.append("recipe:mismatch_with_derived_canonical")
+    if derived_recipe is not None and raw_v3_records:
+        expected_recipe_hash = canonical_v3_sha256(derived_recipe)
+        for index, record in enumerate(raw_v3_records):
+            if record["recipe_hash"] != expected_recipe_hash:
+                problems.append(
+                    f"val_history:record[{index}].recipe_hash:"
+                    "identity_mismatch")
 
     selection = None
     if isinstance(hist, list) and hist:
-        sel = select_best_checkpoint(hist)
+        sel = (raw_v3_selection
+               if history_schema == EVAL_V3_SUMMARY_SCHEMA_VERSION
+               else select_legacy_checkpoint(hist))
         reported_acc = report.get("best_val_acc")
         reported_step = report.get("best_step")
         if sel is not None and isinstance(reported_acc, (int, float)) \
@@ -571,21 +656,36 @@ def validate_train_report(report: dict) -> dict:
                 "recomputed_best_metric": sel.metric,
                 "reported_best_step": reported_step,
                 "reported_best_metric": float(reported_acc),
+                "provenance": ("latent_eval.v3"
+                               if history_schema
+                               == EVAL_V3_SUMMARY_SCHEMA_VERSION
+                               else IRRECOVERABLE_LEGACY_SCORER),
                 "consistent_with_reported": bool(
                     sel.step == reported_step
                     and math.isclose(float(reported_acc), sel.metric,
-                                     rel_tol=0, abs_tol=1e-9)),
+                                     rel_tol=0, abs_tol=1e-9)
+                    and history_schema == EVAL_V3_SUMMARY_SCHEMA_VERSION),
             }
         elif sel is None:
             selection = {"recomputed_best_step": None,
+                         "provenance": ("latent_eval.v3"
+                                        if history_schema
+                                        == EVAL_V3_SUMMARY_SCHEMA_VERSION
+                                        else IRRECOVERABLE_LEGACY_SCORER),
                          "consistent_with_reported": False}
     return {
         "problems": problems,
         "scorer_tag": config.get("scorer"),
+        "history_schema": history_schema,
         "identity": {
             "model_id": model if isinstance(model, str) else None,
             "revision": rev if _is_pinned_revision(rev) else None,
             "suite_sha256": suite if isinstance(suite, str) else None,
+            "run_id": report.get("run_id"),
+            "adapter_id": report.get("adapter_id"),
+            "recipe_hash": (
+                canonical_v3_sha256(derived_recipe)
+                if derived_recipe is not None else None),
             # The canonical recipe ONLY when it was derived from the
             # validated config + validated suite hash AND the report's
             # declared recipe equals it; otherwise None (fail closed).
@@ -737,6 +837,7 @@ def _classify_bundle(raw: dict, path: Path, report_identity,
             "bundle_payload_not_fp32:" + ",".join(bad_dtypes))
         return info
     info["classification"] = CKPT_LOADABLE
+    info["content_digest"] = raw.get("content_digest")
     info["reasons"].append("strict_project_loader_passed")
     info["reasons"].append("payload_floating_tensors_all_fp32")
     if report_identity:
@@ -841,7 +942,18 @@ def evaluate_eval_file(path: Path, examples_by_id: dict | None,
             return out
         records.extend(res["records"])
     out["n_records"] = len(records)
-    out["record_ex_ids"] = sorted({str(r.get("ex_id")) for r in records
+    has_v3 = [isinstance(r, dict)
+              and r.get("schema_version") == EVAL_V3_SCHEMA_VERSION
+              for r in records]
+    if any(has_v3) and not all(has_v3):
+        out["status"] = INVALID_RECORDS
+        out["detail"] = "mixed latent_eval.v3 and legacy records"
+        return out
+    is_v3 = bool(records) and all(has_v3)
+    out["record_schema_version"] = (
+        EVAL_V3_SCHEMA_VERSION if is_v3 else "legacy")
+    id_field = "example_id" if is_v3 else "ex_id"
+    out["record_ex_ids"] = sorted({str(r.get(id_field)) for r in records
                                    if isinstance(r, dict)})
 
     # Relational identity check: every record in a required-split file must
@@ -862,15 +974,66 @@ def evaluate_eval_file(path: Path, examples_by_id: dict | None,
                 f"{shown}")
             return out
 
+    if is_v3:
+        # A handful of raw rows are insufficient if the surrounding file is
+        # not the canonical, identity-bound eval envelope.  Reuse the exact
+        # artifact validator used by the CLI/resume path before rescoring.
+        from latent_lab.bench.artifacts import validate_eval
+        try:
+            validate_eval(path)
+        except ValueError as exc:
+            out["status"] = INVALID_RECORDS
+            out["detail"] = (
+                f"latent_eval.v3 envelope validation failed: {exc}")
+            return out
+        try:
+            metrics = aggregate_v3_records(records)
+        except EvalV3Error as exc:
+            out["status"] = INVALID_RECORDS
+            out["detail"] = f"latent_eval.v3 validation failed: {exc}"
+            return out
+        identity_problems = []
+        for index, record in enumerate(records):
+            if record["split"] != data["split"]:
+                identity_problems.append(
+                    f"record[{index}].split={record['split']!r}")
+            if record["model_identity"] != {
+                    "model_id": data["model"], "revision": data["revision"]}:
+                identity_problems.append(f"record[{index}].model_identity")
+            if record["suite_identity"]["sha256"] != data["suite_sha256"]:
+                identity_problems.append(f"record[{index}].suite_identity")
+        if identity_problems:
+            out["status"] = "invalid_metadata"
+            out["detail"] = "v3 record/top-level identity mismatch: " \
+                + ", ".join(identity_problems[:8])
+            return out
+        out["checkpoint_content_digest"] = records[0][
+            "checkpoint_identity"]["content_sha256"]
+        out["record_run_id"] = records[0]["run_id"]
+        out["record_adapter_id"] = records[0][
+            "checkpoint_identity"]["adapter_id"]
+        out["record_recipe_hash"] = records[0]["recipe_hash"]
+        out["status"] = RESCORED_CORRECTED
+        out["evidence_class"] = "VALID_CURRENT"
+        out["corrected_accuracy"] = metrics["micro_accuracy"]
+        out["metrics"] = metrics
+        return out
+
     if examples_by_id is None:
         examples_by_id = suite_examples_by_id()
 
     from .corrected_scoring import rescore_records
 
     outcome = rescore_records(records, examples_by_id)
-    out["status"] = outcome.status
     if outcome.status == RESCORED_CORRECTED:
-        out["corrected_accuracy"] = outcome.corrected_accuracy
+        out["status"] = HISTORICAL_UNBOUND_LEGACY_SCORER
+        out["evidence_class"] = HISTORICAL_UNBOUND_LEGACY_SCORER
+        out["legacy_rescore_fraction"] = outcome.corrected_accuracy
+    elif outcome.status == MISSING_RAW_PREDICTION:
+        out["status"] = IRRECOVERABLE_LEGACY_SCORER
+        out["evidence_class"] = IRRECOVERABLE_LEGACY_SCORER
+    else:
+        out["status"] = outcome.status
     if outcome.detail:
         out["detail"] = outcome.detail
     if outcome.flag_counts:
@@ -883,16 +1046,28 @@ _SUITE_SHA_CACHE: str | None = None
 _SUITE_SPLIT_CACHE: dict[str, frozenset[str]] | None = None
 
 
+def _build_current_suite():
+    """The only suite eligible for current evidence."""
+    from ..bench.suite_v3 import build_suite
+
+    suite = build_suite()
+    manifest = suite.manifest()
+    if manifest.get("suite_identity") != "behavioral-v3" \
+            or manifest.get("suite_version") != 3 \
+            or manifest.get("suite_hash") != suite.records_hash():
+        raise GateExecutionError(
+            "current benchmark is not a self-consistent behavioral-v3 suite")
+    return suite
+
+
 def suite_examples_by_id() -> dict:
     """ex_id -> Example, built once per process (stdlib-deterministic)."""
     global _SUITE_CACHE
     if _SUITE_CACHE is None:
-        from ..bench.suite import build_suite
-
         cache: dict = {}
-        suite = build_suite()
-        for split in ("train", "validation", "test_id", "test_ood"):
-            for ex in getattr(suite, split):
+        suite = _build_current_suite()
+        for _, examples in suite.splits().items():
+            for ex in examples:
                 cache[ex.ex_id] = ex
         _SUITE_CACHE = cache
     return _SUITE_CACHE
@@ -902,9 +1077,7 @@ def suite_examples_by_split() -> dict[str, frozenset[str]]:
     """split -> preregistered ex_id membership, built once per process."""
     global _SUITE_SPLIT_CACHE
     if _SUITE_SPLIT_CACHE is None:
-        from ..bench.suite import build_suite
-
-        suite = build_suite()
+        suite = _build_current_suite()
         _SUITE_SPLIT_CACHE = {
             name: frozenset(ex.ex_id for ex in exs)
             for name, exs in suite.splits().items()
@@ -915,9 +1088,9 @@ def suite_examples_by_split() -> dict[str, frozenset[str]]:
 def current_suite_sha256() -> str:
     global _SUITE_SHA_CACHE
     if _SUITE_SHA_CACHE is None:
-        from ..bench.suite import build_suite
-
-        _SUITE_SHA_CACHE = build_suite().manifest()["sha256"]
+        suite = _build_current_suite()
+        manifest = suite.manifest()
+        _SUITE_SHA_CACHE = manifest.get("suite_hash", manifest.get("sha256"))
     return _SUITE_SHA_CACHE
 
 
@@ -1177,6 +1350,7 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
                 rv["report_problems"] = report_check["problems"]
                 rv["identity"] = identity
                 rv["scorer_tag"] = report_check["scorer_tag"]
+                rv["history_schema"] = report_check["history_schema"]
                 rv["selection_check"] = report_check["selection_check"]
                 declared = identity.get("suite_sha256")
                 rv["suite_sha256_matches_current_suite"] = bool(
@@ -1305,7 +1479,7 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
            STATUS_PROVEN if reports_ok else STATUS_FAILED,
             (f"{len(retained_runs)}/{len(retained_runs)} retained (2B + live "
              f"4B) reports fully schema-valid with pinned revision + finite "
-             f"metrics + suite hash matching the recomputed behavioral-v2 "
+             f"metrics + suite hash matching the recomputed behavioral-v3 "
              f"suite + recipe equal to the canonically derived "
              f"recipe_from_config(config, suite_sha256)"
             if reports_ok else
@@ -1366,7 +1540,14 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
                 if ev.get("model") != ident.get("model_id") \
                         or ev.get("revision") != ident.get("revision") \
                         or ev.get("suite_sha256_matches_current_suite") \
-                        is not True:
+                        is not True \
+                        or ev.get("checkpoint_content_digest") != \
+                        rv.get("checkpoint", {}).get("content_digest") \
+                        or ev.get("record_run_id") != ident.get("run_id") \
+                        or ev.get("record_adapter_id") != \
+                        ident.get("adapter_id") \
+                        or ev.get("record_recipe_hash") != \
+                        ident.get("recipe_hash"):
                     identity_mismatches.append(f"{ev['file']} vs {rid}")
                     continue
                 covered_ids[ev["split"]].update(ev.get("record_ex_ids") or ())
@@ -1414,13 +1595,14 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
         (rv.get("selection_check") or {}).get("consistent_with_reported")
         for rv in retained_runs if rv.get("selection_check"))
     corrected_histories = bool(retained_runs) and all(
-        rv.get("scorer_tag") == corrected_scorer_tag
+        rv.get("history_schema") == EVAL_V3_SUMMARY_SCHEMA_VERSION
+        and (rv.get("selection_check") or {}).get("provenance")
+        == "latent_eval.v3"
         for rv in retained_runs)
     if rescore_status == STATUS_PROVEN and corrected_histories and selection_ok:
         selection_status = STATUS_PROVEN
         selection_detail = ("best_step values reproduce from histories "
-                            "produced under the corrected gold-aware scorer "
-                            f"({corrected_scorer_tag})")
+                            "produced under canonical latent_eval.v3")
     elif not selection_ok:
         selection_status = STATUS_FAILED
         selection_detail = "recomputed selection disagrees with reported best_step"
@@ -1560,10 +1742,12 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
                 f"{len(bad_evals)}/{len(eval_verdicts)} eval files cannot "
                 f"support the rescore prerequisite ({summary}): {listing}")
     non_rescorable = [e for e in eval_verdicts
-                      if e.get("status") == MISSING_RAW_PREDICTION]
+                      if e.get("status") in (
+                          MISSING_RAW_PREDICTION,
+                          IRRECOVERABLE_LEGACY_SCORER)]
     if non_rescorable:
         listing = "; ".join(f"{e['file']}" for e in non_rescorable[:8])
-        blocker(MISSING_RAW_PREDICTION,
+        blocker(IRRECOVERABLE_LEGACY_SCORER,
                 f"{len(non_rescorable)}/{len(eval_verdicts)} eval files "
                 f"retain only derived correct/rank_of_gold (or reference "
                 f"unknown examples) — corrected rescoring impossible "
@@ -1646,7 +1830,7 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
         f"{fingerprints_before['results_4b']['merkle_sha256'][:12]}…",
         f"{sum(rv.get('suite_sha256_matches_current_suite') is True for rv in two_b_runs)}"
         f"/{len(two_b_runs)} 2B reports pin the locally recomputed "
-        f"behavioral-v2 suite digest",
+        f"behavioral-v3 suite digest",
         f"{sum((rv.get('selection_check') or {}).get('consistent_with_reported') is True for rv in two_b_runs)}"
         f"/{len(two_b_runs)} reported best_step values reproduce exactly "
         f"from their own val_history",
@@ -1673,7 +1857,9 @@ def run_gate(results_2b: Path, results_4b: Path, *, repo_root: Path,
         "eval_files_rescored_corrected": len(rescored),
         "eval_files_missing_raw_prediction": len(non_rescorable := [
             e for e in eval_verdicts
-            if e.get("status") == MISSING_RAW_PREDICTION]),
+            if e.get("status") in (
+                MISSING_RAW_PREDICTION,
+                IRRECOVERABLE_LEGACY_SCORER)]),
         "eval_files_invalid_or_unbound": len(bad_evals) + len(orphan_evals),
         "eval_files_split_membership_violations": len(membership_violations),
         "eligible_checkpoints_fully_covered": len(covered_runs),

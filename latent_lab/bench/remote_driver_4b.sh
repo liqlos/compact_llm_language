@@ -19,8 +19,9 @@
 #   * Paired causal arm: K>0 and K=0 are evaluated on the SAME trained
 #     adapter/seed/suite (only the eval-time K differs). Separate F
 #     adapters do NOT satisfy this contract and are not used.
-#   * Bounded by construction: exactly ONE training run + four paired
-#     evaluations. Any matrix expansion requires its own separate
+#   * Bounded by construction: exactly ONE training run + paired K=4/K=0
+#     evaluations on each preregistered behavioral-v3 evidence split. Any
+#     matrix expansion requires its own separate
 #     pre-spend authorization and is refused here.
 #   * Resume NEVER trusts bare existence: a directory/payload counts as
 #     done ONLY when it re-validates under the FULL expected contract;
@@ -57,7 +58,6 @@ MAX_K=16
 LORA_R=8
 LORA_ALPHA=16.0
 DETACH_Z0=false
-GRAD_CHECKPOINT=true
 LABEL=E4_k${K_POS}_s${SEED}
 RUN_DIR=runs/${LABEL}
 
@@ -75,12 +75,6 @@ py_bool () {
   esac
 }
 PY_DETACH_Z0=$(py_bool "$DETACH_Z0")
-# The trainer pins grad-checkpointing ON (no way to disable it), so the
-# preregistration must agree; anything else is a digest/trainer mismatch.
-[ "$GRAD_CHECKPOINT" = "true" ] \
-  || { echo "FATAL: GRAD_CHECKPOINT must be exactly 'true': the trainer pins grad-checkpointing ON; refusing a digest/trainer mismatch" >&2
-       exit 5; }
-PY_GRAD_CHECKPOINT=$(py_bool "$GRAD_CHECKPOINT")
 # THE verified immutable base image (Python 3.12.3, torch
 # 2.13.0+cu126/CUDA 12.6, transformers/huggingface_hub absent): the
 # externally supplied SEALED_IMAGE must equal this digest exactly.
@@ -274,12 +268,12 @@ python -m pytest -q \
   tests/test_artifact_contracts.py \
   tests/test_paid_driver_sealed.py
 
-SUITE_SHA=$(python -c "from latent_lab.bench.suite import build_suite; print(build_suite().manifest()['sha256'])")
+SUITE_SHA=$(python -c "from latent_lab.bench.suite_v3 import build_suite; print(build_suite().manifest()['suite_hash'])")
 
 # Preregister the EXACT canonical recipe digest from the SAME constants
 # the trainer will use (shared helper — no hand-maintained field list).
 # Resume validation binds this digest, so a wrong suite/LR/interval/LoRA/
-# optimizer/schedule/warmup/clip/detach/checkpoint artifact can never be
+# optimizer/schedule/warmup/clip/detach artifact can never be
 # resumed or reused.
 N_LAYERS=$(python -c "from transformers import AutoConfig; print(AutoConfig.from_pretrained(\"$MODEL\", revision=\"$REV\").num_hidden_layers)")
 CONFIG_SHA256=$(python - <<PY
@@ -294,7 +288,6 @@ print(train_recipe_digest(
     optimizer="${OPTIMIZER}", weight_decay=${WEIGHT_DECAY},
     lr_schedule="${LR_SCHEDULE}", warmup=${WARMUP},
     clip=${CLIP}, detach_z0=${PY_DETACH_Z0},
-    grad_checkpoint=${PY_GRAD_CHECKPOINT},
     suite_sha256="${SUITE_SHA}"))
 PY
 )
@@ -342,7 +335,7 @@ else
   # shellcheck disable=SC2181
   [ "$DETACH_Z0" = "true" ] && TRAIN_ARGS+=(--detach-z0)
   python -m latent_lab.bench.latent_run train "${TRAIN_ARGS[@]}" \
-    --eval-every 100 --val-examples 28 \
+    --eval-every 100 \
     --label "$LABEL" --device cuda "${COMMON[@]}" --out "$RUN_DIR"
   valid_run "$RUN_DIR" \
     || { echo "FATAL: freshly written $RUN_DIR failed validation" >&2; exit 4; }
@@ -369,12 +362,16 @@ ev () { AD=$1; SP=$2; K=$3;
       --expect-digest "$ADAPTER_DIGEST" --expect-split "$SP" \
       --expect-ablation clean --expect-k "$K" --expect-seed "$SEED" >/dev/null \
     || { echo "FATAL: freshly written $F failed validation" >&2; exit 4; }
-  python3 -c "import json;d=json.load(open('$F'));r=d['results'][list(d['results'])[-1]];print('EVAL $AD $SP K=$K acc', r['accuracy'], 'n', r['n'])"
+  python3 -c "import json;d=json.load(open('$F'));r=d['results'][list(d['results'])[-1]];print('EVAL $AD $SP K=$K micro_accuracy', r['metrics']['micro_accuracy'], 'n', r['n'])"
 }
 
 ev "$LABEL" test_id "$K_POS"
 ev "$LABEL" test_id "$K_ZERO"
-ev "$LABEL" test_ood "$K_POS"
-ev "$LABEL" test_ood "$K_ZERO"
+ev "$LABEL" test_ood_length "$K_POS"
+ev "$LABEL" test_ood_length "$K_ZERO"
+ev "$LABEL" test_ood_semantic "$K_POS"
+ev "$LABEL" test_ood_semantic "$K_ZERO"
+ev "$LABEL" final_test "$K_POS"
+ev "$LABEL" final_test "$K_ZERO"
 
 echo ALL_DONE_4B

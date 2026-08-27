@@ -212,7 +212,12 @@ def rescore_records(records) -> float:
 
 def evaluate(rec, data: SuiteTensors, k_steps, indices, *, ablate=None,
              tag="", limit=None):
-    """Ranking accuracy over selected examples; per-example records."""
+    """Historical summed-score evaluator.
+
+    This path is retained only to read/quarantine legacy artifacts.  New
+    validation, checkpoint selection, and final evidence must use
+    :func:`evaluate_v3`.
+    """
     device = next(rec.model.parameters()).device
     t0 = time.perf_counter()
     records = []
@@ -242,6 +247,334 @@ def evaluate(rec, data: SuiteTensors, k_steps, indices, *, ablate=None,
         "by_depth": by_depth, "by_family": by_family,
         "seconds": round(time.perf_counter() - t0, 1),
         "records": records,
+    }
+
+
+_V3_EVIDENCE_IDENTITY_KEYS = frozenset((
+    "run_id", "recipe_hash", "model_id", "model_revision", "adapter_id",
+    "checkpoint_id", "checkpoint_content_hash", "suite_id",
+    "suite_version", "suite_hash", "recurrence_config",
+))
+
+
+def _v3_identity(identity) -> dict:
+    if not isinstance(identity, dict):
+        raise ValueError("v3 evidence_identity must be an object")
+    if set(identity) != set(_V3_EVIDENCE_IDENTITY_KEYS):
+        missing = sorted(_V3_EVIDENCE_IDENTITY_KEYS - set(identity))
+        extra = sorted(set(identity) - _V3_EVIDENCE_IDENTITY_KEYS)
+        raise ValueError(
+            f"v3 evidence_identity keys mismatch; missing={missing}, "
+            f"extra={extra}")
+    return dict(identity)
+
+
+def build_v3_runtime_record(ex, *, split, k_steps, evidence_identity,
+                            details, runtime_order=None,
+                            runtime_raw_sums=None,
+                            runtime_tie_error=None):
+    """Convert one runtime raw-detail snapshot into canonical v3 evidence.
+
+    The converter performs no model work.  It independently recomputes every
+    score/ranking/verdict through :mod:`eval_v3` and requires the runtime's
+    duplicated sums, normalized scores, primary definition, and ordering to
+    agree exactly.  This is the shared validation/final/offline boundary.
+    """
+    from latent_lab.bench.eval_v3 import (
+        PRIMARY_SCORE_DEFINITION, build_eval_record)
+
+    ident = _v3_identity(evidence_identity)
+    declared_split = getattr(ex, "split", split)
+    if declared_split != split:
+        raise ValueError(
+            f"{ex.ex_id}: example belongs to {declared_split!r}, not "
+            f"requested split {split!r}")
+    if not isinstance(details, dict):
+        raise ValueError("runtime score details must be an object")
+    rows = details.get("candidate_token_logprobs")
+    compute = details.get("compute")
+    record = build_eval_record(
+        run_id=ident["run_id"], recipe_hash=ident["recipe_hash"],
+        model_id=ident["model_id"], model_revision=ident["model_revision"],
+        adapter_id=ident["adapter_id"], checkpoint_id=ident["checkpoint_id"],
+        checkpoint_content_hash=ident["checkpoint_content_hash"],
+        suite_id=ident["suite_id"], suite_version=ident["suite_version"],
+        suite_hash=ident["suite_hash"], example_id=ex.ex_id, split=split,
+        family=ex.family, prompt=ex.prompt, candidates=ex.candidates,
+        candidate_permutation_seed=ex.candidate_permutation_seed,
+        candidate_permutation=ex.candidate_permutation,
+        gold_answer=ex.answer, per_token_logprobs=rows, k=k_steps,
+        recurrence_config=ident["recurrence_config"], compute=compute,
+    )
+    duplicates = (
+        ("candidate_token_counts", record["token_counts"]),
+        ("candidate_raw_sum_logprobs", record["raw_summed_logprobs"]),
+        ("candidate_length_normalized_logprobs", record["normalized_scores"]),
+    )
+    for field, expected in duplicates:
+        if field not in details or list(details[field]) != expected:
+            raise ValueError(
+                f"runtime {field} disagrees with canonical v3 raw rescore")
+    if details.get("primary_score_definition") != PRIMARY_SCORE_DEFINITION:
+        raise ValueError("runtime primary score definition is not canonical v3")
+    expected_top_tie = (record["ties"][0]
+                        if record["error_status"] == "AMBIGUOUS_TOP_TIE"
+                        else [])
+    claimed_top_tie = details.get("exact_top_tie_indices")
+    if not isinstance(claimed_top_tie, list) \
+            or sorted(claimed_top_tie) != sorted(expected_top_tie):
+        raise ValueError(
+            "runtime exact-top-tie claim disagrees with canonical v3")
+    if runtime_tie_error is not None \
+            and bool(runtime_tie_error) != bool(expected_top_tie):
+        raise ValueError(
+            "runtime tie control flow disagrees with canonical v3")
+    primary_scores = details.get("primary_scores")
+    if primary_scores is not None \
+            and list(primary_scores) != record["normalized_scores"]:
+        raise ValueError("runtime primary_scores disagree with canonical v3")
+    if runtime_raw_sums is not None \
+            and list(runtime_raw_sums) != record["raw_summed_logprobs"]:
+        raise ValueError("runtime raw sums disagree with canonical v3")
+    if runtime_order is not None:
+        runtime_order = list(runtime_order)
+        if sorted(runtime_order) != list(range(len(record["candidates"]))):
+            raise ValueError("runtime ranking is not a candidate permutation")
+        # Non-leading exact ties may be serialized differently by a runtime
+        # that has token ids but not candidate strings.  They cannot change
+        # the verdict.  A different unique leader is always a hard mismatch.
+        if record["status"] == "ok" \
+                and runtime_order[0] != record["ranking"][0]:
+            raise ValueError("runtime winner disagrees with canonical v3")
+        if not record["ties"] and runtime_order != record["ranking"]:
+            raise ValueError("runtime ranking disagrees with canonical v3")
+    return record
+
+
+def evaluate_v3(rec, data: SuiteTensors, k_steps, indices, *,
+                evidence_identity, split, ablate=None, tag="", limit=None):
+    """Canonical online evaluation used by validation and final scoring."""
+    from latent_lab.bench.eval_v3 import aggregate_records
+
+    device = next(rec.model.parameters()).device
+    t0 = time.perf_counter()
+    records = []
+    for i in (indices[:limit] if limit else indices):
+        ex = data.examples[i]
+        partner = None
+        if ablate and ablate.get("swap_state"):
+            j = (i + 1) % len(data.examples)
+            partner = data.prompt_ids[j].to(device)
+        try:
+            order, raw_sums, report = rec.rank_candidates(
+                data.prompt_ids[i].to(device), data.cand_ids[i], k_steps,
+                ablate=ablate, partner_input_ids=partner)
+            details = report.extra
+            tie_error = False
+        except Exception as exc:  # exact runtime tie is evidence, not a crash
+            if type(exc).__name__ != "AmbiguousTopTie" \
+                    or not isinstance(getattr(exc, "details", None), dict):
+                raise
+            order = None
+            raw_sums = getattr(exc, "raw_sums", None)
+            details = exc.details
+            tie_error = True
+        records.append(build_v3_runtime_record(
+            ex, split=split, k_steps=k_steps,
+            evidence_identity=evidence_identity, details=details,
+            runtime_order=order, runtime_raw_sums=raw_sums,
+            runtime_tie_error=tie_error))
+    metrics = aggregate_records(records)
+    return {
+        "schema_version": metrics["schema_version"],
+        "tag": tag,
+        "ablate": ablate or {},
+        "k_steps": k_steps,
+        "n": len(records),
+        "metrics": metrics,
+        "seconds": time.perf_counter() - t0,
+        "records": records,
+    }
+
+
+def select_v3_checkpoint(history):
+    """Canonical checkpoint selection; legacy accuracy entries are rejected."""
+    from latent_lab.bench.eval_v3 import select_best_checkpoint
+    return select_best_checkpoint(history)
+
+
+def rescore_v3_records(records):
+    """Canonical offline/report rescore from persisted raw fields only."""
+    from latent_lab.bench.eval_v3 import aggregate_records
+    return aggregate_records(records)
+
+
+def canonical_v3_history_entry(step, records):
+    """Persist raw validation records beside their recomputed summary."""
+    from latent_lab.bench.eval_v3 import checkpoint_history_entry
+
+    retained = list(records)
+    entry = checkpoint_history_entry(step, retained)
+    entry["records"] = retained
+    return entry
+
+
+def select_v3_checkpoint_from_raw_history(history, *, expected_identity=None):
+    """Select only after independently rebuilding every v3 summary.
+
+    A summary-only or tampered validation history cannot select a checkpoint.
+    The same canonical selector is then used by training and the no-spend
+    gate.
+    """
+    from latent_lab.bench.eval_v3 import aggregate_records
+
+    canonical = []
+    for index, entry in enumerate(history or ()):
+        if not isinstance(entry, dict):
+            raise ValueError(f"validation history[{index}] is not an object")
+        records = entry.get("records")
+        if not isinstance(records, list) or not records:
+            raise ValueError(
+                f"validation history[{index}] has no raw v3 records")
+        recomputed = aggregate_records(records)
+        if expected_identity is not None:
+            if not isinstance(expected_identity, dict):
+                raise ValueError("expected validation identity must be an object")
+            record = records[0]
+            actual_identity = {
+                "run_id": record["run_id"],
+                "recipe_hash": record["recipe_hash"],
+                "model_id": record["model_identity"]["model_id"],
+                "model_revision": record["model_identity"]["revision"],
+                "adapter_id": record["checkpoint_identity"]["adapter_id"],
+                "suite_id": record["suite_identity"]["suite_id"],
+                "suite_version": record["suite_identity"]["version"],
+                "suite_hash": record["suite_identity"]["sha256"],
+                "split": record["split"],
+                "k": record["k"],
+                "recurrence_config": record["recurrence_config"],
+            }
+            unknown = sorted(set(expected_identity) - set(actual_identity))
+            if unknown:
+                raise ValueError(
+                    f"unknown expected validation identity keys {unknown}")
+            for field, expected in expected_identity.items():
+                if actual_identity[field] != expected:
+                    raise ValueError(
+                        f"validation history[{index}] {field} disagrees "
+                        "with selected adapter identity")
+        if entry.get("metrics") != recomputed:
+            raise ValueError(
+                f"validation history[{index}] summary disagrees with raw "
+                "latent_eval.v3 records")
+        canonical.append({"step": entry.get("step"), "metrics": recomputed})
+    return select_v3_checkpoint(canonical)
+
+
+def _suite_v3_contract(suite) -> dict:
+    manifest = suite.manifest()
+    required = ("suite_identity", "suite_version", "suite_hash")
+    missing = [field for field in required if field not in manifest]
+    if missing:
+        raise ValueError(
+            f"behavioral-v3 manifest missing identity fields {missing}")
+    if manifest["suite_identity"] != "behavioral-v3" \
+            or manifest["suite_version"] != 3:
+        raise ValueError(
+            f"new evidence requires behavioral-v3, got "
+            f"{manifest['suite_identity']!r} v{manifest['suite_version']!r}")
+    if suite.records_hash() != manifest["suite_hash"]:
+        raise ValueError("behavioral-v3 manifest hash disagrees with records")
+    return manifest
+
+
+def _recipe_hash(recipe) -> str:
+    from latent_lab.bench.eval_v3 import canonical_sha256
+    return canonical_sha256(recipe)
+
+
+def _recurrence_config(cfg: dict) -> dict:
+    """Measured recurrence settings; unsupported flags cannot enter v3."""
+    if cfg.get("grad_checkpoint") not in (None, False):
+        raise ValueError("grad_checkpoint=true is unsupported")
+    return {
+        "mode": cfg["mode"],
+        "interval": list(cfg["interval"]),
+        "trained_k": cfg["k"],
+        "max_k": cfg["max_k"],
+        "lora_r": cfg["lora_r"],
+        "lora_alpha": cfg["lora_alpha"],
+        "detach_z0": cfg["detach_z0"],
+    }
+
+
+def _training_run_id(out: Path, recipe_hash: str, seed: int, *,
+                     model_id: str, revision: str) -> str:
+    from latent_lab.bench.eval_v3 import canonical_sha256
+    digest = canonical_sha256({
+        "output_path": str(out.resolve()),
+        "recipe_hash": recipe_hash,
+        "seed": seed,
+        "model_id": model_id,
+        "model_revision": revision,
+    })
+    return f"latent-train-{digest[:24]}"
+
+
+def _v3_evidence_identity(*, run_id, recipe, model_id, revision,
+                          adapter_id, checkpoint_id,
+                          checkpoint_content_hash, suite_manifest,
+                          recurrence_config) -> dict:
+    return _v3_identity({
+        "run_id": run_id,
+        "recipe_hash": _recipe_hash(recipe),
+        "model_id": model_id,
+        "model_revision": revision,
+        "adapter_id": adapter_id,
+        "checkpoint_id": checkpoint_id,
+        "checkpoint_content_hash": checkpoint_content_hash,
+        "suite_id": suite_manifest["suite_identity"],
+        "suite_version": suite_manifest["suite_version"],
+        "suite_hash": suite_manifest["suite_hash"],
+        "recurrence_config": recurrence_config,
+    })
+
+
+def build_v3_eval_payload(*, adapter, split, config, model_id, revision,
+                          suite_hash, tokenizer_class, interval, k_steps,
+                          ablation, seed, checkpoint_content_digest,
+                          result, device):
+    """Canonical persisted eval envelope, validated from raw v3 records."""
+    metrics = rescore_v3_records(result.get("records", ()))
+    if result.get("metrics") != metrics:
+        raise ValueError("eval result summary disagrees with raw v3 records")
+    ablation_name = ablation or CLEAN_ABLATION
+    return {
+        "status": "complete",
+        "adapter": adapter,
+        "split": split,
+        "config": config,
+        "model": model_id,
+        "revision": revision,
+        "identity": {
+            "model_id": model_id,
+            "revision": revision,
+            "suite_sha256": suite_hash,
+            "tokenizer_class": tokenizer_class,
+            "interval": list(interval),
+            "max_k": config["max_k"],
+            "k_steps": k_steps,
+            "split": split,
+            "seed": seed,
+            "ablation": ablation_name,
+            "checkpoint_content_digest": checkpoint_content_digest,
+        },
+        "suite_sha256": suite_hash,
+        "device": device,
+        "seed": seed,
+        "results": {ablation_name: result},
+        "peak_rss_mib": round(peak_rss_mib(), 1),
+        "platform": platform.platform(),
     }
 
 
@@ -276,13 +609,15 @@ def mode_from_spec(interval_spec: str, k: int) -> str:
 def train_recipe_digest(*, mode, interval, k, max_k, lora_r, lora_alpha,
                         lr, steps, seed, optimizer, weight_decay,
                         lr_schedule, warmup, clip, detach_z0,
-                        grad_checkpoint, suite_sha256) -> str:
+                        suite_sha256, grad_checkpoint=None) -> str:
     """ONE canonical digest binding EVERY behavior-changing field.
 
     The single source of truth shared by the trainer and the paid
     driver's preregistration: any change to mode/interval/K/max_k/LoRA/
     LR/steps/seed/optimizer/weight-decay/schedule/warmup/clip/detach/
-    checkpointing/suite produces a materially different config_sha256.
+    suite produces a materially different config_sha256.  The removed
+    ``grad_checkpoint`` keyword is accepted only as a false migration input;
+    checkpointing.recipe_from_config rejects true and never persists it.
     """
     cfg = {
         "mode": mode, "interval": list(interval), "k": k, "max_k": max_k,
@@ -290,8 +625,10 @@ def train_recipe_digest(*, mode, interval, k, max_k, lora_r, lora_alpha,
         "lr": lr, "steps": steps, "seed": seed,
         "optimizer": optimizer, "weight_decay": weight_decay,
         "lr_schedule": lr_schedule, "warmup": warmup, "clip": clip,
-        "detach_z0": detach_z0, "grad_checkpoint": grad_checkpoint,
+        "detach_z0": detach_z0,
     }
+    if grad_checkpoint is not None:
+        cfg["grad_checkpoint"] = grad_checkpoint
     return recipe_from_config(cfg, suite_sha256)["config_sha256"]
 
 
@@ -385,17 +722,16 @@ def _train_inner(args, out: Path, device: str, revision: str):
     import torch
 
     from latent_lab.backends.localized import LocalizedRecurrence
-    from latent_lab.bench.suite import build_suite
+    from latent_lab.bench.suite_v3 import build_suite
     from latent_lab.train.checkpointing import (
-        BestCheckpointTracker, guarded_optimizer_step, sha256_file,
-        write_train_generation)
+        BestCheckpointTracker, adapter_state_sha256,
+        guarded_optimizer_step, sha256_file, write_train_generation)
 
     model, tok = load_model(device, args.model, revision)
     interval = interval_from_spec(
         args.interval, model.config.num_hidden_layers)
     rec = LocalizedRecurrence(model, None, interval=interval, max_k=args.max_k,
-                              lora_r=args.lora_r, lora_alpha=args.lora_alpha,
-                              grad_checkpoint=True)
+                              lora_r=args.lora_r, lora_alpha=args.lora_alpha)
     rec.clock.to(device)
     params = [p for p in rec.trainable_parameters()]
     if args.optimizer != "adamw":
@@ -405,10 +741,36 @@ def _train_inner(args, out: Path, device: str, revision: str):
                             weight_decay=args.weight_decay)
 
     suite = build_suite()
+    suite_manifest = _suite_v3_contract(suite)
+    suite_sha = suite_manifest["suite_hash"]
+    mode = mode_from_spec(args.interval, args.k)
+    cfg = {
+        "mode": mode,
+        "model": args.model, "revision": revision,
+        "interval": list(interval), "k": args.k,
+        "lora_r": args.lora_r, "lora_alpha": args.lora_alpha,
+        "lr": args.lr, "steps": args.steps,
+        "seed": args.seed, "max_k": args.max_k,
+        "optimizer": args.optimizer, "weight_decay": args.weight_decay,
+        "lr_schedule": args.lr_schedule, "warmup": args.warmup,
+        "clip": args.clip, "detach_z0": args.detach_z0,
+        "device": device,
+        "label": getattr(args, "label", None),
+        "suite_sha256": suite_sha,
+    }
+    recipe = recipe_from_config(cfg, suite_sha)
+    run_id = _training_run_id(
+        out, _recipe_hash(recipe), args.seed,
+        model_id=args.model, revision=revision)
+    recurrence_config = _recurrence_config(cfg)
     train = SuiteTensors(tok, list(suite.train))
     val = SuiteTensors(tok, list(suite.validation))
+    cfg["train_examples"] = len(train)
     val_idx = list(range(len(val.examples)))
-    n_val_eval = min(len(val_idx), args.val_examples)
+    if args.val_examples is not None and args.val_examples < 1:
+        raise ValueError("--val-examples must be >=1 or omitted for full validation")
+    n_val_eval = (len(val_idx) if args.val_examples is None
+                  else min(len(val_idx), args.val_examples))
 
     order = list(range(len(train)))
     history = []
@@ -446,15 +808,47 @@ def _train_inner(args, out: Path, device: str, revision: str):
             print(f"step {step} loss {final_loss:.4f} lr {lr_at(step):.2e} "
                   f"({time.perf_counter()-t0:.0f}s)", flush=True)
         if (step + 1) % args.eval_every == 0 or step == args.steps - 1:
-            ev = evaluate(rec, val, args.k, val_idx, tag="val",
-                          limit=n_val_eval)
-            ev["step"] = step + 1
-            ev.pop("records")
-            history.append(ev)
-            print(f"  val acc {ev['accuracy']} @step {step+1}", flush=True)
-            if tracker.update(ev["accuracy"], rec.adapter_state_dict(),
-                              step=step + 1):
-                print(f"  new best {ev['accuracy']} @step {step+1}",
+            checkpoint_step = step + 1
+            adapter_state = rec.adapter_state_dict()
+            checkpoint_hash = adapter_state_sha256(adapter_state)
+            evidence_identity = _v3_evidence_identity(
+                run_id=run_id, recipe=recipe, model_id=args.model,
+                revision=revision, adapter_id=run_id,
+                checkpoint_id=f"step-{checkpoint_step}",
+                checkpoint_content_hash=checkpoint_hash,
+                suite_manifest=suite_manifest,
+                recurrence_config=recurrence_config)
+            ev = evaluate_v3(
+                rec, val, args.k, val_idx,
+                evidence_identity=evidence_identity, split="validation",
+                tag=f"{mode}|validation|clean|K={args.k}",
+                limit=n_val_eval)
+            history.append(canonical_v3_history_entry(
+                checkpoint_step, ev["records"]))
+            selected = select_v3_checkpoint_from_raw_history(
+                history,
+                expected_identity={
+                    "run_id": run_id,
+                    "recipe_hash": _recipe_hash(recipe),
+                    "model_id": args.model,
+                    "model_revision": revision,
+                    "adapter_id": run_id,
+                    "suite_id": suite_manifest["suite_identity"],
+                    "suite_version": suite_manifest["suite_version"],
+                    "suite_hash": suite_sha,
+                    "split": "validation",
+                    "k": args.k,
+                    "recurrence_config": recurrence_config,
+                })
+            if selected is None:
+                raise ValueError(
+                    "canonical v3 selector found no valid checkpoint")
+            metric = ev["metrics"]["micro_accuracy"]
+            print(f"  val micro_accuracy {metric} @step {checkpoint_step}",
+                  flush=True)
+            if selected.step == checkpoint_step and tracker.update(
+                    selected.metric, adapter_state, step=checkpoint_step):
+                print(f"  new best {selected.metric} @step {checkpoint_step}",
                       flush=True)
 
     if not tracker.has_best():
@@ -462,26 +856,6 @@ def _train_inner(args, out: Path, device: str, revision: str):
         raise EmptyCheckpointError(
             "no finite validation checkpoint was accepted; refusing to "
             "report or save final state")
-
-    mode = mode_from_spec(args.interval, args.k)
-    suite_sha = suite.manifest()["sha256"]
-    cfg = {
-        "mode": mode,
-        "model": args.model, "revision": revision,
-        "interval": list(interval), "k": args.k,
-        "lora_r": args.lora_r, "lora_alpha": args.lora_alpha,
-        "lr": args.lr, "steps": args.steps,
-        "seed": args.seed, "max_k": args.max_k,
-        "optimizer": args.optimizer, "weight_decay": args.weight_decay,
-        "lr_schedule": args.lr_schedule, "warmup": args.warmup,
-        "clip": args.clip, "detach_z0": args.detach_z0,
-        "grad_checkpoint": True,
-        "device": device,
-        "train_examples": len(train),
-        "label": getattr(args, "label", None),
-        "suite_sha256": suite_sha,
-    }
-    recipe = recipe_from_config(cfg, suite_sha)
 
     # reload the SELECTED BEST before reporting/saving — final state is
     # never silently used as evidence
@@ -492,16 +866,24 @@ def _train_inner(args, out: Path, device: str, revision: str):
         config=cfg,
         metrics={"best_val_acc": tracker.best_score})
     report = {
+        "run_id": run_id,
+        "adapter_id": run_id,
         "config": cfg,
         "model": args.model, "revision": revision,
         "suite_sha256": suite_sha,
+        "suite_identity": suite_manifest["suite_identity"],
+        "suite_version": suite_manifest["suite_version"],
         "recipe": recipe,
+        "selection_provenance":
+            "latent_eval.v3_recomputed_from_raw_validation_records",
+        "best_val_metric_definition": "micro_accuracy",
         "checkpoint_content_digest": bundle["content_digest"],
         "checkpoint_sha256": sha256_file(bundle_path),
         "precision": {
             "backbone_dtype": str(next(model.parameters()).dtype),
             "trainables_dtype": "torch.float32",
         },
+        "trainable_precision": "fp32",
         "best_val_acc": tracker.best_score,
         "best_step": tracker.best_step,
         "val_history": history,
@@ -523,7 +905,10 @@ def _train_inner(args, out: Path, device: str, revision: str):
         "seed": args.seed,
         "label": getattr(args, "label", None),
         "identity": {"model_id": args.model, "revision": revision},
+        "run_id": run_id,
         "recipe": recipe,
+        "suite_identity": suite_manifest["suite_identity"],
+        "suite_version": suite_manifest["suite_version"],
         "suite_sha256": suite_sha,
         "checkpoint_content_digest": bundle["content_digest"],
         "checkpoint_sha256": sha256_file(bundle_path),
@@ -581,7 +966,7 @@ def cmd_eval(args):
     import torch
 
     from latent_lab.backends.localized import LocalizedRecurrence
-    from latent_lab.bench.suite import build_suite
+    from latent_lab.bench.suite_v3 import build_suite
     from latent_lab.train.checkpointing import (
         AdapterBundleError,
         AdapterBundleIdentityError,
@@ -612,7 +997,8 @@ def cmd_eval(args):
             "revision; refusing to evaluate") from e
 
     suite = build_suite()
-    suite_sha = suite.manifest()["sha256"]
+    suite_manifest = _suite_v3_contract(suite)
+    suite_sha = suite_manifest["suite_hash"]
 
     # Identity-validate + digest-verify the on-disk generation and bundle
     # BEFORE any model/tokenizer load: a tampered adapter must never
@@ -637,6 +1023,42 @@ def cmd_eval(args):
             f"adapter {args.adapter}: manifest suite_sha256 "
             f"{manifest.get('suite_sha256')!r} != current suite "
             f"{suite_sha!r}; refusing to evaluate")
+    if report.get("suite_identity") != suite_manifest["suite_identity"] \
+            or report.get("suite_version") != suite_manifest["suite_version"]:
+        raise AdapterBundleIdentityError(
+            f"adapter {args.adapter}: report is not bound to behavioral-v3; "
+            "legacy/quarantine checkpoints cannot enter current evaluation")
+    if report.get("selection_provenance") != \
+            "latent_eval.v3_recomputed_from_raw_validation_records":
+        raise AdapterBundleIdentityError(
+            f"adapter {args.adapter}: checkpoint selection was not proven "
+            "from raw latent_eval.v3 validation records")
+    run_id = report.get("run_id")
+    adapter_id = report.get("adapter_id")
+    if not isinstance(run_id, str) or not run_id \
+            or not isinstance(adapter_id, str) or not adapter_id:
+        raise AdapterBundleIdentityError(
+            f"adapter {args.adapter}: missing v3 run/adapter identity")
+    selected = select_v3_checkpoint_from_raw_history(
+        report.get("val_history"),
+        expected_identity={
+            "run_id": run_id,
+            "recipe_hash": _recipe_hash(recipe),
+            "model_id": model_id,
+            "model_revision": revision,
+            "adapter_id": adapter_id,
+            "suite_id": suite_manifest["suite_identity"],
+            "suite_version": suite_manifest["suite_version"],
+            "suite_hash": suite_sha,
+            "split": "validation",
+            "k": cfg["k"],
+            "recurrence_config": _recurrence_config(cfg),
+        })
+    if selected is None or selected.step != report.get("best_step") \
+            or selected.metric != report.get("best_val_acc"):
+        raise AdapterBundleIdentityError(
+            f"adapter {args.adapter}: raw v3 validation history does not "
+            "reproduce the reported selected checkpoint")
     m_ident = manifest.get("identity") or {}
     if m_ident.get("model_id") != model_id \
             or require_pinned_revision(m_ident.get("revision")) != revision:
@@ -657,48 +1079,47 @@ def cmd_eval(args):
     interval = tuple(cfg["interval"])
     rec = LocalizedRecurrence(model, None, interval=interval,
                               max_k=cfg["max_k"], lora_r=cfg["lora_r"],
-                              lora_alpha=float(cfg.get("lora_alpha", 16.0)),
-                              grad_checkpoint=False)
+                              lora_alpha=float(cfg.get("lora_alpha", 16.0)))
     rec.load_adapter_state(state)
 
     split_name = args.split
+    if split_name not in suite.splits() or split_name == "train":
+        raise ValueError(
+            f"unsupported v3 eval split {split_name!r}; available: "
+            f"{sorted(set(suite.splits()) - {'train'})}")
     data = SuiteTensors(tok, list(getattr(suite, split_name)))
     idx = list(range(len(data.examples)))
     k = args.k if args.k is not None else cfg["k"]
+    if isinstance(k, bool) or not isinstance(k, int) or not 0 <= k <= cfg["max_k"]:
+        raise ValueError(f"eval K must satisfy 0 <= K <= {cfg['max_k']}")
 
     ablation = parse_ablation_cli(args.ablate, k)
-    res = evaluate(rec, data, k, idx, ablate=ablation,
-                   tag=f"{cfg['mode']}|{split_name}|{args.ablate or 'clean'}|K={k}",
-                   limit=args.limit)
+    evidence_identity = _v3_evidence_identity(
+        run_id=run_id, recipe=recipe, model_id=model_id, revision=revision,
+        adapter_id=adapter_id, checkpoint_id=f"step-{selected.step}",
+        checkpoint_content_hash=report["checkpoint_content_digest"],
+        suite_manifest=suite_manifest,
+        recurrence_config=_recurrence_config(cfg))
+    res = evaluate_v3(
+        rec, data, k, idx, evidence_identity=evidence_identity,
+        split=split_name, ablate=ablation,
+        tag=f"{cfg['mode']}|{split_name}|{args.ablate or 'clean'}|K={k}",
+        limit=args.limit)
     results = {args.ablate or "clean": res}
     # prove the persisted evidence is independently rescorable right now
-    rescore_records(res["records"])
+    if rescore_v3_records(res["records"]) != res["metrics"]:
+        raise ValueError("online/offline latent_eval.v3 rescore disagreement")
     print(json.dumps({k2: v for k2, v in res.items() if k2 != "records"},
                      indent=1))
 
     if args.out:
-        payload = {
-            "status": "complete",
-            "adapter": args.adapter, "split": split_name,
-            "config": cfg, "model": cfg.get("model"),
-            "revision": cfg.get("revision"),
-            "identity": {
-                "model_id": model_id, "revision": revision,
-                "suite_sha256": suite_sha,
-                "tokenizer_class": type(tok).__name__,
-                "interval": list(interval), "max_k": cfg["max_k"],
-                "k_steps": k,
-                "split": split_name, "seed": args.seed,
-                "ablation": args.ablate or "clean",
-                "checkpoint_content_digest":
-                    report.get("checkpoint_content_digest"),
-            },
-            "suite_sha256": suite_sha,
-            "device": device, "seed": args.seed,
-            "results": results,
-            "peak_rss_mib": round(peak_rss_mib(), 1),
-            "platform": platform.platform(),
-        }
+        payload = build_v3_eval_payload(
+            adapter=args.adapter, split=split_name, config=cfg,
+            model_id=model_id, revision=revision, suite_hash=suite_sha,
+            tokenizer_class=type(tok).__name__, interval=interval,
+            k_steps=k, ablation=args.ablate, seed=args.seed,
+            checkpoint_content_digest=report["checkpoint_content_digest"],
+            result=res, device=device)
         atomic_write_json(args.out, payload)
 
 
@@ -716,7 +1137,10 @@ def main():
     tr.add_argument("--max-k", type=int, default=16)
     tr.add_argument("--seed", type=int, default=0)
     tr.add_argument("--eval-every", type=int, default=100)
-    tr.add_argument("--val-examples", type=int, default=28)
+    tr.add_argument(
+        "--val-examples", type=int, default=None,
+        help="validation cap; omitted means the complete behavioral-v3 "
+             "validation split")
     tr.add_argument("--warmup", type=int, default=30)
     tr.add_argument("--lr-schedule", default="constant",
                     choices=["constant", "cosine"])
@@ -733,7 +1157,10 @@ def main():
     tr.add_argument("--out", required=True)
     ev = sub.add_parser("eval")
     ev.add_argument("--adapter", required=True)
-    ev.add_argument("--split", default="test_id")
+    ev.add_argument(
+        "--split", default="test_id",
+        choices=("validation", "test_id", "test_ood_length",
+                 "test_ood_semantic", "final_test"))
     ev.add_argument("--k", type=int, default=None)
     ev.add_argument("--ablate", default=None)
     ev.add_argument("--seed", type=int, default=0)
